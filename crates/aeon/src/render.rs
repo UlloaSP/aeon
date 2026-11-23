@@ -1,8 +1,11 @@
 //! CPU rendering into a softbuffer frame. No GPU context: a GPU device costs
 //! tens of megabytes of resident memory before the first frame.
 
+use std::path::Path;
+
 use aeon_config::Colors;
-use aeon_term::Terminal;
+use aeon_context::Context;
+use aeon_term::{Cell, Color, Flags, Terminal};
 
 use crate::font::Atlas;
 
@@ -12,35 +15,190 @@ pub struct Frame<'a> {
     pub height: u32,
 }
 
+/// The config's colors resolved to pixels once, not per cell.
+pub struct Theme {
+    fg: u32,
+    bg: u32,
+    cursor: u32,
+    bar_bg: u32,
+    ansi: [u32; 16],
+}
+
+impl Theme {
+    pub fn new(colors: &Colors) -> Self {
+        Self {
+            fg: colors.foreground.to_u32(),
+            bg: colors.background.to_u32(),
+            cursor: colors.cursor.to_u32(),
+            bar_bg: colors.bar_background.to_u32(),
+            ansi: colors.ansi().map(|c| c.to_u32()),
+        }
+    }
+
+    fn resolve(&self, color: Color, default: u32) -> u32 {
+        match color {
+            Color::Default => default,
+            Color::Indexed(i) => self.indexed(i),
+            Color::Rgb(r, g, b) => rgb(r, g, b),
+        }
+    }
+
+    /// The xterm 256-color palette: 16 theme colors, a 6x6x6 cube, 24 grays.
+    fn indexed(&self, i: u8) -> u32 {
+        match i {
+            0..=15 => self.ansi[usize::from(i)],
+            16..=231 => {
+                let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+                let i = i - 16;
+                rgb(level(i / 36), level(i / 6 % 6), level(i % 6))
+            }
+            232..=255 => {
+                let gray = 8 + (i - 232) * 10;
+                rgb(gray, gray, gray)
+            }
+        }
+    }
+
+    /// Final (foreground, background) for a cell, after bold-as-bright,
+    /// inverse, dim, and the cursor.
+    fn cell_colors(&self, cell: &Cell, is_cursor: bool) -> (u32, u32) {
+        let fg = match cell.fg {
+            // Bold brightens the 8 basic colors, as most terminals do.
+            Color::Indexed(i @ 0..=7) if cell.flags.contains(Flags::BOLD) => {
+                self.ansi[usize::from(i) + 8]
+            }
+            color => self.resolve(color, self.fg),
+        };
+        let bg = self.resolve(cell.bg, self.bg);
+        let (mut fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+            (bg, fg)
+        } else {
+            (fg, bg)
+        };
+        if cell.flags.contains(Flags::DIM) {
+            fg = blend(bg, fg, 140);
+        }
+        if is_cursor {
+            (self.bg, self.cursor)
+        } else {
+            (fg, bg)
+        }
+    }
+}
+
+const fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 16) | ((g as u32) << 8) | b as u32
+}
+
 pub fn draw(
     frame: &mut Frame<'_>,
     term: &Terminal,
     atlas: &mut Atlas,
-    colors: &Colors,
+    theme: &Theme,
     padding: u32,
 ) {
-    let bg = colors.background.to_u32();
-    frame.pixels.fill(bg);
+    frame.pixels.fill(theme.bg);
 
     let grid = term.grid();
     let cursor = term.cursor();
     let (cw, ch) = (atlas.cell_width, atlas.cell_height);
+    let line = (ch / 16).max(1);
 
     for row in 0..grid.rows() {
         let y = padding + row as u32 * ch;
         for (col, cell) in grid.row(row).iter().enumerate() {
             let x = padding + col as u32 * cw;
             let is_cursor = cursor.row == row && cursor.col == col;
-            let fg = if is_cursor {
-                fill_rect(frame, x, y, cw, ch, colors.cursor.to_u32());
-                bg
-            } else {
-                colors.foreground.to_u32()
-            };
+            let (fg, bg) = theme.cell_colors(cell, is_cursor);
+            if bg != theme.bg {
+                fill_rect(frame, x, y, cw, ch, bg);
+            }
             if cell.ch != ' ' {
                 draw_glyph(frame, atlas, cell.ch, x as i32, y as i32, fg);
             }
+            if cell.flags.contains(Flags::UNDERLINE) {
+                let underline = (y + atlas.baseline as u32 + line).min(y + ch - line);
+                fill_rect(frame, x, underline, cw, line, fg);
+            }
+            if cell.flags.contains(Flags::STRIKE) {
+                fill_rect(frame, x, y + ch / 2, cw, line, fg);
+            }
         }
+    }
+}
+
+/// The context bar: one row of text across the bottom of the window.
+pub fn draw_bar(
+    frame: &mut Frame<'_>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    context: &Context,
+    top: u32,
+    padding: u32,
+) {
+    fill_rect(
+        frame,
+        0,
+        top,
+        frame.width,
+        frame.height.saturating_sub(top),
+        theme.bar_bg,
+    );
+    let text_y = top + (frame.height.saturating_sub(top)).saturating_sub(atlas.cell_height) / 2;
+    let max_cols = (frame.width.saturating_sub(2 * padding) / atlas.cell_width) as usize;
+
+    let mut col = 0;
+    let mut put = |atlas: &mut Atlas, text: &str, color: u32| {
+        for ch in text.chars() {
+            if col >= max_cols {
+                return;
+            }
+            if ch != ' ' {
+                let x = padding + col as u32 * atlas.cell_width;
+                draw_glyph(frame, atlas, ch, x as i32, text_y as i32, color);
+            }
+            col += 1;
+        }
+    };
+
+    let [_, red, green, yellow, blue, magenta, ..] = theme.ansi;
+    let muted = theme.ansi[8];
+    let separator = " \u{2502} ";
+
+    if let Some(cwd) = &context.cwd {
+        put(atlas, &display_path(cwd), blue);
+    }
+    if let Some(git) = &context.git {
+        put(atlas, separator, muted);
+        put(atlas, &git.head, magenta);
+        if git.changed > 0 {
+            put(atlas, &format!(" \u{b1}{}", git.changed), yellow);
+        }
+        if git.ahead > 0 {
+            put(atlas, &format!(" \u{2191}{}", git.ahead), green);
+        }
+        if git.behind > 0 {
+            put(atlas, &format!(" \u{2193}{}", git.behind), red);
+        }
+    }
+    for (i, server) in context.servers.iter().enumerate() {
+        put(atlas, if i == 0 { separator } else { "  " }, muted);
+        put(atlas, "\u{2022} ", green);
+        put(
+            atlas,
+            &format!("{} :{}", server.name, server.port),
+            theme.fg,
+        );
+    }
+}
+
+/// `C:\Users\me\code` -> `~\code`.
+fn display_path(path: &Path) -> String {
+    let home = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from);
+    match home.as_deref().and_then(|h| path.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~\\{}", rest.display()),
+        None => path.display().to_string(),
     }
 }
 
@@ -91,12 +249,58 @@ fn blend(dst: u32, src: u32, alpha: u8) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::blend;
+    use super::*;
+
+    fn theme() -> Theme {
+        Theme::new(&Colors::default())
+    }
 
     #[test]
     fn blend_endpoints() {
         assert_eq!(blend(0x000000, 0xffffff, 0), 0x000000);
         assert_eq!(blend(0x000000, 0xffffff, 255), 0xffffff);
         assert_eq!(blend(0x102030, 0x102030, 128), 0x102030);
+    }
+
+    #[test]
+    fn xterm_256_palette() {
+        let t = theme();
+        assert_eq!(t.indexed(1), t.ansi[1]);
+        assert_eq!(t.indexed(16), 0x000000);
+        assert_eq!(t.indexed(196), 0xff0000);
+        assert_eq!(t.indexed(231), 0xffffff);
+        assert_eq!(t.indexed(232), 0x080808);
+        assert_eq!(t.indexed(255), 0xeeeeee);
+    }
+
+    #[test]
+    fn bold_brightens_basic_colors_only() {
+        let t = theme();
+        let mut cell = Cell {
+            fg: Color::Indexed(1),
+            ..Cell::default()
+        };
+        cell.flags.set(Flags::BOLD, true);
+        assert_eq!(t.cell_colors(&cell, false).0, t.ansi[9]);
+        cell.fg = Color::Indexed(200);
+        assert_eq!(t.cell_colors(&cell, false).0, t.indexed(200));
+    }
+
+    #[test]
+    fn inverse_swaps_and_cursor_wins() {
+        let t = theme();
+        let mut cell = Cell::default();
+        cell.flags.set(Flags::INVERSE, true);
+        assert_eq!(t.cell_colors(&cell, false), (t.bg, t.fg));
+        assert_eq!(t.cell_colors(&cell, true), (t.bg, t.cursor));
+    }
+
+    #[test]
+    fn home_is_shortened() {
+        let Some(home) = std::env::var_os("USERPROFILE").map(std::path::PathBuf::from) else {
+            return;
+        };
+        assert_eq!(display_path(&home), "~");
+        assert_eq!(display_path(&home.join("code")), "~\\code");
     }
 }

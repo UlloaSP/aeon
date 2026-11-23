@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::ffi::{OsString, c_void};
 use std::fs::File;
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -13,9 +13,10 @@ use windows_sys::Win32::System::Console::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
-    STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, GetProcessId, INFINITE,
+    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 
 use crate::{Command, PtySize, command_line};
@@ -155,6 +156,7 @@ impl ConPty {
         let mut attributes = AttributeList::with_pseudoconsole(hpcon)?;
         let mut cmdline = wide(&command_line(command));
         let cwd = command.cwd.as_ref().map(|d| wide(d.as_os_str()));
+        let env = (!command.env.is_empty()).then(|| environment_block(&command.env));
 
         // SAFETY: STARTUPINFOEXW and PROCESS_INFORMATION are plain C structs
         // for which all-zero is a valid initial state.
@@ -180,7 +182,7 @@ impl ConPty {
                 null(),
                 0,
                 EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-                null(),
+                env.as_ref().map_or(null(), |e| e.as_ptr().cast()),
                 cwd.as_ref().map_or(null(), |d| d.as_ptr()),
                 &startup.StartupInfo,
                 &mut info,
@@ -195,6 +197,11 @@ impl ConPty {
         check_hr(unsafe { ResizePseudoConsole(self.hpcon, coord(size)) })
     }
 
+    pub(crate) fn pid(&self) -> u32 {
+        // SAFETY: `process` is a live handle owned by self.
+        unsafe { GetProcessId(self.process.as_raw_handle_value()) }
+    }
+
     pub(crate) fn wait(&self) -> io::Result<u32> {
         let process = self.process.as_raw_handle_value();
         // SAFETY: `process` is a live handle owned by self.
@@ -207,6 +214,28 @@ impl ConPty {
             Ok(code)
         }
     }
+}
+
+/// Aeon's environment with `overrides` applied, as the sorted, double-NUL
+/// terminated UTF-16 block CreateProcessW expects. Names compare without case,
+/// as Windows does.
+fn environment_block(overrides: &[(OsString, OsString)]) -> Vec<u16> {
+    let key = |k: &OsString| k.to_string_lossy().to_uppercase();
+    let mut vars: Vec<(OsString, OsString)> = std::env::vars_os()
+        .filter(|(k, _)| !overrides.iter().any(|(o, _)| key(o) == key(k)))
+        .chain(overrides.iter().cloned())
+        .collect();
+    vars.sort_by_key(|(k, _)| key(k));
+
+    let mut block = Vec::new();
+    for (k, v) in &vars {
+        block.extend(k.encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(v.encode_wide());
+        block.push(0);
+    }
+    block.push(0);
+    block
 }
 
 impl Drop for ConPty {
@@ -234,10 +263,16 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn runs_a_command_and_reads_its_output() {
-        let command = Command::new("cmd.exe").args(["/d", "/c", "echo aeon-pty-ok"]);
-        let mut pty = ConPty::spawn(&command, PtySize { rows: 24, cols: 80 }).unwrap();
+    /// Spawns `command` and returns the PTY once its output contains `marker`.
+    fn spawn_until(command: &Command, marker: &str) -> (ConPty, String) {
+        let mut pty = ConPty::spawn(
+            command,
+            PtySize {
+                rows: 24,
+                cols: 120,
+            },
+        )
+        .unwrap();
         let mut reader = pty.reader.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -251,15 +286,51 @@ mod tests {
 
         // ConPTY discards output it has not flushed when the console closes,
         // so wait for the text itself rather than for the process to exit.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let mut out = String::new();
-        while !out.contains("aeon-pty-ok") {
+        while !out.contains(marker) {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             match rx.recv_timeout(left) {
                 Ok(chunk) => out.push_str(&String::from_utf8_lossy(&chunk)),
-                Err(_) => panic!("no marker in output: {out:?}"),
+                Err(_) => panic!("no {marker:?} in output: {out:?}"),
             }
         }
+        (pty, out)
+    }
+
+    #[test]
+    fn runs_a_command_and_reads_its_output() {
+        let command = Command::new("cmd.exe").args(["/d", "/c", "echo aeon-pty-ok"]);
+        let (pty, _) = spawn_until(&command, "aeon-pty-ok");
         assert_eq!(pty.wait().unwrap(), 0);
+    }
+
+    #[test]
+    fn env_overrides_reach_the_child() {
+        let command = Command::new("cmd.exe")
+            .args(["/d", "/c", "echo [%AEON_TEST_VAR%]"])
+            .env("AEON_TEST_VAR", "from-aeon");
+        let (pty, _) = spawn_until(&command, "[from-aeon]");
+        assert_eq!(pty.wait().unwrap(), 0);
+    }
+
+    #[test]
+    fn integrated_powershell_reports_its_directory() {
+        let Some(program) = ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find_map(crate::find_in_path)
+        else {
+            return;
+        };
+        // The script writes its history directory under APPDATA; keep that
+        // out of the developer's real profile.
+        let appdata = std::env::temp_dir().join(format!("aeon-test-{}", std::process::id()));
+        // Not the temp dir: on CI it is an 8.3 short path the shell may expand.
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let command = crate::integrate(Command::new(program))
+            .cwd(cwd)
+            .env("APPDATA", &appdata);
+        let (_pty, _) = spawn_until(&command, &format!("\x1b]9;9;\"{cwd}\""));
+        let _ = std::fs::remove_dir_all(&appdata);
     }
 }

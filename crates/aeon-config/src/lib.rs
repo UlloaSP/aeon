@@ -17,9 +17,10 @@ pub struct Config {
     pub font: Font,
     pub window: Window,
     pub colors: Colors,
+    pub bar: Bar,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Shell {
     /// Program to launch. `None` picks the best installed shell.
@@ -28,6 +29,33 @@ pub struct Shell {
     /// Starting directory. `None` keeps the directory Aeon was launched from,
     /// or the home directory when launched from the Start menu.
     pub cwd: Option<PathBuf>,
+    /// Lets Aeon set up PowerShell and cmd: no user profile, Aeon's own
+    /// history and prompt, and working-directory reporting for the bar.
+    pub integration: bool,
+}
+
+impl Default for Shell {
+    fn default() -> Self {
+        Self {
+            program: None,
+            args: Vec::new(),
+            cwd: None,
+            integration: true,
+        }
+    }
+}
+
+/// The context bar under the terminal: directory, git, and running servers.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Bar {
+    pub enabled: bool,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -73,6 +101,11 @@ pub struct Colors {
     pub foreground: Rgb,
     pub background: Rgb,
     pub cursor: Rgb,
+    pub bar_background: Rgb,
+    /// ANSI colors 0-7. Unset entries keep Aeon's theme.
+    pub normal: Palette,
+    /// ANSI colors 8-15. Unset entries keep Aeon's theme.
+    pub bright: Palette,
 }
 
 impl Default for Colors {
@@ -81,7 +114,74 @@ impl Default for Colors {
             foreground: Rgb::new(0xd8, 0xdb, 0xe2),
             background: Rgb::new(0x10, 0x11, 0x14),
             cursor: Rgb::new(0xf2, 0xb8, 0x4b),
+            bar_background: Rgb::new(0x1a, 0x1c, 0x22),
+            normal: Palette::default(),
+            bright: Palette::default(),
         }
+    }
+}
+
+/// Aeon's theme: warm, high contrast on the near-black background, with
+/// bright variants that stay readable rather than neon.
+const AEON_ANSI: [Rgb; 16] = [
+    Rgb::new(0x1d, 0x1f, 0x25), // black
+    Rgb::new(0xe0, 0x6c, 0x75), // red
+    Rgb::new(0x8f, 0xc7, 0x7f), // green
+    Rgb::new(0xe8, 0xb7, 0x5f), // yellow
+    Rgb::new(0x61, 0xa6, 0xf2), // blue
+    Rgb::new(0xc3, 0x8a, 0xe6), // magenta
+    Rgb::new(0x4f, 0xc1, 0xc9), // cyan
+    Rgb::new(0xc8, 0xcc, 0xd6), // white
+    Rgb::new(0x4b, 0x4f, 0x5c), // bright black
+    Rgb::new(0xff, 0x7a, 0x85), // bright red
+    Rgb::new(0xa6, 0xe0, 0x95), // bright green
+    Rgb::new(0xf6, 0xcd, 0x7d), // bright yellow
+    Rgb::new(0x82, 0xbc, 0xff), // bright blue
+    Rgb::new(0xd7, 0xa6, 0xf7), // bright magenta
+    Rgb::new(0x72, 0xd9, 0xe0), // bright cyan
+    Rgb::new(0xf2, 0xf4, 0xf8), // bright white
+];
+
+impl Colors {
+    /// The 16 ANSI colors with the user's overrides applied.
+    pub fn ansi(&self) -> [Rgb; 16] {
+        let mut ansi = AEON_ANSI;
+        for (offset, palette) in [(0, &self.normal), (8, &self.bright)] {
+            for (i, color) in palette.entries().into_iter().enumerate() {
+                if let Some(color) = color {
+                    ansi[offset + i] = color;
+                }
+            }
+        }
+        ansi
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Palette {
+    pub black: Option<Rgb>,
+    pub red: Option<Rgb>,
+    pub green: Option<Rgb>,
+    pub yellow: Option<Rgb>,
+    pub blue: Option<Rgb>,
+    pub magenta: Option<Rgb>,
+    pub cyan: Option<Rgb>,
+    pub white: Option<Rgb>,
+}
+
+impl Palette {
+    fn entries(&self) -> [Option<Rgb>; 8] {
+        [
+            self.black,
+            self.red,
+            self.green,
+            self.yellow,
+            self.blue,
+            self.magenta,
+            self.cyan,
+            self.white,
+        ]
     }
 }
 
@@ -215,6 +315,30 @@ mod tests {
         for bad in ["1e1e2e", "#1e1e2", "#1e1e2g", "#1e1e2e0", ""] {
             assert!(bad.parse::<Rgb>().is_err(), "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn palette_overrides_only_what_is_set() {
+        let config = Config::parse(
+            "[colors.bright]
+red = \"#ff0000\"",
+        )
+        .unwrap();
+        let ansi = config.colors.ansi();
+        assert_eq!(ansi[9], Rgb::new(0xff, 0, 0));
+        assert_eq!(ansi[1], AEON_ANSI[1]);
+        assert_eq!(ansi[10], AEON_ANSI[10]);
+    }
+
+    #[test]
+    fn shell_integration_and_bar_default_on() {
+        let config = Config::parse(
+            "[shell]
+program = \"cmd.exe\"",
+        )
+        .unwrap();
+        assert!(config.shell.integration);
+        assert!(config.bar.enabled);
     }
 
     #[test]
