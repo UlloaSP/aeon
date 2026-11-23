@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Aeon installer, built by scripts/package-msi.ps1 with WiX v5.
+
+  Preprocessor variables (passed with -d):
+    Version  Numeric MSI version, major.minor.patch. Prerelease suffixes are
+             stripped by the script: MSI cannot order them.
+    BinDir   Directory holding the aeon.exe to ship.
+
+  UpgradeCode identifies the product across every version. Changing it makes
+  a new install sit next to the old one instead of replacing it. Never change it.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Aeon"
+    Manufacturer="Aeon"
+    Version="$(var.Version)"
+    UpgradeCode="D8551A8F-DADB-4C0F-8648-75545018F2B7"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <!-- Same-version upgrades let nightlies, which share a numeric version,
+         replace each other instead of failing with "already installed". -->
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of Aeon is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/UlloaSP/aeon" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/UlloaSP/aeon/issues" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <StandardDirectory Id="ProgramFiles6432Folder">
+      <Directory Id="INSTALLFOLDER" Name="Aeon">
+        <Component Id="AeonExe">
+          <File Id="AeonExeFile" Source="$(var.BinDir)\aeon.exe" KeyPath="yes">
+            <Shortcut
+              Id="StartMenuShortcut"
+              Directory="ProgramMenuFolder"
+              Name="Aeon"
+              Description="A fast, lean terminal for Windows"
+              Advertise="no" />
+          </File>
+          <!-- `aeon` from any shell. Removed again on uninstall. -->
+          <Environment
+            Id="PathEntry"
+            Name="PATH"
+            Value="[INSTALLFOLDER]"
+            Action="set"
+            Part="last"
+            Permanent="no"
+            System="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+  </Package>
+</Wix>

@@ -1,0 +1,58 @@
+name: Bug report
+description: Something is broken, slow, or uses more memory than it should.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. One bug per issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Aeon
+        2. Run `...`
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Aeon version
+      description: From the window title, or the MSI you installed.
+      placeholder: 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: shell
+    attributes:
+      label: Shell
+      placeholder: pwsh 7.5, cmd, WSL Ubuntu, Git Bash...
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and architecture
+      placeholder: Windows 11 24H2, x64
+    validations:
+      required: true
+  - type: input
+    id: display
+    attributes:
+      label: Display scale
+      placeholder: 150%, two monitors
+  - type: textarea
+    id: config
+    attributes:
+      label: config.toml
+      description: Contents of %APPDATA%\aeon\config.toml, if you have one.
+      render: toml

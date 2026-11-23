@@ -1,0 +1,135 @@
+# Builds, packages, and (on x64) smoke-installs one Windows architecture.
+# Called by release.yml for every release, and by ci.yml so packaging is
+# proven on every change that can break it. Both upload `windows-<arch>`.
+name: Release Windows
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Full release version, such as 1.2.3 or 1.2.4-nightly.20261123.42.
+        type: string
+        required: true
+      arch:
+        description: x64 or arm64.
+        type: string
+        required: true
+      ref:
+        description: Commit to build. Empty builds the triggering commit.
+        type: string
+        default: ""
+      smoke-install:
+        description: Install, launch, and uninstall the MSI. Needs a runner of the same architecture.
+        type: boolean
+        default: false
+      retention-days:
+        description: How long the uploaded artifact is kept.
+        type: number
+        default: 7
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  build:
+    name: Build ${{ inputs.arch }}
+    # arm64 cross-compiles on x64: the hosted image ships the ARM64 MSVC tools,
+    # and WiX targets any architecture from any host.
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      TARGET: ${{ inputs.arch == 'arm64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
+    steps:
+      - name: Validate inputs
+        shell: bash
+        env:
+          ARCH: ${{ inputs.arch }}
+        run: |
+          if [[ "$ARCH" != x64 && "$ARCH" != arm64 ]]; then
+            echo "Unsupported arch: $ARCH" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ env.TARGET }}
+          cache-key: release-${{ inputs.arch }}
+
+      # AEON_VERSION is read by option_env! in crates/aeon/src/main.rs, so a
+      # nightly reports its full version without rewriting Cargo.toml.
+      - name: Build
+        env:
+          AEON_VERSION: ${{ inputs.version }}
+        run: cargo build --release --locked --target $env:TARGET -p aeon
+
+      - name: Setup WiX
+        uses: ./.github/actions/setup-wix
+
+      - name: Package
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ inputs.arch }}
+        run: ./scripts/package-msi.ps1 -Version $env:VERSION -Arch $env:ARCH -OutDir dist
+
+      # What a user gets from double-clicking the MSI: files in Program Files,
+      # aeon on PATH, a Start menu entry, a window that stays up, and a clean
+      # uninstall. Startup memory goes to the job summary to spot regressions.
+      - name: Smoke test the installer
+        if: inputs.smoke-install
+        timeout-minutes: 5
+        env:
+          VERSION: ${{ inputs.version }}
+          ARCH: ${{ inputs.arch }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Get-Item dist/*.msi).FullName
+          $dir = Join-Path $env:ProgramFiles 'Aeon'
+          $exe = Join-Path $dir 'aeon.exe'
+          $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Aeon.lnk'
+          $log = Join-Path $env:RUNNER_TEMP 'msi'
+          function Test-OnPath { [Environment]::GetEnvironmentVariable('PATH', 'Machine') -split ';' | Where-Object { $_.TrimEnd('\') -eq $dir } }
+          function Invoke-Msi($action, $name) {
+            $p = Start-Process msiexec -ArgumentList $action, "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log-$name.log`"" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { Get-Content "$log-$name.log" -Tail 80; throw "msiexec $action exited with $($p.ExitCode)" }
+          }
+
+          Invoke-Msi '/i' 'install'
+          if (-not (Test-Path $exe)) { throw "$exe was not installed" }
+          if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing: $lnk" }
+          if (-not (Test-OnPath)) { throw "$dir is not on the machine PATH" }
+
+          # Same-version reinstall is how nightlies replace each other.
+          Invoke-Msi '/i' 'reinstall'
+
+          $aeon = Start-Process $exe -PassThru
+          Start-Sleep -Seconds 5
+          $aeon.Refresh()
+          if ($aeon.HasExited) { throw "aeon exited during startup with code $($aeon.ExitCode)" }
+          $private = '{0:N1}' -f ($aeon.PrivateMemorySize64 / 1MB)
+          $ws = '{0:N1}' -f ($aeon.WorkingSet64 / 1MB)
+          Stop-Process -Id $aeon.Id -Force
+          $size = '{0:N0}' -f ((Get-Item $exe).Length / 1KB)
+          "### aeon $env:VERSION ($env:ARCH)`n`n| Binary | Private memory | Working set |`n| --- | --- | --- |`n| $size KB | $private MB | $ws MB |" >> $env:GITHUB_STEP_SUMMARY
+
+          Invoke-Msi '/x' 'uninstall'
+          if (Test-Path $exe) { throw "$exe survived uninstall" }
+          if (Test-OnPath) { throw "$dir is still on the machine PATH after uninstall" }
+
+      - name: Upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-${{ inputs.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

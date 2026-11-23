@@ -1,0 +1,6 @@
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      # `queue: max` is newer than actionlint's schema. It keeps every queued
+      # release run instead of only the newest; see the comment in release.yml.
+      - 'unexpected key "queue" for "concurrency" section'

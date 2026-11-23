@@ -1,0 +1,24 @@
+[package]
+name = "aeon"
+description = "A fast, lean terminal for Windows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "aeon"
+path = "src/main.rs"
+
+[dependencies]
+aeon-config.workspace = true
+aeon-pty.workspace = true
+aeon-term.workspace = true
+fontdue.workspace = true
+softbuffer.workspace = true
+winit.workspace = true
+
+[lints]
+workspace = true

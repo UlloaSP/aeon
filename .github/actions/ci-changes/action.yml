@@ -1,0 +1,37 @@
+name: CI changes
+description: Decide which CI jobs a change needs. See .github/scripts/ci-changes.sh.
+outputs:
+  rust:
+    description: Clippy and tests on Windows.
+    value: ${{ steps.detect.outputs.rust }}
+  packaging:
+    description: Release build, MSI packaging, and install smoke test.
+    value: ${{ steps.detect.outputs.packaging }}
+runs:
+  using: composite
+  steps:
+    - id: detect
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+      run: |
+        set -uo pipefail
+
+        decide() {
+          bash .github/scripts/ci-changes.sh "$@" | tee -a "$GITHUB_OUTPUT"
+          exit "${PIPESTATUS[0]}"
+        }
+
+        # main and develop keep a full run as the backstop for anything the gate misses.
+        if [[ "$EVENT_NAME" != pull_request ]]; then
+          decide --all
+        fi
+
+        # A pull request checks out GitHub's merge commit with fetch-depth: 2,
+        # so its first parent is the base branch and the diff is the PR's change.
+        # Detection fails open: if the diff cannot be resolved, everything runs.
+        if ! git diff --name-only --no-renames HEAD^1 HEAD > "$RUNNER_TEMP/changed-paths"; then
+          echo "Could not diff against the base branch. Running every job."
+          decide --all
+        fi
+        decide "$RUNNER_TEMP/changed-paths"

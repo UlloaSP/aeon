@@ -1,0 +1,8 @@
+# git autocrlf=true converts LF to CRLF on Windows, which breaks rustfmt --check in CI.
+* text=auto eol=lf
+# Batch files need CRLF for cmd.exe to parse them reliably.
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ico binary
+*.msi binary
+Cargo.lock linguist-generated

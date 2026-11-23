@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+# Single source of truth for the release version. Stable tags must match it;
+# see docs/release.md.
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/UlloaSP/aeon"
+
+[workspace.dependencies]
+aeon-config = { path = "crates/aeon-config" }
+aeon-pty = { path = "crates/aeon-pty" }
+aeon-term = { path = "crates/aeon-term" }
+
+fontdue = "0.9.5"
+serde = { version = "1.0.229", features = ["derive"] }
+softbuffer = { version = "0.4.8", default-features = false }
+thiserror = "2.0.21"
+toml = { version = "1.2.2", default-features = false, features = ["parse", "serde"] }
+vte = { version = "0.15.0", default-features = false }
+windows-sys = "0.61.2"
+winit = { version = "0.30.13", default-features = false, features = ["rwh_06"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+undocumented_unsafe_blocks = "warn"
+
+# Startup time and resident memory are the product. Fat LTO and one codegen
+# unit cost build time, never runtime.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+# Dependencies are optimized in dev too: a debug-built VT parser makes the
+# terminal feel broken and hides real performance problems.
+[profile.dev.package."*"]
+opt-level = 2

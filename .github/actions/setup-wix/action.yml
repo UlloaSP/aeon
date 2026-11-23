@@ -1,0 +1,24 @@
+name: Setup WiX
+description: Install the WiX CLI that scripts/package-msi.ps1 builds the MSI with.
+inputs:
+  version:
+    # WiX 6 and later require accepting the Open Source Maintenance Fee EULA
+    # on every build. Moving past 5.x is a deliberate decision, not a bump.
+    description: WiX toolset version.
+    required: false
+    default: "5.0.2"
+runs:
+  using: composite
+  steps:
+    - name: Install WiX
+      shell: pwsh
+      env:
+        WIX_VERSION: ${{ inputs.version }}
+      run: |
+        dotnet tool install --global wix --version $env:WIX_VERSION
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
+
+    - name: Check WiX
+      shell: pwsh
+      run: wix --version
