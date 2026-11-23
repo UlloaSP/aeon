@@ -14,7 +14,8 @@ use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::window::{Window, WindowId};
+use winit::platform::windows::IconExtWindows;
+use winit::window::{Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
 use crate::render::{self, Frame, Theme};
@@ -101,6 +102,7 @@ impl App {
             event_loop.create_window(
                 Window::default_attributes()
                     .with_title(title)
+                    .with_window_icon(Icon::from_resource(1, None).ok())
                     .with_inner_size(inner),
             )?,
         );

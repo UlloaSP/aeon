@@ -21,5 +21,8 @@ fontdue.workspace = true
 softbuffer.workspace = true
 winit.workspace = true
 
+[build-dependencies]
+embed-resource.workspace = true
+
 [lints]
 workspace = true

@@ -1,0 +1,3 @@
+// Windows resources for aeon.exe. Icon 1 is what Explorer, the taskbar, and
+// the window show; the terminal also loads it by id at runtime.
+1 ICON "../../packaging/windows/aeon.ico"

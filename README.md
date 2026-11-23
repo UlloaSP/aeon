@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./packaging/windows/aeon.svg" width="80" height="80" alt="Aeon logo: a ring with an amber block cursor" />
+</p>
+
 <h1 align="center">Aeon</h1>
 
 <p align="center">A fast, lean terminal for Windows.</p>
@@ -70,10 +74,10 @@ padding = 8
 enabled = true                # directory, git, and servers under the terminal
 
 [colors]
-foreground = "#d8dbe2"
-background = "#101114"
-cursor = "#f2b84b"
-bar_background = "#1a1c22"
+foreground = "#f2f1ec"
+background = "#0c0d10"
+cursor = "#ffb547"
+bar_background = "#17181c"
 
 [colors.normal]               # ANSI 0-7; any color left out keeps Aeon's theme
 red = "#e06c75"
