@@ -95,9 +95,10 @@ pub fn draw(
     term: &Terminal,
     atlas: &mut Atlas,
     theme: &Theme,
-    padding: u32,
+    origin: (u32, u32),
 ) {
     frame.pixels.fill(theme.bg);
+    let (left, top) = origin;
 
     let grid = term.grid();
     let cursor = term.cursor();
@@ -105,9 +106,9 @@ pub fn draw(
     let line = (ch / 16).max(1);
 
     for row in 0..grid.rows() {
-        let y = padding + row as u32 * ch;
+        let y = top + row as u32 * ch;
         for (col, cell) in grid.row(row).iter().enumerate() {
-            let x = padding + col as u32 * cw;
+            let x = left + col as u32 * cw;
             let is_cursor = cursor.row == row && cursor.col == col;
             let (fg, bg) = theme.cell_colors(cell, is_cursor);
             if bg != theme.bg {
@@ -138,19 +139,19 @@ pub fn draw_bar(
     atlas: &mut Atlas,
     theme: &Theme,
     context: &Context,
-    top: u32,
+    (left, top): (u32, u32),
     padding: u32,
 ) {
     fill_rect(
         frame,
-        0,
+        left,
         top,
-        frame.width,
+        frame.width.saturating_sub(left),
         frame.height.saturating_sub(top),
         theme.bar_bg,
     );
     let text_y = top + (frame.height.saturating_sub(top)).saturating_sub(atlas.cell_height) / 2;
-    let max_cols = (frame.width.saturating_sub(2 * padding) / atlas.cell_width) as usize;
+    let max_cols = (frame.width.saturating_sub(left + 2 * padding) / atlas.cell_width) as usize;
 
     let mut col = 0;
     let mut put = |atlas: &mut Atlas, text: &str, color: u32| {
@@ -159,7 +160,7 @@ pub fn draw_bar(
                 return;
             }
             if ch != ' ' {
-                let x = padding + col as u32 * atlas.cell_width;
+                let x = left + padding + col as u32 * atlas.cell_width;
                 draw_glyph(frame, atlas, ch, x as i32, text_y as i32, color);
             }
             col += 1;
@@ -194,6 +195,193 @@ pub fn draw_bar(
             &format!("{} :{}", server.name, server.port),
             theme.fg,
         );
+    }
+}
+
+/// The sidebar's measurements, shared by drawing and by mouse hit-testing so
+/// the two never disagree.
+pub struct Sidebar {
+    pub width: u32,
+    pad: u32,
+    header: u32,
+    row: u32,
+}
+
+impl Sidebar {
+    pub fn new(atlas: &Atlas, scale: f64) -> Self {
+        let px = |logical: f64| (logical * scale).round() as u32;
+        let pad = px(10.0);
+        Self {
+            width: px(220.0),
+            pad,
+            header: atlas.cell_height + 2 * pad,
+            row: 2 * atlas.cell_height + 2 * pad,
+        }
+    }
+
+    /// The session row under a point, if any.
+    pub fn row_at(&self, x: f64, y: f64, sessions: usize) -> Option<usize> {
+        if x < 0.0 || x >= f64::from(self.width) || y < f64::from(self.header) {
+            return None;
+        }
+        let i = ((y - f64::from(self.header)) / f64::from(self.row)) as usize;
+        (i < sessions).then_some(i)
+    }
+
+    /// Whether a point is on the header's "+" (new session).
+    pub fn is_new_button(&self, x: f64, y: f64, atlas: &Atlas) -> bool {
+        let button = f64::from(self.pad + 2 * atlas.cell_width);
+        y >= 0.0
+            && y < f64::from(self.header)
+            && x >= f64::from(self.width) - button
+            && x < f64::from(self.width)
+    }
+}
+
+/// What the sidebar shows for one session.
+pub struct SidebarEntry<'a> {
+    pub context: &'a Context,
+}
+
+pub fn draw_sidebar(
+    frame: &mut Frame<'_>,
+    atlas: &mut Atlas,
+    theme: &Theme,
+    sidebar: &Sidebar,
+    entries: &[SidebarEntry<'_>],
+    active: usize,
+) {
+    let [_, _, green, yellow, _, magenta, ..] = theme.ansi;
+    let muted = theme.ansi[8];
+    let (w, pad, cw, ch) = (
+        sidebar.width,
+        sidebar.pad,
+        atlas.cell_width,
+        atlas.cell_height,
+    );
+    fill_rect(frame, 0, 0, w, frame.height, theme.bar_bg);
+    fill_rect(
+        frame,
+        w.saturating_sub(1),
+        0,
+        1,
+        frame.height,
+        blend(theme.bar_bg, theme.fg, 24),
+    );
+
+    let cols = (w.saturating_sub(2 * pad) / cw) as usize;
+    draw_text(
+        frame,
+        atlas,
+        pad,
+        pad,
+        "Sessions",
+        muted,
+        cols.saturating_sub(3),
+    );
+    draw_glyph(
+        frame,
+        atlas,
+        '+',
+        (w - pad - cw) as i32,
+        pad as i32,
+        theme.fg,
+    );
+
+    for (i, entry) in entries.iter().enumerate() {
+        let top = sidebar.header + i as u32 * sidebar.row;
+        if top >= frame.height {
+            break;
+        }
+        if i == active {
+            fill_rect(
+                frame,
+                0,
+                top,
+                w - 1,
+                sidebar.row,
+                blend(theme.bar_bg, theme.fg, 22),
+            );
+            fill_rect(frame, 0, top, (pad / 3).max(2), sidebar.row, theme.cursor);
+        }
+        let (line1, line2) = (top + pad, top + pad + ch);
+        // Ctrl+1..9 selects the first nine; show the number to make that visible.
+        let number = if i < 9 {
+            char::from(b'1' + i as u8)
+        } else {
+            ' '
+        };
+        draw_glyph(frame, atlas, number, pad as i32, line1 as i32, muted);
+        let text_x = pad + 2 * cw;
+        let text_cols = cols.saturating_sub(2);
+        let title = entry
+            .context
+            .cwd
+            .as_deref()
+            .map_or_else(|| "shell".to_owned(), session_title);
+        let title_color = if i == active {
+            theme.fg
+        } else {
+            blend(theme.bar_bg, theme.fg, 190)
+        };
+        draw_text(frame, atlas, text_x, line1, &title, title_color, text_cols);
+
+        let mut x = text_x;
+        let mut left = text_cols;
+        let mut put = |frame: &mut Frame<'_>, atlas: &mut Atlas, text: &str, color: u32| {
+            let n = text.chars().count().min(left);
+            draw_text(frame, atlas, x, line2, text, color, n);
+            x += n as u32 * cw;
+            left -= n;
+        };
+        if let Some(git) = &entry.context.git {
+            put(frame, atlas, &git.head, magenta);
+            if git.changed > 0 {
+                put(frame, atlas, &format!(" \u{b1}{}", git.changed), yellow);
+            }
+        }
+        if !entry.context.servers.is_empty() {
+            put(
+                frame,
+                atlas,
+                &format!(" \u{2022}{}", entry.context.servers.len()),
+                green,
+            );
+        }
+    }
+}
+
+/// The last folder of `path`, or `~` for the home folder itself.
+fn session_title(path: &Path) -> String {
+    let display = display_path(path);
+    if display == "~" {
+        return display;
+    }
+    path.file_name()
+        .map_or(display, |name| name.to_string_lossy().into_owned())
+}
+
+/// Monospace text from `x`, cut with an ellipsis past `max_cols`.
+pub(crate) fn draw_text(
+    frame: &mut Frame<'_>,
+    atlas: &mut Atlas,
+    x: u32,
+    y: u32,
+    text: &str,
+    color: u32,
+    max_cols: usize,
+) {
+    let count = text.chars().count();
+    let cut = count > max_cols && max_cols > 0;
+    let shown = text
+        .chars()
+        .take(if cut { max_cols - 1 } else { max_cols })
+        .chain(cut.then_some('\u{2026}'));
+    for (i, ch) in shown.enumerate() {
+        if ch != ' ' {
+            let cx = x + i as u32 * atlas.cell_width;
+            draw_glyph(frame, atlas, ch, cx as i32, y as i32, color);
+        }
     }
 }
 

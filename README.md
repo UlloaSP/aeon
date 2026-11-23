@@ -49,6 +49,20 @@ Builds are not code-signed yet, so Windows SmartScreen may warn the first time y
 
 Aeon reads `%APPDATA%\aeon\config.toml`. Every setting is optional, and an unknown key is an error, so typos don't fail silently. If the file is invalid, Aeon starts with the defaults and says so in the window title.
 
+### Sessions
+
+One window holds as many shells as you want, listed in the sidebar with their folder, git branch, pending changes, and running servers. A new session starts in the folder of the one you are in.
+
+| Keys | Action |
+| --- | --- |
+| Ctrl+Shift+T | New session (or click **+**) |
+| Ctrl+Shift+W | Close the session |
+| Ctrl+Tab, Ctrl+Shift+Tab | Next, previous session |
+| Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
+| Ctrl+Shift+B | Show or hide the sidebar |
+
+Aeon's shortcuts use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%eon\state`, apart from your `config.toml`.
+
 ### The launcher
 
 Aeon starts with Windows and waits in the background, using about 8 MB. Press **Ctrl+Alt+Space** anywhere to open the launcher:
