@@ -7,6 +7,7 @@ name = "aeon"
 version = "0.1.0"
 dependencies = [
  "aeon-config",
+ "aeon-context",
  "aeon-pty",
  "aeon-term",
  "fontdue",
@@ -21,6 +22,13 @@ dependencies = [
  "serde",
  "thiserror 2.0.21",
  "toml",
+]
+
+[[package]]
+name = "aeon-context"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

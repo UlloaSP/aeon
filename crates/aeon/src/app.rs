@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use aeon_config::Config;
+use aeon_context::{Context, Watcher};
 use aeon_pty::{Pty, PtySize};
 use aeon_term::Terminal;
 use winit::application::ApplicationHandler;
@@ -16,18 +17,23 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::window::{Window, WindowId};
 
 use crate::font::{self, Atlas};
-use crate::render::{self, Frame};
+use crate::render::{self, Frame, Theme};
 
-/// Sent from the PTY reader thread to the UI thread.
+/// Sent from background threads to the UI thread.
 pub enum Event {
+    /// A chunk of shell output, from the PTY reader thread.
     Output(Vec<u8>),
+    /// The shell exited.
     Exited,
+    /// New context bar contents, from the context watcher thread.
+    Context(Context),
 }
 
 pub struct App {
     proxy: EventLoopProxy<Event>,
     config: Config,
     config_error: Option<String>,
+    theme: Theme,
     session: Option<Session>,
 }
 
@@ -39,6 +45,16 @@ struct Session {
     term: Terminal,
     pty: Pty,
     input: File,
+    context: Context,
+    watcher: Option<Watcher>,
+}
+
+/// Where the grid and the context bar go in a window of a given size.
+struct Layout {
+    rows: usize,
+    cols: usize,
+    /// First pixel row of the context bar, when it is shown.
+    bar_top: Option<u32>,
 }
 
 impl App {
@@ -50,6 +66,7 @@ impl App {
         };
         Self {
             proxy,
+            theme: Theme::new(&config.colors),
             config,
             config_error,
             session: None,
@@ -66,9 +83,14 @@ impl App {
         // The window starts at the default scale and is resized on the first
         // ScaleFactorChanged, so size it from 96-DPI metrics.
         let atlas = Atlas::new(font, points_to_px(self.config.font.size, 1.0));
+        let bar_height = if self.config.bar.enabled {
+            atlas.cell_height + pad
+        } else {
+            0
+        };
         let inner = winit::dpi::LogicalSize::new(
             u32::from(window_cfg.columns) * atlas.cell_width + 2 * pad,
-            u32::from(window_cfg.rows) * atlas.cell_height + 2 * pad,
+            u32::from(window_cfg.rows) * atlas.cell_height + 2 * pad + bar_height,
         );
 
         let mut title = format!("Aeon {}", crate::VERSION);
@@ -87,19 +109,21 @@ impl App {
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
 
-        let size = window.inner_size();
-        let (rows, cols) = grid_size(size, &atlas, self.scaled_padding(&window));
-        let term = Terminal::new(rows, cols);
+        let layout = self.layout(window.inner_size(), &atlas, &window);
+        let term = Terminal::new(layout.rows, layout.cols);
 
-        let mut shell = match &self.config.shell.program {
-            Some(program) => aeon_pty::Command::new(program).args(&self.config.shell.args),
-            None => aeon_pty::default_shell(),
-        };
-        shell.cwd = self.config.shell.cwd.clone().or_else(start_dir);
-        let mut pty = Pty::spawn(&shell, pty_size(rows, cols))?;
+        let shell = self.shell_command();
+        let mut pty = Pty::spawn(&shell, pty_size(layout.rows, layout.cols))?;
         let output = pty.take_reader().ok_or("pty reader already taken")?;
         let input = pty.take_writer().ok_or("pty writer already taken")?;
         spawn_reader(output, self.proxy.clone());
+
+        let watcher = self.config.bar.enabled.then(|| {
+            let proxy = self.proxy.clone();
+            Watcher::spawn(pty.pid(), shell.cwd.clone(), move |context| {
+                let _ = proxy.send_event(Event::Context(context));
+            })
+        });
 
         Ok(Session {
             window,
@@ -108,20 +132,60 @@ impl App {
             term,
             pty,
             input,
+            context: Context {
+                cwd: shell.cwd,
+                ..Context::default()
+            },
+            watcher,
         })
+    }
+
+    fn shell_command(&self) -> aeon_pty::Command {
+        let shell = &self.config.shell;
+        let mut command = match &shell.program {
+            Some(program) => aeon_pty::Command::new(program).args(&shell.args),
+            None => aeon_pty::default_shell(),
+        };
+        if shell.integration {
+            command = aeon_pty::integrate(command);
+        }
+        command.cwd = shell.cwd.clone().or_else(start_dir);
+        command
+            .env("TERM_PROGRAM", "aeon")
+            .env("TERM_PROGRAM_VERSION", crate::VERSION)
+            .env("COLORTERM", "truecolor")
     }
 
     fn scaled_padding(&self, window: &Window) -> u32 {
         (f64::from(self.config.window.padding) * window.scale_factor()).round() as u32
     }
 
+    fn layout(&self, size: PhysicalSize<u32>, atlas: &Atlas, window: &Window) -> Layout {
+        let padding = self.scaled_padding(window);
+        let bar_height = if self.config.bar.enabled {
+            atlas.cell_height + padding
+        } else {
+            0
+        };
+        let term_height = size.height.saturating_sub(bar_height);
+        let w = size.width.saturating_sub(2 * padding);
+        let h = term_height.saturating_sub(2 * padding);
+        Layout {
+            rows: (h / atlas.cell_height).max(1) as usize,
+            cols: (w / atlas.cell_width).max(1) as usize,
+            bar_top: self.config.bar.enabled.then_some(term_height),
+        }
+    }
+
     fn resize(&mut self, size: PhysicalSize<u32>) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let layout = self.layout(size, &session.atlas, &session.window);
         let Some(session) = self.session.as_mut() else {
             return;
         };
-        let pad =
-            (f64::from(self.config.window.padding) * session.window.scale_factor()).round() as u32;
-        let (rows, cols) = grid_size(size, &session.atlas, pad);
+        let (rows, cols) = (layout.rows, layout.cols);
         if (rows, cols) != (session.term.grid().rows(), session.term.grid().cols()) {
             session.term.resize(rows, cols);
             let _ = session.pty.resize(pty_size(rows, cols));
@@ -130,14 +194,15 @@ impl App {
     }
 
     fn redraw(&mut self) {
-        let padding = self
-            .session
-            .as_ref()
-            .map(|s| self.scaled_padding(&s.window));
-        let (Some(session), Some(padding)) = (self.session.as_mut(), padding) else {
+        let Some(session) = self.session.as_ref() else {
             return;
         };
+        let padding = self.scaled_padding(&session.window);
         let size = session.window.inner_size();
+        let layout = self.layout(size, &session.atlas, &session.window);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return;
         };
@@ -156,9 +221,19 @@ impl App {
             &mut frame,
             &session.term,
             &mut session.atlas,
-            &self.config.colors,
+            &self.theme,
             padding,
         );
+        if let Some(top) = layout.bar_top {
+            render::draw_bar(
+                &mut frame,
+                &mut session.atlas,
+                &self.theme,
+                &session.context,
+                top,
+                padding,
+            );
+        }
         let _ = buffer.present();
     }
 
@@ -214,7 +289,28 @@ impl ApplicationHandler<Event> for App {
         match event {
             Event::Output(bytes) => {
                 session.term.advance(&bytes);
-                if session.term.take_dirty() {
+                let mut redraw = session.term.take_dirty();
+                if session.term.take_cwd_changed()
+                    && let Some(cwd) = session.term.cwd().map(PathBuf::from)
+                {
+                    // Show the new directory now; git and servers follow
+                    // from the watcher.
+                    session.context.cwd = Some(cwd.clone());
+                    session.context.git = None;
+                    if let Some(watcher) = &session.watcher {
+                        watcher.set_cwd(cwd);
+                    }
+                    redraw = true;
+                }
+                if redraw {
+                    session.window.request_redraw();
+                }
+            }
+            Event::Context(context) => {
+                // The watcher may answer for a directory the shell already
+                // left; never let it overwrite a newer one.
+                if context.cwd == session.context.cwd {
+                    session.context = context;
                     session.window.request_redraw();
                 }
             }
@@ -259,15 +355,6 @@ fn start_dir() -> Option<PathBuf> {
 
 fn points_to_px(points: f32, scale_factor: f64) -> f32 {
     (f64::from(points) * 96.0 / 72.0 * scale_factor) as f32
-}
-
-fn grid_size(size: PhysicalSize<u32>, atlas: &Atlas, padding: u32) -> (usize, usize) {
-    let w = size.width.saturating_sub(2 * padding);
-    let h = size.height.saturating_sub(2 * padding);
-    (
-        (h / atlas.cell_height).max(1) as usize,
-        (w / atlas.cell_width).max(1) as usize,
-    )
 }
 
 fn pty_size(rows: usize, cols: usize) -> PtySize {

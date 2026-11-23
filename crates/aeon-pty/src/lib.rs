@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 mod conpty;
+mod shell;
+
+pub use shell::integrate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {
@@ -23,6 +26,8 @@ pub struct Command {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
+    /// Variables set on top of Aeon's own environment.
+    pub env: Vec<(OsString, OsString)>,
 }
 
 impl Command {
@@ -31,6 +36,7 @@ impl Command {
             program: program.into(),
             args: Vec::new(),
             cwd: None,
+            env: Vec::new(),
         }
     }
 
@@ -46,6 +52,11 @@ impl Command {
 
     pub fn cwd(mut self, dir: impl Into<PathBuf>) -> Self {
         self.cwd = Some(dir.into());
+        self
+    }
+
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.env.push((key.into(), value.into()));
         self
     }
 }
@@ -93,6 +104,14 @@ impl Pty {
             let _ = size;
             Ok(())
         }
+    }
+
+    /// The shell's process id, for finding what it started.
+    pub fn pid(&self) -> u32 {
+        #[cfg(windows)]
+        return self.inner.pid();
+        #[cfg(not(windows))]
+        0
     }
 
     /// Blocks until the shell exits and returns its exit code.

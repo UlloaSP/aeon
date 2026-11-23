@@ -1,0 +1,20 @@
+[package]
+name = "aeon-context"
+description = "What the context bar shows: working directory, git state, and servers the shell started."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+  "Win32_Foundation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+  "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[lints]
+workspace = true
