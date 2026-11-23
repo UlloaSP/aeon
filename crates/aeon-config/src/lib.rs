@@ -18,6 +18,7 @@ pub struct Config {
     pub window: Window,
     pub colors: Colors,
     pub bar: Bar,
+    pub launcher: Launcher,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -55,6 +56,23 @@ pub struct Bar {
 impl Default for Bar {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// The quick launcher that the resident Aeon (`aeon --background`, started
+/// at sign-in) opens from anywhere.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Launcher {
+    /// Global hotkey, such as `"Ctrl+Alt+Space"` or `"Win+`"`.
+    pub hotkey: String,
+}
+
+impl Default for Launcher {
+    fn default() -> Self {
+        Self {
+            hotkey: "Ctrl+Alt+Space".to_owned(),
+        }
     }
 }
 

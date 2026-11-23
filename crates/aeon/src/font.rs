@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use fontdue::{Font, FontSettings, Metrics};
 
@@ -11,12 +12,12 @@ const SYSTEM_FONTS: &[&str] = &[
 ];
 
 /// Where glyphs the main font lacks come from, such as the prompt's `❯` under
-/// Consolas. Loaded only when the first missing glyph shows up: Segoe UI
-/// Symbol alone is a few megabytes.
-const FALLBACK_FONTS: &[&str] = &[
-    r"C:\Windows\Fonts\CascadiaMono.ttf",
-    r"C:\Windows\Fonts\seguisym.ttf",
-];
+/// Consolas. Loaded only when the first missing glyph shows up.
+///
+/// Not Segoe UI Symbol or emoji fonts: fontdue builds every glyph of a font
+/// when it loads, and Segoe UI Symbol alone costs about 45 MB that way.
+/// Glyphs neither font has render as a box until fallback rasterizes on demand.
+const FALLBACK_FONTS: &[&str] = &[r"C:\Windows\Fonts\CascadiaMono.ttf"];
 
 pub fn load(configured: Option<&Path>) -> Result<Font, String> {
     let candidates: Vec<PathBuf> = match configured {
@@ -47,7 +48,7 @@ pub struct Glyph {
 
 /// One font at one pixel size, with every glyph rasterized at most once.
 pub struct Atlas {
-    font: Font,
+    font: Rc<Font>,
     /// `None` until a glyph is missing from `font`.
     fallbacks: Option<Vec<Font>>,
     px: f32,
@@ -58,11 +59,11 @@ pub struct Atlas {
 }
 
 impl Atlas {
-    pub fn new(font: Font, px: f32) -> Self {
+    pub fn new(font: Rc<Font>, px: f32) -> Self {
         Self::with_fallbacks(font, None, px)
     }
 
-    fn with_fallbacks(font: Font, fallbacks: Option<Vec<Font>>, px: f32) -> Self {
+    fn with_fallbacks(font: Rc<Font>, fallbacks: Option<Vec<Font>>, px: f32) -> Self {
         let line = font
             .horizontal_line_metrics(px)
             .expect("monospace fonts have horizontal metrics");

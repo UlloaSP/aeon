@@ -13,8 +13,9 @@ const CMD_PROMPT: &str = r"$e]9;9;$P$e\$P$G";
 
 /// Sets up PowerShell and cmd for Aeon. PowerShell starts without the user's
 /// profile, with Aeon's history file and prompt. Both report their working
-/// directory for the context bar.
-pub fn integrate(command: Command) -> Command {
+/// directory for the context bar. `run` is a first command for the session,
+/// which then stays open (the launcher's Ctrl+Enter).
+pub fn integrate(command: Command, run: Option<&str>) -> Command {
     if !command.args.is_empty() {
         return command;
     }
@@ -24,10 +25,23 @@ pub fn integrate(command: Command) -> Command {
         .unwrap_or_default()
         .to_lowercase();
     match stem.as_str() {
-        "pwsh" | "powershell" => command
-            .args(["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand"])
-            .arg(encoded_command(POWERSHELL_INIT)),
-        "cmd" => command.env("PROMPT", CMD_PROMPT),
+        "pwsh" | "powershell" => {
+            let mut script = POWERSHELL_INIT.to_owned();
+            if let Some(run) = run {
+                script.push('\n');
+                script.push_str(run);
+            }
+            command
+                .args(["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand"])
+                .arg(encoded_command(&script))
+        }
+        "cmd" => {
+            let command = command.env("PROMPT", CMD_PROMPT);
+            match run {
+                Some(run) => command.args(["/k", run]),
+                None => command,
+            }
+        }
         _ => command,
     }
 }
@@ -79,27 +93,39 @@ mod tests {
 
     #[test]
     fn powershell_skips_the_profile() {
-        let command = integrate(Command::new(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        let command = integrate(
+            Command::new(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            None,
+        );
         assert_eq!(
             command.args[..4],
             ["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand"]
         );
-        let windows = integrate(Command::new("powershell.exe"));
+        let windows = integrate(Command::new("powershell.exe"), None);
         assert!(windows.args.iter().any(|a| a == "-NoProfile"));
     }
 
     #[test]
     fn cmd_reports_its_directory() {
-        let command = integrate(Command::new(r"C:\WINDOWS\system32\cmd.exe"));
+        let command = integrate(Command::new(r"C:\WINDOWS\system32\cmd.exe"), None);
         assert!(command.args.is_empty());
         assert_eq!(command.env, [("PROMPT".into(), CMD_PROMPT.into())]);
     }
 
     #[test]
+    fn a_first_command_runs_and_the_session_stays_open() {
+        let cmd = integrate(Command::new("cmd.exe"), Some("git status"));
+        assert_eq!(cmd.args, ["/k", "git status"]);
+        let pwsh = integrate(Command::new("pwsh.exe"), Some("git status"));
+        assert_ne!(pwsh.args, integrate(Command::new("pwsh.exe"), None).args);
+        assert!(pwsh.args.iter().any(|a| a == "-NoExit"));
+    }
+
+    #[test]
     fn explicit_args_and_unknown_shells_are_untouched() {
         let pwsh = Command::new("pwsh.exe").arg("-Login");
-        assert_eq!(integrate(pwsh.clone()), pwsh);
+        assert_eq!(integrate(pwsh.clone(), Some("x")), pwsh);
         let wsl = Command::new("wsl.exe");
-        assert_eq!(integrate(wsl.clone()), wsl);
+        assert_eq!(integrate(wsl.clone(), Some("x")), wsl);
     }
 }

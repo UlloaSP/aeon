@@ -18,6 +18,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **Fast.** Native Rust, built with full link-time optimization. Startup is instant, and a dropped frame is a bug.
 - **Small.** One static `aeon.exe` under 1 MB. A window with a shell uses about 13 MB of private memory. Every release build reports both numbers, so regressions are caught before they ship.
 - **Native to Windows.** ConPTY, per-monitor DPI, x64 and arm64, and an MSI installer that puts `aeon` on your PATH.
+- **A launcher on Ctrl+Alt+Space.** From anywhere, type a command and press Enter to run it, or do quick math. Your history comes with you.
 - **Context at a glance.** A bar under the terminal shows where you are, the git branch and pending changes, and the servers you started from that shell (`node :5173`). No prompt framework needed.
 - **Full color.** 16, 256, and 24-bit color, with Aeon's own theme or yours.
 - **No account, no telemetry.** It is a terminal.
@@ -44,6 +45,17 @@ Builds are not code-signed yet, so Windows SmartScreen may warn the first time y
 
 Aeon reads `%APPDATA%\aeon\config.toml`. Every setting is optional, and an unknown key is an error, so typos don't fail silently. If the file is invalid, Aeon starts with the defaults and says so in the window title.
 
+### The launcher
+
+Aeon starts with Windows and waits in the background, using about 8 MB. Press **Ctrl+Alt+Space** anywhere to open the launcher:
+
+- Type a command, such as `code C:\code\app`, and press **Enter**. It starts in the background, the way Win+R would, and the launcher closes.
+- **Ctrl+Enter** opens it in an Aeon terminal instead, so you can watch the output.
+- Type math, such as `5*3-2` or `sqrt(2)`, and the result appears as you type. **Enter** copies it.
+- The list shows what you ran from the launcher, then your PowerShell history in Aeon, filtered as you type. **Up** and **Down** pick one, and **Tab** puts it in the box to edit.
+
+To stop it from starting with Windows, turn off Aeon in Task Manager, under Startup apps.
+
 ### Your shell inside Aeon
 
 Aeon starts PowerShell **without your profile**, with its own prompt and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. Prompt themes like Oh My Posh are not needed: the context bar shows the same information, for every shell. cmd keeps its usual prompt and reports its directory to the bar.
@@ -65,6 +77,9 @@ size = 11.0                   # points
 columns = 120
 rows = 32
 padding = 8
+
+[launcher]
+hotkey = "Ctrl+Alt+Space"     # Ctrl, Alt, Shift, Win + a letter, digit, F1-F24, Space, or `
 
 [bar]
 enabled = true                # directory, git, and servers under the terminal
