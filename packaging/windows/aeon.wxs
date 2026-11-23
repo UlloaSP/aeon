@@ -28,6 +28,9 @@
       DowngradeErrorMessage="A newer version of Aeon is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!-- The icon in Settings > Apps. aeon.exe carries the same icon itself. -->
+    <Icon Id="AeonIcon" SourceFile="$(sys.SOURCEFILEDIR)aeon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AeonIcon" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/UlloaSP/aeon" />
     <Property Id="ARPHELPLINK" Value="https://github.com/UlloaSP/aeon/issues" />
     <Property Id="ARPNOREPAIR" Value="1" />
