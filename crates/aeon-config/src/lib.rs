@@ -18,6 +18,7 @@ pub struct Config {
     pub window: Window,
     pub colors: Colors,
     pub bar: Bar,
+    pub launcher: Launcher,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -55,6 +56,23 @@ pub struct Bar {
 impl Default for Bar {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// The quick launcher that the resident Aeon (`aeon --background`, started
+/// at sign-in) opens from anywhere.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Launcher {
+    /// Global hotkey, such as `"Ctrl+Alt+Space"` or `"Win+`"`.
+    pub hotkey: String,
+}
+
+impl Default for Launcher {
+    fn default() -> Self {
+        Self {
+            hotkey: "Ctrl+Alt+Space".to_owned(),
+        }
     }
 }
 
@@ -111,10 +129,11 @@ pub struct Colors {
 impl Default for Colors {
     fn default() -> Self {
         Self {
-            foreground: Rgb::new(0xd8, 0xdb, 0xe2),
-            background: Rgb::new(0x10, 0x11, 0x14),
-            cursor: Rgb::new(0xf2, 0xb8, 0x4b),
-            bar_background: Rgb::new(0x1a, 0x1c, 0x22),
+            // Aeon's brand: ink, paper, and the amber of the logo's cursor.
+            foreground: Rgb::new(0xf2, 0xf1, 0xec),
+            background: Rgb::new(0x0c, 0x0d, 0x10),
+            cursor: Rgb::new(0xff, 0xb5, 0x47),
+            bar_background: Rgb::new(0x17, 0x18, 0x1c),
             normal: Palette::default(),
             bright: Palette::default(),
         }

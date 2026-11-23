@@ -14,9 +14,11 @@ repository = "https://github.com/UlloaSP/aeon"
 [workspace.dependencies]
 aeon-config = { path = "crates/aeon-config" }
 aeon-context = { path = "crates/aeon-context" }
+aeon-launcher = { path = "crates/aeon-launcher" }
 aeon-pty = { path = "crates/aeon-pty" }
 aeon-term = { path = "crates/aeon-term" }
 
+embed-resource = "3.0.12"
 fontdue = "0.9.5"
 serde = { version = "1.0.229", features = ["derive"] }
 softbuffer = { version = "0.4.8", default-features = false }
