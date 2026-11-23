@@ -61,7 +61,7 @@ One window holds as many shells as you want, listed in the sidebar with their fo
 | Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
 | Ctrl+Shift+B | Show or hide the sidebar |
 
-Aeon's shortcuts use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%eon\state`, apart from your `config.toml`.
+Aeon's shortcuts use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%\aeon\state`, apart from your `config.toml`.
 
 ### The launcher
 
