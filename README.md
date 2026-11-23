@@ -75,6 +75,8 @@ Aeon starts with Windows and waits in the background, using about 8 MB. Press **
 - Type math, such as `5*3-2` or `sqrt(2)`, and the result appears as you type. **Enter** copies it.
 - The list shows what you ran from the launcher, then your PowerShell history in Aeon, filtered as you type. **Up** and **Down** pick one, and **Tab** puts it in the box to edit.
 
+While it runs, Aeon has an icon in the notification area (under the taskbar's hidden icons). Click it to open the launcher, or right-click for a new terminal, your settings, or to quit.
+
 To stop it from starting with Windows, turn off Aeon in Task Manager, under Startup apps.
 
 ### Your shell inside Aeon
