@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Aeon installer, built by scripts/package-msi.ps1 with WiX v5.
+  Aeon installer, built by scripts/package-msi.ps1 with WiX v5 and its Util
+  extension.
 
   Preprocessor variables (passed with -d):
     Version  Numeric MSI version, major.minor.patch. Prerelease suffixes are
@@ -10,7 +11,8 @@
   UpgradeCode identifies the product across every version. Changing it makes
   a new install sit next to the old one instead of replacing it. Never change it.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package
     Name="Aeon"
     Manufacturer="Aeon"
@@ -51,7 +53,42 @@
             Permanent="no"
             System="yes" />
         </Component>
+        <!-- The resident launcher starts at every sign-in, for every user.
+             Users can turn it off in Task Manager > Startup apps. -->
+        <Component Id="Autostart">
+          <RegistryValue
+            Root="HKLM"
+            Key="Software\Microsoft\Windows\CurrentVersion\Run"
+            Name="Aeon"
+            Type="string"
+            Value="&quot;[INSTALLFOLDER]aeon.exe&quot; --background"
+            KeyPath="yes" />
+        </Component>
       </Directory>
     </StandardDirectory>
+
+    <!-- Upgrades and uninstalls replace or remove aeon.exe, so every running
+         Aeon is asked to close first (the resident exits on WM_CLOSE), and
+         terminated if it does not. -->
+    <util:CloseApplication
+      Id="CloseAeon"
+      Target="aeon.exe"
+      CloseMessage="yes"
+      RebootPrompt="no"
+      TerminateProcess="1" />
+
+    <!-- Start the resident right away instead of at the next sign-in. This
+         runs in the UI sequence, which is the installing user's own
+         unelevated process: a resident started from the elevated execute
+         sequence would run every launched command as administrator. Silent
+         installs skip it; the resident then starts at the next sign-in. -->
+    <CustomAction
+      Id="StartResident"
+      FileRef="AeonExeFile"
+      ExeCommand="--background"
+      Return="asyncNoWait" />
+    <InstallUISequence>
+      <Custom Action="StartResident" After="ExecuteAction" Condition="NOT REMOVE~=&quot;ALL&quot;" />
+    </InstallUISequence>
   </Package>
 </Wix>

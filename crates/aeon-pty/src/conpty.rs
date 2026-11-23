@@ -327,7 +327,7 @@ mod tests {
         let appdata = std::env::temp_dir().join(format!("aeon-test-{}", std::process::id()));
         // Not the temp dir: on CI it is an 8.3 short path the shell may expand.
         let cwd = env!("CARGO_MANIFEST_DIR");
-        let command = crate::integrate(Command::new(program))
+        let command = crate::integrate(Command::new(program), None)
             .cwd(cwd)
             .env("APPDATA", &appdata);
         let (_pty, _) = spawn_until(&command, &format!("\x1b]9;9;\"{cwd}\""));

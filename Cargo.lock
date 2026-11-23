@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "aeon-config",
  "aeon-context",
+ "aeon-launcher",
  "aeon-pty",
  "aeon-term",
  "fontdue",
@@ -26,6 +27,13 @@ dependencies = [
 
 [[package]]
 name = "aeon-context"
+version = "0.1.0"
+dependencies = [
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aeon-launcher"
 version = "0.1.0"
 dependencies = [
  "windows-sys 0.61.2",
