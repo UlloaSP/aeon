@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use aeon_config::Config;
 use aeon_launcher::{
-    Action, App, Hotkey, Icon, Icons, Item, Launcher, Sources, Theme as WindowsTheme, apps,
-    history, sys,
+    Action, App, Hotkey, Icon, Icons, Item, Launcher, Sources, Theme as WindowsTheme, TrayCommand,
+    apps, history, sys,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -57,6 +57,8 @@ pub enum Event {
     },
     /// An app's icon, or `None` when the shell has none, from the icon thread.
     Icon(String, Option<Icon>),
+    /// A click or menu pick on the notification-area icon.
+    Tray(TrayCommand),
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -71,6 +73,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 struct Resident {
     proxy: EventLoopProxy<Event>,
+    /// Kept so the icon is removed when the resident exits.
+    tray: Option<sys::Tray>,
     config: Config,
     theme: Theme,
     hotkey: Result<Hotkey, String>,
@@ -115,6 +119,7 @@ impl Resident {
         };
         Self {
             proxy,
+            tray: None,
             theme: Theme::new(&config.colors),
             config,
             hotkey,
@@ -308,8 +313,7 @@ impl Resident {
     }
 
     fn perform(&mut self, action: Action) {
-        let home =
-            std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from);
+        let home = home_dir();
         let result = match &action {
             Action::Copy(text) => match self.view.as_ref().and_then(|v| hwnd(&v.window)) {
                 Some(owner) if sys::set_clipboard(owner, text) => Ok(()),
@@ -563,6 +567,32 @@ fn draw_icon(frame: &mut Frame<'_>, icon: &Icon, x: i32, y: i32, size: u32) {
     }
 }
 
+fn home_dir() -> PathBuf {
+    std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from)
+}
+
+/// Opens `config.toml` in the user's editor, creating it with a pointer to
+/// the documentation when it does not exist yet: the menu item is the user
+/// asking for it. Without an app for `.toml`, Notepad opens it.
+fn open_settings() {
+    let Some(path) = Config::default_path() else {
+        return;
+    };
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(
+            &path,
+            "# Aeon settings. Every key is optional, and an unknown key is an error.\n\
+             # All options: https://github.com/UlloaSP/aeon#configuration\n",
+        );
+    }
+    if !sys::open_url(&path.to_string_lossy()) {
+        let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
+    }
+}
+
 fn hwnd(window: &Window) -> Option<isize> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
@@ -614,6 +644,17 @@ impl ApplicationHandler<Event> for Resident {
             })
         });
         self.load_apps_if_stale();
+        let label = match &self.hotkey {
+            Ok(hotkey) => format!("Open launcher\t{hotkey}"),
+            Err(_) => "Open launcher".to_owned(),
+        };
+        let proxy = self.proxy.clone();
+        match sys::show_tray("Aeon", &label, move |command| {
+            let _ = proxy.send_event(Event::Tray(command));
+        }) {
+            Ok(tray) => self.tray = Some(tray),
+            Err(e) => eprintln!("aeon: no tray icon: {e}"),
+        }
         // A resident nobody can reach is useless: say why, once, on screen.
         if let Err(e) = registered {
             self.error = Some(e);
@@ -621,9 +662,24 @@ impl ApplicationHandler<Event> for Resident {
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Hotkey => self.toggle(),
+            Event::Tray(TrayCommand::OpenLauncher) => {
+                if self.view.as_ref().and_then(|v| v.window.is_visible()) != Some(true) {
+                    self.toggle();
+                }
+            }
+            Event::Tray(TrayCommand::NewTerminal) => {
+                let _ = std::env::current_exe().and_then(|exe| {
+                    std::process::Command::new(exe)
+                        .current_dir(home_dir())
+                        .spawn()
+                        .map(drop)
+                });
+            }
+            Event::Tray(TrayCommand::OpenSettings) => open_settings(),
+            Event::Tray(TrayCommand::Quit) => event_loop.exit(),
             Event::Icon(id, icon) => {
                 self.icons_pending.remove(&id);
                 self.icon_cache.insert(id, icon);

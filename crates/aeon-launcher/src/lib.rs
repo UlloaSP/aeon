@@ -100,6 +100,15 @@ fn builtins(query: &str) -> Vec<Builtin> {
     }
 }
 
+/// What the notification-area icon asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayCommand {
+    OpenLauncher,
+    NewTerminal,
+    OpenSettings,
+    Quit,
+}
+
 /// What choosing an item asks the caller to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
