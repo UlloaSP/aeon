@@ -47,6 +47,8 @@ Builds are not code-signed yet, so Windows SmartScreen may warn the first time y
 
 ## Configuration
 
+Press **Ctrl+,** (or click **Settings** at the bottom of the sidebar) to change the shell, font, size, padding, context bar, launcher hotkey, and web search from inside Aeon. Changes apply at once and are saved to `config.toml` without touching anything else in it, comments included.
+
 Aeon reads `%APPDATA%\aeon\config.toml`. Every setting is optional, and an unknown key is an error, so typos don't fail silently. If the file is invalid, Aeon starts with the defaults and says so in the window title.
 
 ### Sessions
