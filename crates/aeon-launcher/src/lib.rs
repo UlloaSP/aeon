@@ -11,6 +11,8 @@ mod hotkey;
 pub mod icons;
 #[cfg(windows)]
 pub mod sys;
+pub mod update;
+pub mod updater;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -109,6 +111,40 @@ pub enum TrayCommand {
     Quit,
     /// A terminal saved settings; re-read config.toml.
     Reload,
+    CheckUpdates,
+    DownloadUpdate,
+    InstallUpdate,
+}
+
+/// What a terminal asks the resident to do, sent to its tray window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResidentCommand {
+    SettingsChanged = 1,
+    CheckUpdates = 2,
+    DownloadUpdate = 3,
+    InstallUpdate = 4,
+}
+
+impl ResidentCommand {
+    pub fn from_code(code: usize) -> Option<Self> {
+        [
+            Self::SettingsChanged,
+            Self::CheckUpdates,
+            Self::DownloadUpdate,
+            Self::InstallUpdate,
+        ]
+        .into_iter()
+        .find(|c| *c as usize == code)
+    }
+
+    pub fn tray_command(self) -> TrayCommand {
+        match self {
+            Self::SettingsChanged => TrayCommand::Reload,
+            Self::CheckUpdates => TrayCommand::CheckUpdates,
+            Self::DownloadUpdate => TrayCommand::DownloadUpdate,
+            Self::InstallUpdate => TrayCommand::InstallUpdate,
+        }
+    }
 }
 
 /// What choosing an item asks the caller to do.

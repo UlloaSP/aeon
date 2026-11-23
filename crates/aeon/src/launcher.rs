@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use aeon_config::Config;
 use aeon_launcher::{
     Action, App, Hotkey, Icon, Icons, Item, Launcher, Sources, Theme as WindowsTheme, TrayCommand,
-    apps, history, sys,
+    apps, history, sys, update, updater,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -59,9 +59,12 @@ pub enum Event {
     Icon(String, Option<Icon>),
     /// A click or menu pick on the notification-area icon.
     Tray(TrayCommand),
+    /// The update thread's new status.
+    Update(update::Status),
 }
 
-pub fn run(at_sign_in: bool) -> Result<(), Box<dyn std::error::Error>> {
+/// `check_updates`: a terminal asked to check while no resident ran.
+pub fn run(at_sign_in: bool, check_updates: bool) -> Result<(), Box<dyn std::error::Error>> {
     if at_sign_in {
         let config = Config::default_path()
             .and_then(|p| Config::load(&p).ok())
@@ -75,6 +78,9 @@ pub fn run(at_sign_in: bool) -> Result<(), Box<dyn std::error::Error>> {
     }
     let event_loop = EventLoop::<Event>::with_user_event().build()?;
     let mut resident = Resident::new(event_loop.create_proxy());
+    if check_updates {
+        resident.updater.request(updater::Request::Check);
+    }
     event_loop.run_app(&mut resident)?;
     Ok(())
 }
@@ -101,6 +107,9 @@ struct Resident {
     modifiers: ModifiersState,
     /// Shown in place of the placeholder: a bad hotkey or a failed launch.
     error: Option<String>,
+    updater: updater::Updater,
+    /// The last update the tray announced, so each is announced once.
+    announced: Option<String>,
 }
 
 /// The window and what draws it, created once and then shown and hidden.
@@ -127,7 +136,20 @@ impl Resident {
                 let _ = proxy.send_event(Event::Icon(id, icon));
             })
         };
+        let updater = {
+            let proxy = proxy.clone();
+            updater::Updater::spawn(
+                crate::VERSION,
+                channel(&config),
+                config.updates.check,
+                move |status| {
+                    let _ = proxy.send_event(Event::Update(status.clone()));
+                },
+            )
+        };
         Self {
+            updater,
+            announced: None,
             proxy,
             tray: None,
             hotkey_listener: None,
@@ -239,6 +261,10 @@ impl Resident {
             .parse::<Hotkey>()
             .map_err(|e| format!("Invalid [launcher] hotkey: {e}"));
         self.theme = Theme::new(&config.colors);
+        self.updater.request(updater::Request::Configure {
+            channel: channel(&config),
+            automatic: config.updates.check,
+        });
         let hotkey_changed = hotkey != self.hotkey;
         self.config = config;
         self.hotkey = hotkey;
@@ -624,6 +650,13 @@ fn draw_icon(frame: &mut Frame<'_>, icon: &Icon, x: i32, y: i32, size: u32) {
     }
 }
 
+fn channel(config: &Config) -> update::Channel {
+    match config.updates.channel {
+        aeon_config::Channel::Stable => update::Channel::Stable,
+        aeon_config::Channel::Nightly => update::Channel::Nightly,
+    }
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from)
 }
@@ -724,6 +757,25 @@ impl ApplicationHandler<Event> for Resident {
             Event::Tray(TrayCommand::OpenSettings) => open_settings(),
             Event::Tray(TrayCommand::Quit) => event_loop.exit(),
             Event::Tray(TrayCommand::Reload) => self.reload(),
+            Event::Tray(TrayCommand::CheckUpdates) => self.updater.request(updater::Request::Check),
+            Event::Tray(TrayCommand::DownloadUpdate) => {
+                self.updater.request(updater::Request::Download)
+            }
+            Event::Tray(TrayCommand::InstallUpdate) => {
+                self.updater.request(updater::Request::Install)
+            }
+            Event::Update(update::Status::Available(release)) => {
+                if self.announced.as_ref() != Some(&release.version) {
+                    if let Some(tray) = &self.tray {
+                        tray.notify(
+                            &format!("Aeon {} is available", release.version),
+                            "Download it from the bottom of the sidebar in any Aeon window.",
+                        );
+                    }
+                    self.announced = Some(release.version);
+                }
+            }
+            Event::Update(_) => {}
             Event::Icon(id, icon) => {
                 self.icons_pending.remove(&id);
                 self.icon_cache.insert(id, icon);

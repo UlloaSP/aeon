@@ -24,6 +24,7 @@ pub struct Config {
     pub launcher: Launcher,
     pub keys: Keys,
     pub cursor: Cursor,
+    pub updates: Updates,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -113,6 +114,34 @@ impl Default for Keys {
             settings: "Ctrl+,".to_owned(),
         }
     }
+}
+
+/// Updates, which the resident checks for and the user installs.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Updates {
+    pub channel: Channel,
+    /// Check shortly after sign-in and every few hours. Off, Aeon only checks
+    /// when asked.
+    pub check: bool,
+}
+
+impl Default for Updates {
+    fn default() -> Self {
+        Self {
+            channel: Channel::Stable,
+            check: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Channel {
+    #[default]
+    Stable,
+    /// Daily builds of `develop`, and stable releases when they are newer.
+    Nightly,
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -484,6 +513,16 @@ program = \"cmd.exe\"",
         assert_eq!(config.keys.settings, "Ctrl+,");
         assert_eq!(config.cursor.style, CursorStyle::Bar);
         assert!(Config::parse("[cursor]\nstyle = \"beam\"").is_err());
+    }
+
+    #[test]
+    fn updates_default_to_stable_with_checks() {
+        assert_eq!(Config::default().updates.channel, Channel::Stable);
+        assert!(Config::default().updates.check);
+        let config = Config::parse("[updates]\nchannel = \"nightly\"\ncheck = false").unwrap();
+        assert_eq!(config.updates.channel, Channel::Nightly);
+        assert!(!config.updates.check);
+        assert!(Config::parse("[updates]\nchannel = \"beta\"").is_err());
     }
 
     #[test]

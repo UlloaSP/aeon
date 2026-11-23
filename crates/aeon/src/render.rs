@@ -247,6 +247,15 @@ impl Sidebar {
         x >= 0.0 && x < f64::from(self.width) && y >= f64::from(height.saturating_sub(self.header))
     }
 
+    /// Whether a point is on the update row above Settings, when it is shown.
+    pub fn is_update_button(&self, x: f64, y: f64, height: u32) -> bool {
+        let top = height.saturating_sub(2 * self.header);
+        x >= 0.0
+            && x < f64::from(self.width)
+            && y >= f64::from(top)
+            && y < f64::from(top + self.header)
+    }
+
     /// Whether a point is on the header's "+" (new session).
     pub fn is_new_button(&self, x: f64, y: f64, atlas: &Atlas) -> bool {
         let button = f64::from(self.pad + 2 * atlas.cell_width);
@@ -262,15 +271,36 @@ pub struct SidebarEntry<'a> {
     pub context: &'a Context,
 }
 
+/// Everything the sidebar shows.
+pub struct SidebarContent<'a> {
+    pub entries: &'a [SidebarEntry<'a>],
+    pub active: usize,
+    pub settings_open: bool,
+    pub update: Option<UpdateRow>,
+}
+
+/// The row above Settings while there is something to do about an update.
+pub struct UpdateRow {
+    pub icon: char,
+    pub label: String,
+    pub color: u32,
+    /// Filled behind the label while downloading.
+    pub percent: Option<u8>,
+}
+
 pub fn draw_sidebar(
     frame: &mut Frame<'_>,
     atlas: &mut Atlas,
     theme: &Theme,
     sidebar: &Sidebar,
-    entries: &[SidebarEntry<'_>],
-    active: usize,
-    settings_open: bool,
+    content: &SidebarContent<'_>,
 ) {
+    let (entries, active, settings_open, update) = (
+        content.entries,
+        content.active,
+        content.settings_open,
+        content.update.as_ref(),
+    );
     let [_, _, green, yellow, _, magenta, ..] = theme.ansi;
     let muted = theme.ansi[8];
     let (w, pad, cw, ch) = (
@@ -310,7 +340,8 @@ pub fn draw_sidebar(
 
     for (i, entry) in entries.iter().enumerate() {
         let top = sidebar.header + i as u32 * sidebar.row;
-        if top + sidebar.row > frame.height.saturating_sub(sidebar.header) {
+        let footer = sidebar.header * if update.is_some() { 2 } else { 1 };
+        if top + sidebar.row > frame.height.saturating_sub(footer) {
             break;
         }
         if i == active {
@@ -369,9 +400,42 @@ pub fn draw_sidebar(
             );
         }
     }
+    let divider = blend(theme.bar_bg, theme.fg, 24);
+    if let Some(update) = update {
+        let top = frame.height.saturating_sub(2 * sidebar.header);
+        fill_rect(frame, 0, top, w.saturating_sub(1), 1, divider);
+        if let Some(percent) = update.percent {
+            let filled = (w.saturating_sub(1)) * u32::from(percent.min(100)) / 100;
+            fill_rect(
+                frame,
+                0,
+                top + 1,
+                filled,
+                sidebar.header - 1,
+                blend(theme.bar_bg, update.color, 40),
+            );
+        }
+        draw_glyph(
+            frame,
+            atlas,
+            update.icon,
+            pad as i32,
+            (top + pad) as i32,
+            update.color,
+        );
+        draw_text(
+            frame,
+            atlas,
+            pad + 2 * cw,
+            top + pad,
+            &update.label,
+            update.color,
+            cols.saturating_sub(2),
+        );
+    }
+
     // Footer: Settings, highlighted while the panel is open.
     let top = frame.height.saturating_sub(sidebar.header);
-    let divider = blend(theme.bar_bg, theme.fg, 24);
     fill_rect(frame, 0, top, w.saturating_sub(1), 1, divider);
     if settings_open {
         fill_rect(

@@ -41,7 +41,9 @@ Download the MSI for your machine from the [latest release](https://github.com/U
 
 The installer adds Aeon to the Start menu and to your PATH, so you can also start it with `aeon` from any shell. Prefer no installer? Each release also has a portable `.zip` with just `aeon.exe`. `SHA256SUMS` lists the checksum of every file.
 
-Nightly builds of `main` are published as prereleases. They install over each other and over the stable release.
+Nightly builds of `develop` are published as prereleases. They install over each other and over the stable release.
+
+Aeon looks for new versions in the background, shortly after sign-in and every 4 hours. When one is out, the bottom of the sidebar says so: click it to download, then **Restart to update**. Nothing downloads or installs on its own, and the installer is checked against the release's SHA-256 before it runs. **Settings > About** checks on demand and switches between the Stable and Nightly channels.
 
 Builds are not code-signed yet, so Windows SmartScreen may warn the first time you run the installer.
 
@@ -121,6 +123,10 @@ enabled = true                # directory, git, and servers under the terminal
 
 [cursor]
 style = "block"               # block, bar, or underline
+
+[updates]
+channel = "stable"            # or "nightly": daily builds, and stable releases when newer
+check = true                  # look for updates at sign-in and every 4 hours
 
 [colors]
 theme = "aeon"                # aeon, aeon-light, dracula, nord, gruvbox-dark, solarized-dark,

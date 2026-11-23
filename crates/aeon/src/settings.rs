@@ -2,10 +2,13 @@
 //! setting saved straight to config.toml (comments kept, see
 //! `aeon_config::edit`). It takes the place of the terminal while open.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use aeon_config::edit::{Change, Value};
-use aeon_config::{Config, CursorStyle, themes};
+use aeon_config::{Channel, Config, CursorStyle, themes};
+use aeon_launcher::ResidentCommand;
+use aeon_launcher::update::Status;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::font::Atlas;
@@ -64,13 +67,22 @@ enum Control {
         key: &'static str,
     },
     Info(String),
-    Button(&'static str),
+    Button {
+        label: &'static str,
+        action: Action,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Action {
+    OpenConfigFile,
+    Update(ResidentCommand),
 }
 
 #[derive(Debug, Clone)]
 struct Row {
     title: &'static str,
-    description: &'static str,
+    description: Cow<'static, str>,
     control: Control,
 }
 
@@ -81,6 +93,8 @@ pub enum Outcome {
     Redraw,
     Save(Vec<Change>),
     OpenConfigFile,
+    /// Ask the resident to check for, download, or install an update.
+    Update(ResidentCommand),
     Close,
 }
 
@@ -91,12 +105,14 @@ pub struct Settings {
     rows: Vec<Row>,
     shells: Vec<Choice>,
     fonts: Vec<Choice>,
+    /// What the resident reports about updates, for About.
+    pub update: Status,
     /// Shown under the rows: why the last save failed.
     pub error: Option<String>,
 }
 
 impl Settings {
-    pub fn new(config: &Config) -> Self {
+    pub fn new(config: &Config, update: Status) -> Self {
         let mut settings = Self {
             section: 0,
             selected: 0,
@@ -104,6 +120,7 @@ impl Settings {
             rows: Vec::new(),
             shells: detect_shells(),
             fonts: detect_fonts(),
+            update,
             error: None,
         };
         settings.rebuild(config);
@@ -112,7 +129,13 @@ impl Settings {
 
     /// Rows for the current section, from what the config says now.
     pub fn rebuild(&mut self, config: &Config) {
-        self.rows = rows(SECTIONS[self.section].0, config, &self.shells, &self.fonts);
+        self.rows = rows(
+            SECTIONS[self.section].0,
+            config,
+            &self.shells,
+            &self.fonts,
+            &self.update,
+        );
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
     }
 
@@ -211,7 +234,14 @@ impl Settings {
                 self.error = None;
                 Outcome::Redraw
             }
-            Control::Button(_) => Outcome::OpenConfigFile,
+            Control::Button {
+                action: Action::OpenConfigFile,
+                ..
+            } => Outcome::OpenConfigFile,
+            Control::Button {
+                action: Action::Update(command),
+                ..
+            } => Outcome::Update(*command),
             _ => Outcome::None,
         }
     }
@@ -374,7 +404,7 @@ impl Settings {
                 atlas,
                 x,
                 line1 + ch,
-                row.description,
+                &row.description,
                 muted,
                 title_cols,
             );
@@ -487,7 +517,7 @@ impl Settings {
             Control::Info(text) => {
                 render::draw_text(frame, atlas, right(text), y, text, muted, cols)
             }
-            Control::Button(label) => {
+            Control::Button { label, .. } => {
                 let text = format!("{label} \u{203a}");
                 render::draw_text(frame, atlas, right(&text), y, &text, blue, cols);
             }
@@ -573,12 +603,18 @@ fn change(table: &'static str, key: &'static str, value: Option<Value>) -> Chang
     Change { table, key, value }
 }
 
-fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) -> Vec<Row> {
+fn rows(
+    section: Section,
+    config: &Config,
+    shells: &[Choice],
+    fonts: &[Choice],
+    update: &Status,
+) -> Vec<Row> {
     match section {
         Section::General => vec![
             Row {
                 title: "Shell",
-                description: "What new sessions run.",
+                description: "What new sessions run.".into(),
                 control: Control::Choice {
                     index: current_shell(config, shells),
                     options: shells.to_vec(),
@@ -586,7 +622,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Shell integration",
-                description: "Aeon's prompt and history. Off loads your PowerShell profile.",
+                description: "Aeon's prompt and history. Off loads your PowerShell profile.".into(),
                 control: Control::Toggle {
                     on: config.shell.integration,
                     table: "shell",
@@ -595,7 +631,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Context bar",
-                description: "Folder, git, and servers under the terminal.",
+                description: "Folder, git, and servers under the terminal.".into(),
                 control: Control::Toggle {
                     on: config.bar.enabled,
                     table: "bar",
@@ -604,7 +640,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Start with Windows",
-                description: "Keep the launcher ready from sign-in.",
+                description: "Keep the launcher ready from sign-in.".into(),
                 control: Control::Toggle {
                     on: config.launcher.start_with_windows,
                     table: "launcher",
@@ -615,7 +651,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
         Section::Appearance => vec![
             Row {
                 title: "Theme",
-                description: "Colors for the terminal, sidebar, and launcher.",
+                description: "Colors for the terminal, sidebar, and launcher.".into(),
                 control: Control::Choice {
                     index: themes::PRESETS
                         .iter()
@@ -636,7 +672,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Cursor",
-                description: "How the text cursor is drawn.",
+                description: "How the text cursor is drawn.".into(),
                 control: Control::Choice {
                     index: match config.cursor.style {
                         CursorStyle::Block => 0,
@@ -658,7 +694,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Font",
-                description: "Monospace fonts installed on this PC.",
+                description: "Monospace fonts installed on this PC.".into(),
                 control: Control::Choice {
                     index: current_font(config, fonts),
                     options: fonts.to_vec(),
@@ -666,7 +702,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Font size",
-                description: "Text size at 100% display scale.",
+                description: "Text size at 100% display scale.".into(),
                 control: Control::Number {
                     value: f64::from(config.font.size),
                     step: 0.5,
@@ -680,7 +716,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
             Row {
                 title: "Padding",
-                description: "Space around the terminal text.",
+                description: "Space around the terminal text.".into(),
                 control: Control::Number {
                     value: f64::from(config.window.padding),
                     step: 2.0,
@@ -696,7 +732,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
         Section::Keyboard => {
             let key_row = |title: &'static str, key: &'static str, value: &str| Row {
                 title,
-                description: "Enter, then press the new shortcut.",
+                description: "Enter, then press the new shortcut.".into(),
                 control: Control::Hotkey {
                     value: value.to_owned(),
                     table: "keys",
@@ -721,7 +757,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
                 key_row("Settings", "settings", &keys.settings),
                 Row {
                     title: "Go to a session",
-                    description: "Fixed: by its number in the sidebar.",
+                    description: "Fixed: by its number in the sidebar.".into(),
                     control: Control::Info("Ctrl+1 \u{2026} Ctrl+9".to_owned()),
                 },
             ]
@@ -757,7 +793,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             vec![
                 Row {
                     title: "Hotkey",
-                    description: "Opens the launcher from anywhere. Enter to record.",
+                    description: "Opens the launcher from anywhere. Enter to record.".into(),
                     control: Control::Hotkey {
                         value: config.launcher.hotkey.clone(),
                         table: "launcher",
@@ -766,7 +802,7 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
                 },
                 Row {
                     title: "Web search",
-                    description: "Where queries that are not a command or app go.",
+                    description: "Where queries that are not a command or app go.".into(),
                     control: Control::Choice { options, index },
                 },
             ]
@@ -774,15 +810,90 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
         Section::About => vec![
             Row {
                 title: "Version",
-                description: "The Aeon build you are running.",
+                description: "The Aeon build you are running.".into(),
                 control: Control::Info(crate::VERSION.to_owned()),
+            },
+            update_row(update),
+            Row {
+                title: "Update channel",
+                description: "Nightly: daily builds of what comes next.".into(),
+                control: Control::Choice {
+                    index: usize::from(config.updates.channel == Channel::Nightly),
+                    options: vec![
+                        Choice {
+                            label: "Stable".into(),
+                            changes: vec![change("updates", "channel", None)],
+                        },
+                        Choice {
+                            label: "Nightly".into(),
+                            changes: vec![change(
+                                "updates",
+                                "channel",
+                                Some(Value::Str("nightly".into())),
+                            )],
+                        },
+                    ],
+                },
+            },
+            Row {
+                title: "Check automatically",
+                description: "At sign-in and every 4 hours. Nothing installs by itself.".into(),
+                control: Control::Toggle {
+                    on: config.updates.check,
+                    table: "updates",
+                    key: "check",
+                },
             },
             Row {
                 title: "Configuration file",
-                description: "Every setting, including ones not shown here.",
-                control: Control::Button("Open"),
+                description: "Every setting, including ones not shown here.".into(),
+                control: Control::Button {
+                    label: "Open",
+                    action: Action::OpenConfigFile,
+                },
             },
         ],
+    }
+}
+
+/// What the user can do about updates right now.
+fn update_row(status: &Status) -> Row {
+    let row = |description: String, control| Row {
+        title: "Updates",
+        description: description.into(),
+        control,
+    };
+    let button = |label, command| Control::Button {
+        label,
+        action: Action::Update(command),
+    };
+    let check = || button("Check now", ResidentCommand::CheckUpdates);
+    match status {
+        Status::Idle => row(
+            "Aeon looks for new versions in the background.".into(),
+            check(),
+        ),
+        Status::UpToDate => row("Aeon is up to date.".into(), check()),
+        Status::Error(message) => row(message.clone(), check()),
+        Status::Checking => row(
+            "Checking for updates\u{2026}".into(),
+            Control::Info(String::new()),
+        ),
+        Status::Available(release) => row(
+            format!("Aeon {} is available.", release.version),
+            button("Download", ResidentCommand::DownloadUpdate),
+        ),
+        Status::Downloading { release, percent } => row(
+            format!("Downloading Aeon {}.", release.version),
+            Control::Info(format!("{percent}%")),
+        ),
+        Status::Ready { release, .. } => row(
+            format!(
+                "Aeon {} is ready. Aeon closes to install it.",
+                release.version
+            ),
+            button("Restart to update", ResidentCommand::InstallUpdate),
+        ),
     }
 }
 
@@ -995,6 +1106,7 @@ mod tests {
                 },
             ],
             fonts: Vec::new(),
+            update: Status::Idle,
             error: None,
         };
         s.rebuild(&config);
@@ -1165,7 +1277,7 @@ mod tests {
     fn a_custom_search_url_stays_selectable() {
         let mut config = Config::default();
         config.launcher.search_url = "https://kagi.com/search?q={query}".into();
-        let rows = rows(Section::Launcher, &config, &[], &[]);
+        let rows = rows(Section::Launcher, &config, &[], &[], &Status::Idle);
         let Control::Choice { options, index } = &rows[1].control else {
             panic!("web search is a choice");
         };

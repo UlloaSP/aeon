@@ -13,6 +13,13 @@ use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
     DeleteObject, GetDIBits, GetObjectW, HBITMAP,
 };
+use windows_sys::Win32::Networking::WinHttp::{
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_CONTENT_LENGTH,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect,
+    WinHttpOpen, WinHttpOpenRequest, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest,
+};
+use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
@@ -294,21 +301,156 @@ impl Drop for HotkeyListener {
     }
 }
 
-/// The message a terminal sends the resident after saving settings.
-const SETTINGS_CHANGED: &str = "AeonSettingsChanged";
+/// The message a terminal sends the resident; the command travels in wParam.
+const RESIDENT_COMMAND: &str = "AeonResidentCommand";
 
-/// Tells a running resident to re-read config.toml. Does nothing when no
-/// resident runs.
-pub fn notify_settings_changed() {
-    let (class, message) = (wide("AeonTray"), wide(SETTINGS_CHANGED));
+/// Sends `command` to the running resident. `false` when none runs.
+pub fn send_to_resident(command: crate::ResidentCommand) -> bool {
+    let (class, message) = (wide("AeonTray"), wide(RESIDENT_COMMAND));
     // SAFETY: NUL-terminated strings; posting to a window that vanished in
     // between only fails.
     unsafe {
         let window = FindWindowW(class.as_ptr(), null());
-        if !window.is_null() {
-            PostMessageW(window, RegisterWindowMessageW(message.as_ptr()), 0, 0);
+        !window.is_null()
+            && PostMessageW(
+                window,
+                RegisterWindowMessageW(message.as_ptr()),
+                command as usize,
+                0,
+            ) != 0
+    }
+}
+
+/// Tells a running resident to re-read config.toml.
+pub fn notify_settings_changed() {
+    send_to_resident(crate::ResidentCommand::SettingsChanged);
+}
+
+/// GETs an https `url`, following redirects, through the system proxy, and
+/// returns the HTTP status. Only a 200's body is read: `on_chunk` receives
+/// it piece by piece and `on_progress(done, total)` reports bytes, `total`
+/// being the length when the server gives it. Blocks: call it on a
+/// background thread.
+pub fn http_get(
+    url: &str,
+    mut on_chunk: impl FnMut(&[u8]) -> Result<(), String>,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<u32, String> {
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| format!("not an https URL: {url}"))?;
+    let (host, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let path = if path.is_empty() { "/" } else { path };
+
+    /// Closes a WinHTTP handle on every path out.
+    struct Handle(*mut c_void);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a handle WinHTTP returned, closed once.
+                unsafe { WinHttpCloseHandle(self.0) };
+            }
         }
     }
+    let fail = |what: &str| format!("{what} failed (error {})", std::io::Error::last_os_error());
+
+    let agent = wide(&format!("Aeon/{}", env!("CARGO_PKG_VERSION")));
+    let (host, path, get) = (wide(host), wide(path), wide("GET"));
+    // SAFETY: every string is NUL-terminated and outlives the calls; handles
+    // are checked before use and closed by `Handle`.
+    unsafe {
+        let session = Handle(WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            null(),
+            null(),
+            0,
+        ));
+        if session.0.is_null() {
+            return Err(fail("WinHttpOpen"));
+        }
+        let connection = Handle(WinHttpConnect(session.0, host.as_ptr(), 443, 0));
+        if connection.0.is_null() {
+            return Err(fail("connecting"));
+        }
+        let request = Handle(WinHttpOpenRequest(
+            connection.0,
+            get.as_ptr(),
+            path.as_ptr(),
+            null(),
+            null(),
+            null(),
+            WINHTTP_FLAG_SECURE,
+        ));
+        if request.0.is_null() {
+            return Err(fail("opening the request"));
+        }
+        if WinHttpSendRequest(request.0, null(), 0, null(), 0, 0, 0) == 0
+            || WinHttpReceiveResponse(request.0, null_mut()) == 0
+        {
+            return Err(fail("the request"));
+        }
+        let number = |info: u32| {
+            let mut value = 0u32;
+            let mut size = size_of::<u32>() as u32;
+            let ok = WinHttpQueryHeaders(
+                request.0,
+                info | WINHTTP_QUERY_FLAG_NUMBER,
+                null(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+                null_mut(),
+            );
+            (ok != 0).then_some(value)
+        };
+        let status = number(WINHTTP_QUERY_STATUS_CODE).unwrap_or(0);
+        if status != 200 {
+            return Ok(status);
+        }
+        let total = number(WINHTTP_QUERY_CONTENT_LENGTH).map(u64::from);
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut done = 0u64;
+        loop {
+            let mut read = 0u32;
+            if WinHttpReadData(
+                request.0,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut read,
+            ) == 0
+            {
+                return Err(fail("reading"));
+            }
+            if read == 0 {
+                return Ok(status);
+            }
+            on_chunk(&buf[..read as usize])?;
+            done += u64::from(read);
+            on_progress(done, total);
+        }
+    }
+}
+
+/// Lowercase hex SHA-256 of `data`.
+pub fn sha256(data: &[u8]) -> Result<String, String> {
+    let mut digest = [0u8; 32];
+    // SAFETY: the pseudo-handle needs no setup; input and output buffers are
+    // valid for the lengths given.
+    let status = unsafe {
+        BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE,
+            null(),
+            0,
+            data.as_ptr(),
+            data.len() as u32,
+            digest.as_mut_ptr(),
+            digest.len() as u32,
+        )
+    };
+    if status < 0 {
+        return Err(format!("hashing failed (status {status:#x})"));
+    }
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Returns `false` when another process already holds `name`. The lock lasts
@@ -407,6 +549,14 @@ mod tests {
     }
 
     #[test]
+    fn sha256_matches_the_standard_vector() {
+        assert_eq!(
+            sha256(b"abc").unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
     fn second_holder_of_a_lock_is_refused() {
         let name = format!("Local\\aeon-test-{}", std::process::id());
         assert!(single_instance(&name));
@@ -425,7 +575,8 @@ mod tray {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -447,8 +598,8 @@ mod tray {
         on_command: Box<dyn Fn(TrayCommand)>,
         /// Explorer broadcasts this after restarting; the icon must be re-added.
         taskbar_created: u32,
-        /// Sent by a terminal that saved settings.
-        settings_changed: u32,
+        /// Commands from terminals; see `send_to_resident`.
+        command_message: u32,
         hwnd: HWND,
         icon: HICON,
         tooltip: String,
@@ -462,6 +613,27 @@ mod tray {
     /// Removes the icon when dropped, so it does not linger after Aeon exits.
     pub struct Tray {
         hwnd: usize,
+    }
+
+    impl Tray {
+        /// Shows a notification from the icon, such as "Update ready".
+        pub fn notify(&self, title: &str, text: &str) {
+            let mut data = notify_data(self.hwnd as HWND, null_mut(), "");
+            data.uFlags = NIF_INFO;
+            data.dwInfoFlags = NIIF_INFO;
+            for (slot, unit) in data
+                .szInfoTitle
+                .iter_mut()
+                .zip(title.encode_utf16().take(63))
+            {
+                *slot = unit;
+            }
+            for (slot, unit) in data.szInfo.iter_mut().zip(text.encode_utf16().take(255)) {
+                *slot = unit;
+            }
+            // SAFETY: modifies our own icon by window and id.
+            unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+        }
     }
 
     impl Drop for Tray {
@@ -555,8 +727,8 @@ mod tray {
                 let state = State {
                     on_command: Box::new(on_command),
                     taskbar_created,
-                    settings_changed: {
-                        let name = wide(super::SETTINGS_CHANGED);
+                    command_message: {
+                        let name = wide(super::RESIDENT_COMMAND);
                         // SAFETY: NUL-terminated name.
                         unsafe { RegisterWindowMessageW(name.as_ptr()) }
                     },
@@ -667,8 +839,10 @@ mod tray {
                 add_icon(state);
                 return Some(0);
             }
-            if msg == state.settings_changed {
-                (state.on_command)(TrayCommand::Reload);
+            if msg == state.command_message {
+                if let Some(command) = crate::ResidentCommand::from_code(wparam) {
+                    (state.on_command)(command.tray_command());
+                }
                 return Some(0);
             }
             None
