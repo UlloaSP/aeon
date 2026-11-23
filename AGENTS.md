@@ -131,7 +131,7 @@ Most code changes do not need a documentation change. Agents can read the code.
 - `crates/aeon-term` - VT parsing into a grid. Pure and synchronous: no I/O, no clock, no window. Most terminal behavior lives and is tested here.
 - `crates/aeon-pty` - ConPTY process spawning, command-line quoting, and shell integration (`shell.rs`, with the PowerShell script in `aeon.ps1`). Its Win32 code is in `conpty.rs`.
 - `crates/aeon-context` - what the context bar shows: git state and the servers under the shell, gathered on a background thread. Its Win32 code is in `sys.rs`.
-- `crates/aeon-launcher` - the launcher's state (query, results, calculator, history, installed apps, built-in commands such as `theme`) as pure, tested code, plus `sys.rs` for the global hotkey, clipboard, single-instance lock, and Windows theme. The window itself is `crates/aeon/src/launcher.rs`.
+- `crates/aeon-launcher` - the launcher's state (query, results, calculator, history, installed apps, built-in commands such as `theme`) as pure, tested code, plus `sys.rs` for the global hotkey, notification-area icon, clipboard, single-instance lock, and Windows theme. The window itself is `crates/aeon/src/launcher.rs`.
 - `crates/aeon-config` - `config.toml` schema and loading.
 - `packaging/windows` - the WiX source for the MSI. Its `UpgradeCode` must never change.
 - `scripts/` - developer and CI scripts that are not workflow-specific.
