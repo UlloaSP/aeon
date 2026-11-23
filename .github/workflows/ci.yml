@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - develop
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # Skips jobs a pull request cannot affect: a docs change does not start a
+  # Windows runner, and a Rust change does not rebuild the MSI.
+  # .github/scripts/ci-changes.sh maps changed files to gates. Pushes to main and develop
+  # still run every job. Detection fails open: if the diff cannot be resolved,
+  # everything runs.
+  changes:
+    name: Changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.detect.outputs.rust }}
+      packaging: ${{ steps.detect.outputs.packaging }}
+    steps:
+      # Depth 2 brings the base commit the change is diffed against.
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+          sparse-checkout: |
+            /.github/scripts/ci-changes.sh
+            /.github/actions/ci-changes/
+          sparse-checkout-cone-mode: false
+
+      - name: Detect affected jobs
+        id: detect
+        uses: ./.github/actions/ci-changes
+
+  # Enforces the branch flow in AGENTS.md#git-workflow. Rulesets protect main
+  # and develop and pick each one's merge method; this checks what they cannot:
+  # which branch a pull request comes from and how it is named.
+  branch_rules:
+    name: Branch Rules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Check pull request source and target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE: ${{ github.base_ref }}
+          HEAD: ${{ github.head_ref }}
+          SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          if [[ "$EVENT_NAME" != pull_request ]]; then
+            echo "Not a pull request. Nothing to check."
+            exit 0
+          fi
+
+          fail() {
+            echo "::error::$*"
+            echo "Branch flow: <type>/<name> from develop -> develop (squash) -> main (merge) -> develop (sync). See AGENTS.md#git-workflow."
+            exit 1
+          }
+
+          work='^(feature|fix|chore|docs|refactor|perf|test|ci|build)/[a-z0-9][a-z0-9._-]*$'
+          case "$BASE" in
+            main)
+              [[ "$HEAD" == develop && "$SAME_REPO" == true ]] \
+                || fail "Only develop can open a pull request into main, not $HEAD."
+              ;;
+            develop)
+              if [[ "$HEAD" == main && "$SAME_REPO" == true ]]; then
+                echo "Sync of main back into develop."
+              elif [[ "$HEAD" =~ $work || "$HEAD" == dependabot/* ]]; then
+                echo "Work branch $HEAD into develop."
+              else
+                fail "Branch $HEAD does not follow <type>/<kebab-name>. Allowed types: feature fix chore docs refactor perf test ci build."
+              fi
+              ;;
+            *)
+              fail "Pull requests target develop (work) or main (releases), not $BASE."
+              ;;
+          esac
+
+  # Always runs, on Linux: formatting and workflow lint need no Windows minutes
+  # and cover every file, docs included.
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Reject committed build outputs
+        run: |
+          files="$(git ls-files '*.msi' '*.wixpdb' 'dist/*' 'target/*')"
+          if test -n "$files"; then
+            printf 'Build outputs must not be committed:\n%s\n' "$files" >&2
+            exit 1
+          fi
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          cache: "false"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+      - name: Lint workflows
+        run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.12 -color
+
+  # Clippy and tests live in a reusable workflow so release.yml runs exactly
+  # the same checks on the commit it ships.
+  rust:
+    name: Rust
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.rust != 'false' }}
+    uses: ./.github/workflows/rust-checks.yml
+
+  # The release build, run through the release's own workflow so packaging
+  # breaks here and not on release day. arm64 is cross-compiled and only
+  # packaged; x64 also installs, launches, and uninstalls the MSI.
+  package:
+    name: Package ${{ matrix.arch }}
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.packaging != 'false' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, arm64]
+    uses: ./.github/workflows/release-windows.yml
+    with:
+      version: 0.0.0-ci.${{ github.run_number }}
+      arch: ${{ matrix.arch }}
+      smoke-install: ${{ matrix.arch == 'x64' }}
+      retention-days: 3
+
+  # Branch protection requires this job by its name, `Check`. It fails when any
+  # other job fails, is cancelled, or is skipped without a reason, so splitting
+  # jobs needs no ruleset change. Add every new job to `needs`.
+  # `always()` rather than `!cancelled()`: a skipped job reports success to
+  # branch protection, so a cancelled run must still produce a failing check.
+  check:
+    name: Check
+    if: ${{ always() }}
+    needs: [changes, branch_rules, lint, rust, package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every job to pass
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          # A job may skip only when `changes` said its gate was not needed.
+          # Gates are keyed by job name, except `package`.
+          echo "$RESULTS" | jq -e '.changes.outputs as $gates
+            | {package: "packaging"} as $renamed
+            | all(to_entries[];
+                .value.result == "success"
+                or (.value.result == "skipped"
+                  and $gates[$renamed[.key] // .key] == "false"))' > /dev/null
