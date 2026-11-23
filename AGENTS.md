@@ -127,7 +127,7 @@ Most code changes do not need a documentation change. Agents can read the code.
 
 ## Where code lives
 
-- `crates/aeon` - the binary. Window, event loop, keyboard, and CPU rendering (`app.rs`, `render.rs`, `font.rs`). Thin: it wires the other crates together.
+- `crates/aeon` - the binary. The terminal window and its sessions (`app.rs`), the resident launcher (`launcher.rs`), CPU rendering including the sidebar (`render.rs`), and fonts (`font.rs`). Thin: it wires the other crates together.
 - `crates/aeon-term` - VT parsing into a grid. Pure and synchronous: no I/O, no clock, no window. Most terminal behavior lives and is tested here.
 - `crates/aeon-pty` - ConPTY process spawning, command-line quoting, and shell integration (`shell.rs`, with the PowerShell script in `aeon.ps1`). Its Win32 code is in `conpty.rs`.
 - `crates/aeon-context` - what the context bar shows: git state and the servers under the shell, gathered on a background thread. Its Win32 code is in `sys.rs`.

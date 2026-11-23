@@ -9,25 +9,28 @@ use aeon_context::{Context, Watcher};
 use aeon_pty::{Pty, PtySize};
 use aeon_term::Terminal;
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::IconExtWindows;
 use winit::window::{Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
-use crate::render::{self, Frame, Theme};
+use crate::render::{self, Frame, Sidebar, SidebarEntry, Theme};
+
+/// Identifies a session across threads; never reused within a process.
+type SessionId = u64;
 
 /// Sent from background threads to the UI thread.
 pub enum Event {
-    /// A chunk of shell output, from the PTY reader thread.
-    Output(Vec<u8>),
-    /// The shell exited.
-    Exited,
-    /// New context bar contents, from the context watcher thread.
-    Context(Context),
+    /// A chunk of shell output, from a session's PTY reader thread.
+    Output(SessionId, Vec<u8>),
+    /// A session's shell exited.
+    Exited(SessionId),
+    /// New context bar contents, from a session's watcher thread.
+    Context(SessionId, Context),
 }
 
 pub struct App {
@@ -35,16 +38,28 @@ pub struct App {
     config: Config,
     config_error: Option<String>,
     theme: Theme,
-    /// A first command for the shell, from `--command` (the launcher's Ctrl+Enter).
+    /// A first command for the first shell, from `--command` (the launcher's
+    /// Ctrl+Enter).
     run: Option<String>,
-    session: Option<Session>,
+    view: Option<View>,
+    sessions: Vec<Session>,
+    active: usize,
+    next_id: SessionId,
+    sidebar_visible: bool,
+    modifiers: ModifiersState,
+    cursor: PhysicalPosition<f64>,
 }
 
-/// Everything that exists only while the window does.
-struct Session {
+/// The window and what draws into it; shared by every session.
+struct View {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     atlas: Atlas,
+}
+
+/// One shell: its PTY, what it printed, and what the bar and sidebar show.
+struct Session {
+    id: SessionId,
     term: Terminal,
     pty: Pty,
     input: File,
@@ -52,8 +67,12 @@ struct Session {
     watcher: Option<Watcher>,
 }
 
-/// Where the grid and the context bar go in a window of a given size.
+/// Where everything goes in a window of a given size.
 struct Layout {
+    /// Width of the sidebar; 0 when it is hidden.
+    sidebar: u32,
+    /// Top-left pixel of the grid.
+    origin: (u32, u32),
     rows: usize,
     cols: usize,
     /// First pixel row of the context bar, when it is shown.
@@ -73,14 +92,20 @@ impl App {
             config,
             config_error,
             run,
-            session: None,
+            view: None,
+            sessions: Vec::new(),
+            active: 0,
+            next_id: 0,
+            sidebar_visible: state::sidebar_visible(),
+            modifiers: ModifiersState::empty(),
+            cursor: PhysicalPosition::new(-1.0, -1.0),
         }
     }
 
-    fn start(
-        &mut self,
+    fn create_view(
+        &self,
         event_loop: &ActiveEventLoop,
-    ) -> Result<Session, Box<dyn std::error::Error>> {
+    ) -> Result<View, Box<dyn std::error::Error>> {
         let window_cfg = &self.config.window;
         let pad = u32::from(window_cfg.padding);
         let font = font::load(self.config.font.path.as_deref())?;
@@ -92,8 +117,13 @@ impl App {
         } else {
             0
         };
+        let sidebar = if self.sidebar_visible {
+            Sidebar::new(&atlas, 1.0).width
+        } else {
+            0
+        };
         let inner = winit::dpi::LogicalSize::new(
-            u32::from(window_cfg.columns) * atlas.cell_width + 2 * pad,
+            sidebar + u32::from(window_cfg.columns) * atlas.cell_width + 2 * pad,
             u32::from(window_cfg.rows) * atlas.cell_height + 2 * pad + bar_height,
         );
 
@@ -110,31 +140,46 @@ impl App {
             )?,
         );
         let atlas = atlas.with_px(points_to_px(self.config.font.size, window.scale_factor()));
-
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
-
-        let layout = self.layout(window.inner_size(), &atlas, &window);
-        let term = Terminal::new(layout.rows, layout.cols);
-
-        let shell = self.shell_command();
-        let mut pty = Pty::spawn(&shell, pty_size(layout.rows, layout.cols))?;
-        let output = pty.take_reader().ok_or("pty reader already taken")?;
-        let input = pty.take_writer().ok_or("pty writer already taken")?;
-        spawn_reader(output, self.proxy.clone());
-
-        let watcher = self.config.bar.enabled.then(|| {
-            let proxy = self.proxy.clone();
-            Watcher::spawn(pty.pid(), shell.cwd.clone(), move |context| {
-                let _ = proxy.send_event(Event::Context(context));
-            })
-        });
-
-        Ok(Session {
+        Ok(View {
             window,
             surface,
             atlas,
-            term,
+        })
+    }
+
+    /// Starts a shell in `cwd` and makes it the active session.
+    fn open_session(
+        &mut self,
+        cwd: Option<PathBuf>,
+        run: Option<String>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(view) = &self.view else {
+            return Err("no window".into());
+        };
+        let layout = self.layout(view);
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let shell = self.shell_command(cwd, run.as_deref());
+        let mut pty = Pty::spawn(&shell, pty_size(layout.rows, layout.cols))?;
+        let output = pty.take_reader().ok_or("pty reader already taken")?;
+        let input = pty.take_writer().ok_or("pty writer already taken")?;
+        spawn_reader(id, output, self.proxy.clone());
+
+        // The sidebar shows every session's branch, so each one is watched
+        // whenever either the bar or the sidebar can show it.
+        let watcher = (self.config.bar.enabled || self.sidebar_visible).then(|| {
+            let proxy = self.proxy.clone();
+            Watcher::spawn(pty.pid(), shell.cwd.clone(), move |context| {
+                let _ = proxy.send_event(Event::Context(id, context));
+            })
+        });
+
+        self.sessions.push(Session {
+            id,
+            term: Terminal::new(layout.rows, layout.cols),
             pty,
             input,
             context: Context {
@@ -142,79 +187,158 @@ impl App {
                 ..Context::default()
             },
             watcher,
-        })
+        });
+        self.active = self.sessions.len() - 1;
+        self.update_title();
+        self.request_redraw();
+        Ok(())
     }
 
-    fn shell_command(&self) -> aeon_pty::Command {
+    fn shell_command(&self, cwd: Option<PathBuf>, run: Option<&str>) -> aeon_pty::Command {
         let shell = &self.config.shell;
         let mut command = match &shell.program {
             Some(program) => aeon_pty::Command::new(program).args(&shell.args),
             None => aeon_pty::default_shell(),
         };
         if shell.integration {
-            command = aeon_pty::integrate(command, self.run.as_deref());
+            command = aeon_pty::integrate(command, run);
         }
-        command.cwd = shell.cwd.clone().or_else(start_dir);
+        command.cwd = cwd.or_else(|| shell.cwd.clone()).or_else(start_dir);
         command
             .env("TERM_PROGRAM", "aeon")
             .env("TERM_PROGRAM_VERSION", crate::VERSION)
             .env("COLORTERM", "truecolor")
     }
 
-    fn scaled_padding(&self, window: &Window) -> u32 {
-        (f64::from(self.config.window.padding) * window.scale_factor()).round() as u32
+    /// A new session starts where the active one is.
+    fn new_session(&mut self) {
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.context.cwd.clone());
+        if let Err(e) = self.open_session(cwd, None) {
+            eprintln!("aeon: could not open a session: {e}");
+        }
     }
 
-    fn layout(&self, size: PhysicalSize<u32>, atlas: &Atlas, window: &Window) -> Layout {
-        let padding = self.scaled_padding(window);
+    fn close_session(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        if index >= self.sessions.len() {
+            return;
+        }
+        // Dropping the session closes its pseudo console, which ends the shell.
+        self.sessions.remove(index);
+        if self.sessions.is_empty() {
+            event_loop.exit();
+            return;
+        }
+        if self.active > index || self.active >= self.sessions.len() {
+            self.active = self.active.saturating_sub(1);
+        }
+        self.update_title();
+        self.request_redraw();
+    }
+
+    fn select(&mut self, index: usize) {
+        if index < self.sessions.len() && index != self.active {
+            self.active = index;
+            self.update_title();
+            self.request_redraw();
+        }
+    }
+
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        state::set_sidebar_visible(self.sidebar_visible);
+        self.resize();
+    }
+
+    fn update_title(&self) {
+        let (Some(view), Some(session)) = (&self.view, self.sessions.get(self.active)) else {
+            return;
+        };
+        let place = session
+            .context
+            .cwd
+            .as_deref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned());
+        let mut title = match place {
+            Some(place) => format!("{place} \u{2014} Aeon"),
+            None => format!("Aeon {}", crate::VERSION),
+        };
+        if let Some(error) = &self.config_error {
+            title.push_str(&format!(" (config ignored: {error})"));
+        }
+        view.window.set_title(&title);
+    }
+
+    fn request_redraw(&self) {
+        if let Some(view) = &self.view {
+            view.window.request_redraw();
+        }
+    }
+
+    fn layout(&self, view: &View) -> Layout {
+        let size = view.window.inner_size();
+        let scale = view.window.scale_factor();
+        let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
+        let atlas = &view.atlas;
+        let sidebar = if self.sidebar_visible {
+            Sidebar::new(atlas, scale).width.min(size.width / 2)
+        } else {
+            0
+        };
         let bar_height = if self.config.bar.enabled {
             atlas.cell_height + padding
         } else {
             0
         };
         let term_height = size.height.saturating_sub(bar_height);
-        let w = size.width.saturating_sub(2 * padding);
+        let w = size.width.saturating_sub(sidebar + 2 * padding);
         let h = term_height.saturating_sub(2 * padding);
         Layout {
+            sidebar,
+            origin: (sidebar + padding, padding),
             rows: (h / atlas.cell_height).max(1) as usize,
             cols: (w / atlas.cell_width).max(1) as usize,
             bar_top: self.config.bar.enabled.then_some(term_height),
         }
     }
 
-    fn resize(&mut self, size: PhysicalSize<u32>) {
-        let Some(session) = self.session.as_ref() else {
+    /// Fits every session's grid and PTY to the window.
+    fn resize(&mut self) {
+        let Some(view) = &self.view else {
             return;
         };
-        let layout = self.layout(size, &session.atlas, &session.window);
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
+        let layout = self.layout(view);
         let (rows, cols) = (layout.rows, layout.cols);
-        if (rows, cols) != (session.term.grid().rows(), session.term.grid().cols()) {
-            session.term.resize(rows, cols);
-            let _ = session.pty.resize(pty_size(rows, cols));
+        for session in &mut self.sessions {
+            if (rows, cols) != (session.term.grid().rows(), session.term.grid().cols()) {
+                session.term.resize(rows, cols);
+                let _ = session.pty.resize(pty_size(rows, cols));
+            }
         }
-        session.window.request_redraw();
+        self.request_redraw();
     }
 
     fn redraw(&mut self) {
-        let Some(session) = self.session.as_ref() else {
+        let Some(view) = self.view.as_ref() else {
             return;
         };
-        let padding = self.scaled_padding(&session.window);
-        let size = session.window.inner_size();
-        let layout = self.layout(size, &session.atlas, &session.window);
-        let Some(session) = self.session.as_mut() else {
+        let layout = self.layout(view);
+        let scale = view.window.scale_factor();
+        let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
+        let Some(view) = self.view.as_mut() else {
             return;
         };
+        let size = view.window.inner_size();
         let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
             return;
         };
-        if session.surface.resize(w, h).is_err() {
+        if view.surface.resize(w, h).is_err() {
             return;
         }
-        let Ok(mut buffer) = session.surface.buffer_mut() else {
+        let Ok(mut buffer) = view.surface.buffer_mut() else {
             return;
         };
         let mut frame = Frame {
@@ -222,33 +346,103 @@ impl App {
             width: w.get(),
             height: h.get(),
         };
+        let Some(session) = self.sessions.get(self.active) else {
+            return;
+        };
         render::draw(
             &mut frame,
             &session.term,
-            &mut session.atlas,
+            &mut view.atlas,
             &self.theme,
-            padding,
+            layout.origin,
         );
         if let Some(top) = layout.bar_top {
             render::draw_bar(
                 &mut frame,
-                &mut session.atlas,
+                &mut view.atlas,
                 &self.theme,
                 &session.context,
-                top,
+                (layout.sidebar, top),
                 padding,
+            );
+        }
+        if layout.sidebar > 0 {
+            let entries: Vec<SidebarEntry<'_>> = self
+                .sessions
+                .iter()
+                .map(|s| SidebarEntry {
+                    context: &s.context,
+                })
+                .collect();
+            let sidebar = Sidebar::new(&view.atlas, scale);
+            render::draw_sidebar(
+                &mut frame,
+                &mut view.atlas,
+                &self.theme,
+                &sidebar,
+                &entries,
+                self.active,
             );
         }
         let _ = buffer.present();
     }
 
-    fn key(&mut self, event: &KeyEvent) {
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        if event.state != ElementState::Pressed {
+    /// Aeon's own shortcuts. Returns whether the key was one of them.
+    ///
+    /// They all use Ctrl+Shift (or Ctrl with Tab and digits): plain Ctrl+T,
+    /// Ctrl+W and Ctrl+B already mean something to shells and readline.
+    fn shortcut(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) -> bool {
+        let (ctrl, shift, alt) = (
+            self.modifiers.control_key(),
+            self.modifiers.shift_key(),
+            self.modifiers.alt_key(),
+        );
+        if !ctrl || alt {
+            return false;
+        }
+        match &event.logical_key {
+            Key::Named(NamedKey::Tab) => {
+                let n = self.sessions.len();
+                if n > 1 {
+                    let next = if shift {
+                        (self.active + n - 1) % n
+                    } else {
+                        (self.active + 1) % n
+                    };
+                    self.select(next);
+                }
+                true
+            }
+            Key::Character(c) if shift && c.eq_ignore_ascii_case("t") => {
+                self.new_session();
+                true
+            }
+            Key::Character(c) if shift && c.eq_ignore_ascii_case("w") => {
+                self.close_session(self.active, event_loop);
+                true
+            }
+            Key::Character(c) if shift && c.eq_ignore_ascii_case("b") => {
+                self.toggle_sidebar();
+                true
+            }
+            Key::Character(c) if !shift => match c.parse::<usize>() {
+                Ok(n @ 1..=9) => {
+                    self.select(n - 1);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
+        if event.state != ElementState::Pressed || self.shortcut(event, event_loop) {
             return;
         }
+        let Some(session) = self.sessions.get_mut(self.active) else {
+            return;
+        };
         let bytes: &[u8] = match &event.logical_key {
             Key::Named(NamedKey::Enter) => b"\r",
             Key::Named(NamedKey::Backspace) => b"\x7f",
@@ -271,30 +465,53 @@ impl App {
         // does not block the UI thread in practice.
         let _ = session.input.write_all(bytes);
     }
+
+    fn click(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        if !self.sidebar_visible {
+            return;
+        }
+        let sidebar = Sidebar::new(&view.atlas, view.window.scale_factor());
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        if sidebar.is_new_button(x, y, &view.atlas) {
+            self.new_session();
+        } else if let Some(i) = sidebar.row_at(x, y, self.sessions.len()) {
+            self.select(i);
+        }
+    }
+
+    fn session_index(&self, id: SessionId) -> Option<usize> {
+        self.sessions.iter().position(|s| s.id == id)
+    }
 }
 
 impl ApplicationHandler<Event> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.session.is_some() {
+        if self.view.is_some() {
             return;
         }
-        match self.start(event_loop) {
-            Ok(session) => self.session = Some(session),
-            Err(e) => {
-                eprintln!("aeon: failed to start: {e}");
-                event_loop.exit();
-            }
+        let started = self.create_view(event_loop).and_then(|view| {
+            self.view = Some(view);
+            let run = self.run.take();
+            self.open_session(None, run)
+        });
+        if let Err(e) = started {
+            eprintln!("aeon: failed to start: {e}");
+            event_loop.exit();
         }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
         match event {
-            Event::Output(bytes) => {
+            Event::Output(id, bytes) => {
+                let Some(index) = self.session_index(id) else {
+                    return;
+                };
+                let session = &mut self.sessions[index];
                 session.term.advance(&bytes);
-                let mut redraw = session.term.take_dirty();
+                let mut redraw = session.term.take_dirty() && index == self.active;
                 // The first report usually repeats the starting directory,
                 // which the bar already shows in full.
                 if session.term.take_cwd_changed()
@@ -308,41 +525,88 @@ impl ApplicationHandler<Event> for App {
                     if let Some(watcher) = &session.watcher {
                         watcher.set_cwd(cwd);
                     }
+                    if index == self.active {
+                        self.update_title();
+                    }
+                    // The sidebar shows every session's folder.
                     redraw = true;
                 }
                 if redraw {
-                    session.window.request_redraw();
+                    self.request_redraw();
                 }
             }
-            Event::Context(context) => {
+            Event::Context(id, context) => {
+                let Some(index) = self.session_index(id) else {
+                    return;
+                };
+                let session = &mut self.sessions[index];
                 // The watcher may answer for a directory the shell already
                 // left; never let it overwrite a newer one.
                 if context.cwd == session.context.cwd {
                     session.context = context;
-                    session.window.request_redraw();
+                    self.request_redraw();
                 }
             }
-            Event::Exited => event_loop.exit(),
+            Event::Exited(id) => {
+                if let Some(index) = self.session_index(id) {
+                    self.close_session(index, event_loop);
+                }
+            }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => self.resize(size),
+            WindowEvent::Resized(_) => self.resize(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(session) = self.session.take() {
+                if let Some(view) = self.view.take() {
                     let px = points_to_px(self.config.font.size, scale_factor);
-                    let atlas = session.atlas.with_px(px);
-                    let size = session.window.inner_size();
-                    self.session = Some(Session { atlas, ..session });
-                    self.resize(size);
+                    self.view = Some(View {
+                        atlas: view.atlas.with_px(px),
+                        ..view
+                    });
+                    self.resize();
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::KeyboardInput { event, .. } => self.key(&event),
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::KeyboardInput { event, .. } => self.key(&event, event_loop),
+            WindowEvent::CursorMoved { position, .. } => self.cursor = position,
+            WindowEvent::CursorLeft { .. } => self.cursor = PhysicalPosition::new(-1.0, -1.0),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.click(),
             _ => {}
         }
+    }
+}
+
+/// Small UI state that outlives a window, kept apart from config.toml so
+/// Aeon never rewrites the user's own file (and its comments).
+mod state {
+    use std::path::PathBuf;
+
+    fn path() -> Option<PathBuf> {
+        std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join("aeon").join("state"))
+    }
+
+    pub fn sidebar_visible() -> bool {
+        let text = path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+        !text.lines().any(|l| l.trim() == "sidebar=hidden")
+    }
+
+    pub fn set_sidebar_visible(visible: bool) {
+        let Some(path) = path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let value = if visible { "shown" } else { "hidden" };
+        let _ = std::fs::write(path, format!("sidebar={value}\n"));
     }
 }
 
@@ -374,22 +638,25 @@ fn pty_size(rows: usize, cols: usize) -> PtySize {
 
 /// Reads PTY output on its own thread so a chatty shell never stalls input or
 /// painting. Each chunk wakes the event loop once.
-fn spawn_reader(mut output: File, proxy: EventLoopProxy<Event>) {
+fn spawn_reader(id: SessionId, mut output: File, proxy: EventLoopProxy<Event>) {
     std::thread::Builder::new()
-        .name("pty-reader".into())
+        .name(format!("pty-reader-{id}"))
         .spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
             loop {
                 match output.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        if proxy.send_event(Event::Output(buf[..n].to_vec())).is_err() {
+                        if proxy
+                            .send_event(Event::Output(id, buf[..n].to_vec()))
+                            .is_err()
+                        {
                             return;
                         }
                     }
                 }
             }
-            let _ = proxy.send_event(Event::Exited);
+            let _ = proxy.send_event(Event::Exited(id));
         })
         .expect("spawning the pty reader thread");
 }
