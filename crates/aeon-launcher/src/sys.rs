@@ -25,11 +25,11 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_AppsFolder, KF_FLAG_DEFAULT, SHCreateItemInKnownFolder, SIIGBF_BIGGERSIZEOK,
-    SIIGBF_ICONONLY,
+    SIIGBF_ICONONLY, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
-    WM_HOTKEY, WM_SETTINGCHANGE,
+    GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    SendMessageTimeoutW, WM_HOTKEY, WM_SETTINGCHANGE,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -50,6 +50,24 @@ struct ImageFactoryVtbl {
         flags: i32,
         bitmap: *mut HBITMAP,
     ) -> HRESULT,
+}
+
+/// Opens `url` in the default browser.
+pub fn open_url(url: &str) -> bool {
+    let (verb, url) = (wide("open"), wide(url));
+    // SAFETY: NUL-terminated strings; ShellExecuteW returns a value above 32
+    // on success.
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            url.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as isize > 32
 }
 
 /// Prepares the calling thread for [`app_icon`]. Call once per thread.

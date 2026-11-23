@@ -1,7 +1,7 @@
 //! Installed apps, as the Start menu lists them: desktop programs and Store
 //! apps alike, each with the AppUserModelID that opens it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -52,6 +52,36 @@ pub fn load() -> Vec<App> {
         .output()
         .map(|out| parse(&String::from_utf8_lossy(&out.stdout)))
         .unwrap_or_default()
+}
+
+/// Programs a shell can run by name: every file on PATH with an extension in
+/// PATHEXT, lowercase and without the extension. A directory listing per PATH
+/// entry: call it off the UI thread.
+pub fn path_commands() -> HashSet<String> {
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .map(|e| e.trim_start_matches('.').to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+    let mut commands = HashSet::new();
+    let Some(path) = std::env::var_os("PATH") else {
+        return commands;
+    };
+    for dir in std::env::split_paths(&path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_lowercase();
+            if let Some((stem, ext)) = name.rsplit_once('.')
+                && exts.iter().any(|e| e == ext)
+            {
+                commands.insert(stem.to_owned());
+            }
+        }
+    }
+    commands
 }
 
 /// One `name<TAB>id` per line, sorted and without duplicates.
@@ -214,6 +244,13 @@ mod tests {
     fn caps_the_list() {
         let all = apps(&["a1", "a2", "a3", "a4", "a5", "a6"]);
         assert_eq!(search(&all, "a").len(), MAX_APPS);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_programs_on_path() {
+        // cmd.exe is on every Windows PATH.
+        assert!(path_commands().contains("cmd"));
     }
 
     #[cfg(windows)]

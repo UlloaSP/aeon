@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use aeon_config::Config;
 use aeon_launcher::{
-    Action, App, Hotkey, Icon, Icons, Item, Launcher, Theme as WindowsTheme, apps, history, sys,
+    Action, App, Hotkey, Icon, Icons, Item, Launcher, Sources, Theme as WindowsTheme, apps,
+    history, sys,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -49,7 +50,11 @@ const ICON_SIZE: f64 = 20.0;
 pub enum Event {
     Hotkey,
     /// The installed apps, from a background load.
-    Apps(Vec<App>),
+    Catalog {
+        apps: Vec<App>,
+        /// Programs on PATH, which tell commands from web searches.
+        commands: HashSet<String>,
+    },
     /// An app's icon, or `None` when the shell has none, from the icon thread.
     Icon(String, Option<Icon>),
 }
@@ -72,6 +77,7 @@ struct Resident {
     view: Option<View>,
     launcher: Launcher,
     apps: Vec<App>,
+    commands: HashSet<String>,
     /// When the app list was last requested; `None` before the first load.
     apps_requested: Option<Instant>,
     icons: Icons,
@@ -115,6 +121,7 @@ impl Resident {
             view: None,
             launcher: Launcher::default(),
             apps: Vec::new(),
+            commands: HashSet::new(),
             apps_requested: None,
             icons,
             icon_cache: HashMap::new(),
@@ -168,7 +175,12 @@ impl Resident {
         if let Some(dir) = history::dir() {
             apps::count_uses(&mut self.apps, &history::app_uses(&dir));
         }
-        self.launcher = Launcher::open(history, self.apps.clone());
+        self.launcher = Launcher::open(Sources {
+            history,
+            apps: self.apps.clone(),
+            commands: self.commands.clone(),
+            search_url: self.config.launcher.search_url.clone(),
+        });
         self.load_apps_if_stale();
         if self.hotkey.is_ok() {
             self.error = None;
@@ -189,7 +201,10 @@ impl Resident {
         let _ = std::thread::Builder::new()
             .name("apps".into())
             .spawn(move || {
-                let _ = proxy.send_event(Event::Apps(apps::load()));
+                let _ = proxy.send_event(Event::Catalog {
+                    apps: apps::load(),
+                    commands: apps::path_commands(),
+                });
             });
     }
 
@@ -312,6 +327,13 @@ impl Resident {
                     .map(drop)
             }),
             Action::OpenApp(id) => apps::open(id),
+            Action::OpenUrl(url) => {
+                if sys::open_url(url) {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::other("no browser opened the search"))
+                }
+            }
             Action::SetTheme(theme) => {
                 let light = match theme {
                     WindowsTheme::Toggle => !sys::light_theme().unwrap_or(false),
@@ -397,7 +419,7 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
         scale,
     } = *content;
     let px = |logical: f64| (logical * scale).round() as u32;
-    let [_, red, green, yellow, blue, magenta, ..] = theme.ansi;
+    let [_, red, green, yellow, blue, magenta, cyan, ..] = theme.ansi;
     let muted = theme.ansi[8];
     frame.pixels.fill(theme.bar_bg);
 
@@ -472,6 +494,7 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
             Item::History(_) => ('\u{25F7}', muted),
             Item::App(_) => ('\u{25C6}', blue),
             Item::Builtin(_) => ('\u{25D0}', magenta),
+            Item::Search { .. } => ('\u{25CE}', cyan),
         };
         match item {
             Item::App(app) if let Some(Some(image)) = icons.get(&app.id) => {
@@ -488,6 +511,7 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
             (Item::Calc { .. }, true) => "Enter copies",
             (Item::App(_), true) => "Enter opens",
             (Item::Builtin(_), true) => "Enter applies",
+            (Item::Search { .. }, true) => "Enter searches",
             (_, true) => "Enter runs \u{b7} Ctrl+Enter in a terminal",
         };
         let hint_cols = hint.chars().count();
@@ -608,13 +632,18 @@ impl ApplicationHandler<Event> for Resident {
                     view.window.request_redraw();
                 }
             }
-            Event::Apps(mut list) => {
+            Event::Catalog {
+                apps: mut list,
+                commands,
+            } => {
+                self.commands = commands;
                 if let Some(dir) = history::dir() {
                     apps::count_uses(&mut list, &history::app_uses(&dir));
                 }
                 self.apps = list;
                 if self.view.as_ref().and_then(|v| v.window.is_visible()) == Some(true) {
-                    self.launcher.set_apps(self.apps.clone());
+                    self.launcher
+                        .set_catalog(self.apps.clone(), self.commands.clone());
                     self.resize();
                 }
             }
