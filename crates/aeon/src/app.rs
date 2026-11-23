@@ -19,6 +19,7 @@ use winit::window::{Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
 use crate::render::{self, Frame, Sidebar, SidebarEntry, Theme};
+use crate::settings::{self, Outcome, Settings};
 
 /// Identifies a session across threads; never reused within a process.
 type SessionId = u64;
@@ -46,6 +47,8 @@ pub struct App {
     active: usize,
     next_id: SessionId,
     sidebar_visible: bool,
+    /// The settings panel, in place of the terminal while open.
+    settings: Option<Settings>,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
 }
@@ -99,6 +102,7 @@ impl App {
             sidebar_visible: state::sidebar_visible(),
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(-1.0, -1.0),
+            settings: None,
         }
     }
 
@@ -349,14 +353,20 @@ impl App {
         let Some(session) = self.sessions.get(self.active) else {
             return;
         };
-        render::draw(
-            &mut frame,
-            &session.term,
-            &mut view.atlas,
-            &self.theme,
-            layout.origin,
-        );
-        if let Some(top) = layout.bar_top {
+        if let Some(panel) = &self.settings {
+            frame.pixels.fill(self.theme.bg);
+            let geo = settings::Geometry::new(layout.sidebar, frame.width, &view.atlas, scale);
+            panel.draw(&mut frame, &mut view.atlas, &self.theme, &geo);
+        } else {
+            render::draw(
+                &mut frame,
+                &session.term,
+                &mut view.atlas,
+                &self.theme,
+                layout.origin,
+            );
+        }
+        if let Some(top) = layout.bar_top.filter(|_| self.settings.is_none()) {
             render::draw_bar(
                 &mut frame,
                 &mut view.atlas,
@@ -382,6 +392,7 @@ impl App {
                 &sidebar,
                 &entries,
                 self.active,
+                self.settings.is_some(),
             );
         }
         let _ = buffer.present();
@@ -425,6 +436,10 @@ impl App {
                 self.toggle_sidebar();
                 true
             }
+            Key::Character(c) if !shift && c == "," => {
+                self.toggle_settings();
+                true
+            }
             Key::Character(c) if !shift => match c.parse::<usize>() {
                 Ok(n @ 1..=9) => {
                     self.select(n - 1);
@@ -438,6 +453,11 @@ impl App {
 
     fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
         if event.state != ElementState::Pressed || self.shortcut(event, event_loop) {
+            return;
+        }
+        if let Some(panel) = &mut self.settings {
+            let outcome = panel.key(&event.logical_key, self.modifiers, &self.config);
+            self.settings_outcome(outcome);
             return;
         }
         let Some(session) = self.sessions.get_mut(self.active) else {
@@ -470,16 +490,76 @@ impl App {
         let Some(view) = &self.view else {
             return;
         };
-        if !self.sidebar_visible {
+        let scale = view.window.scale_factor();
+        let size = view.window.inner_size();
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let layout = self.layout(view);
+        if x >= f64::from(layout.sidebar) {
+            if let Some(panel) = &mut self.settings {
+                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
+                let outcome = panel.click(x, y, &geo, &self.config);
+                self.settings_outcome(outcome);
+            }
             return;
         }
-        let sidebar = Sidebar::new(&view.atlas, view.window.scale_factor());
-        let (x, y) = (self.cursor.x, self.cursor.y);
-        if sidebar.is_new_button(x, y, &view.atlas) {
+        let sidebar = Sidebar::new(&view.atlas, scale);
+        if sidebar.is_settings_button(x, y, size.height) {
+            self.toggle_settings();
+        } else if sidebar.is_new_button(x, y, &view.atlas) {
             self.new_session();
         } else if let Some(i) = sidebar.row_at(x, y, self.sessions.len()) {
+            self.settings = None;
             self.select(i);
+            self.request_redraw();
         }
+    }
+
+    fn toggle_settings(&mut self) {
+        self.settings = match self.settings {
+            Some(_) => None,
+            None => Some(Settings::new(&self.config)),
+        };
+        self.request_redraw();
+    }
+
+    fn settings_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::None => {}
+            Outcome::Redraw => self.request_redraw(),
+            Outcome::Close => {
+                self.settings = None;
+                self.request_redraw();
+            }
+            Outcome::OpenConfigFile => crate::launcher::open_settings(),
+            Outcome::Save(changes) => {
+                let result = self.save_settings(&changes);
+                if let Some(panel) = &mut self.settings {
+                    panel.error = result.err();
+                    panel.rebuild(&self.config);
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Writes `changes` to config.toml and applies the new config: theme and
+    /// font now, the shell for sessions opened from now on, and the launcher
+    /// through the resident.
+    fn save_settings(&mut self, changes: &[aeon_config::edit::Change]) -> Result<(), String> {
+        let path = Config::default_path().ok_or("no config folder (APPDATA is not set)")?;
+        aeon_config::edit::write(&path, changes)?;
+        let config = Config::load(&path).map_err(|e| e.to_string())?;
+        let font_changed = config.font != self.config.font;
+        if font_changed && let Some(view) = &mut self.view {
+            let font = font::load(config.font.path.as_deref())?;
+            let px = points_to_px(config.font.size, view.window.scale_factor());
+            view.atlas = Atlas::new(Rc::new(font), px);
+        }
+        self.theme = Theme::new(&config.colors);
+        self.config = config;
+        self.resize();
+        aeon_launcher::sys::notify_settings_changed();
+        Ok(())
     }
 
     fn session_index(&self, id: SessionId) -> Option<usize> {

@@ -6,6 +6,7 @@ mod app;
 mod font;
 mod launcher;
 mod render;
+mod settings;
 
 use winit::event_loop::EventLoop;
 

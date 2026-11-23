@@ -228,6 +228,11 @@ impl Sidebar {
         (i < sessions).then_some(i)
     }
 
+    /// Whether a point is on the footer's Settings row.
+    pub fn is_settings_button(&self, x: f64, y: f64, height: u32) -> bool {
+        x >= 0.0 && x < f64::from(self.width) && y >= f64::from(height.saturating_sub(self.header))
+    }
+
     /// Whether a point is on the header's "+" (new session).
     pub fn is_new_button(&self, x: f64, y: f64, atlas: &Atlas) -> bool {
         let button = f64::from(self.pad + 2 * atlas.cell_width);
@@ -250,6 +255,7 @@ pub fn draw_sidebar(
     sidebar: &Sidebar,
     entries: &[SidebarEntry<'_>],
     active: usize,
+    settings_open: bool,
 ) {
     let [_, _, green, yellow, _, magenta, ..] = theme.ansi;
     let muted = theme.ansi[8];
@@ -290,7 +296,7 @@ pub fn draw_sidebar(
 
     for (i, entry) in entries.iter().enumerate() {
         let top = sidebar.header + i as u32 * sidebar.row;
-        if top >= frame.height {
+        if top + sidebar.row > frame.height.saturating_sub(sidebar.header) {
             break;
         }
         if i == active {
@@ -349,6 +355,45 @@ pub fn draw_sidebar(
             );
         }
     }
+    // Footer: Settings, highlighted while the panel is open.
+    let top = frame.height.saturating_sub(sidebar.header);
+    let divider = blend(theme.bar_bg, theme.fg, 24);
+    fill_rect(frame, 0, top, w.saturating_sub(1), 1, divider);
+    if settings_open {
+        fill_rect(
+            frame,
+            0,
+            top + 1,
+            w.saturating_sub(1),
+            sidebar.header - 1,
+            blend(theme.bar_bg, theme.fg, 22),
+        );
+    }
+    let color = if settings_open {
+        theme.fg
+    } else {
+        blend(theme.bar_bg, theme.fg, 190)
+    };
+    draw_glyph(
+        frame,
+        atlas,
+        '\u{2261}',
+        pad as i32,
+        (top + pad) as i32,
+        color,
+    );
+    draw_text(
+        frame,
+        atlas,
+        pad + 2 * cw,
+        top + pad,
+        "Settings",
+        color,
+        cols.saturating_sub(9),
+    );
+    let hint = "Ctrl+,";
+    let hint_x = w.saturating_sub(pad + hint.len() as u32 * cw);
+    draw_text(frame, atlas, hint_x, top + pad, hint, muted, hint.len());
 }
 
 /// The last folder of `path`, or `~` for the home folder itself.

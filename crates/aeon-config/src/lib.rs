@@ -4,6 +4,8 @@
 //! Unknown keys are rejected: a typo should fail loudly, not silently fall
 //! back to a default.
 
+pub mod edit;
+
 use std::fmt;
 use std::path::{Path, PathBuf};
 

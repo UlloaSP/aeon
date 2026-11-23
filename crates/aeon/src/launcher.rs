@@ -75,6 +75,8 @@ struct Resident {
     proxy: EventLoopProxy<Event>,
     /// Kept so the icon is removed when the resident exits.
     tray: Option<sys::Tray>,
+    /// Holds the global hotkey; replaced when settings change it.
+    hotkey_listener: Option<sys::HotkeyListener>,
     config: Config,
     theme: Theme,
     hotkey: Result<Hotkey, String>,
@@ -120,6 +122,7 @@ impl Resident {
         Self {
             proxy,
             tray: None,
+            hotkey_listener: None,
             theme: Theme::new(&config.colors),
             config,
             hotkey,
@@ -191,6 +194,52 @@ impl Resident {
             self.error = None;
         }
         self.show();
+    }
+
+    /// (Re)registers the configured hotkey. A resident nobody can reach is
+    /// useless: when that fails, say why on screen.
+    fn register_hotkey(&mut self) {
+        // Only called at start and when the hotkey changed, so the old keys
+        // and the new ones never collide while the old thread winds down.
+        self.hotkey_listener = None;
+        let registered = self.hotkey.clone().and_then(|hotkey| {
+            let proxy = self.proxy.clone();
+            sys::listen(hotkey, move || {
+                let _ = proxy.send_event(Event::Hotkey);
+            })
+        });
+        match registered {
+            Ok(listener) => {
+                self.hotkey_listener = Some(listener);
+                self.error = None;
+            }
+            Err(e) => {
+                self.error = Some(e);
+                self.show();
+            }
+        }
+    }
+
+    /// A terminal saved settings: take the ones the launcher uses.
+    fn reload(&mut self) {
+        let config = Config::default_path()
+            .and_then(|p| Config::load(&p).ok())
+            .unwrap_or_default();
+        let hotkey = config
+            .launcher
+            .hotkey
+            .parse::<Hotkey>()
+            .map_err(|e| format!("Invalid [launcher] hotkey: {e}"));
+        self.theme = Theme::new(&config.colors);
+        let hotkey_changed = hotkey != self.hotkey;
+        self.config = config;
+        self.hotkey = hotkey;
+        if hotkey_changed {
+            self.register_hotkey();
+        }
+        if let Some(view) = &self.view {
+            view.window.request_redraw();
+        }
     }
 
     /// Loads the app list on a background thread when it is missing or old.
@@ -574,7 +623,7 @@ fn home_dir() -> PathBuf {
 /// Opens `config.toml` in the user's editor, creating it with a pointer to
 /// the documentation when it does not exist yet: the menu item is the user
 /// asking for it. Without an app for `.toml`, Notepad opens it.
-fn open_settings() {
+pub(crate) fn open_settings() {
     let Some(path) = Config::default_path() else {
         return;
     };
@@ -637,29 +686,15 @@ impl ApplicationHandler<Event> for Resident {
                 return;
             }
         }
-        let registered = self.hotkey.clone().and_then(|hotkey| {
-            let proxy = self.proxy.clone();
-            sys::listen(hotkey, move || {
-                let _ = proxy.send_event(Event::Hotkey);
-            })
-        });
         self.load_apps_if_stale();
-        let label = match &self.hotkey {
-            Ok(hotkey) => format!("Open launcher\t{hotkey}"),
-            Err(_) => "Open launcher".to_owned(),
-        };
         let proxy = self.proxy.clone();
-        match sys::show_tray("Aeon", &label, move |command| {
+        match sys::show_tray("Aeon", "Open launcher", move |command| {
             let _ = proxy.send_event(Event::Tray(command));
         }) {
             Ok(tray) => self.tray = Some(tray),
             Err(e) => eprintln!("aeon: no tray icon: {e}"),
         }
-        // A resident nobody can reach is useless: say why, once, on screen.
-        if let Err(e) = registered {
-            self.error = Some(e);
-            self.show();
-        }
+        self.register_hotkey();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
@@ -680,6 +715,7 @@ impl ApplicationHandler<Event> for Resident {
             }
             Event::Tray(TrayCommand::OpenSettings) => open_settings(),
             Event::Tray(TrayCommand::Quit) => event_loop.exit(),
+            Event::Tray(TrayCommand::Reload) => self.reload(),
             Event::Icon(id, icon) => {
                 self.icons_pending.remove(&id);
                 self.icon_cache.insert(id, icon);
