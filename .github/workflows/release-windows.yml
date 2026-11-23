@@ -83,8 +83,9 @@ jobs:
         run: ./scripts/package-msi.ps1 -Version $env:VERSION -Arch $env:ARCH -OutDir dist
 
       # What a user gets from double-clicking the MSI: files in Program Files,
-      # aeon on PATH, a Start menu entry, a window that stays up, and a clean
-      # uninstall. Startup memory goes to the job summary to spot regressions.
+      # aeon on PATH, a Start menu entry, the resident launcher registered for
+      # sign-in, a window that stays up, an upgrade that closes running copies,
+      # and a clean uninstall. Startup memory goes to the job summary.
       - name: Smoke test the installer
         if: inputs.smoke-install
         timeout-minutes: 5
@@ -99,6 +100,7 @@ jobs:
           $lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\Aeon.lnk'
           $log = Join-Path $env:RUNNER_TEMP 'msi'
           function Test-OnPath { [Environment]::GetEnvironmentVariable('PATH', 'Machine') -split ';' | Where-Object { $_.TrimEnd('\') -eq $dir } }
+          function Get-Autostart { (Get-ItemProperty 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Run' -ErrorAction SilentlyContinue).Aeon }
           function Invoke-Msi($action, $name) {
             $p = Start-Process msiexec -ArgumentList $action, "`"$msi`"", '/qn', '/norestart', '/l*v', "`"$log-$name.log`"" -Wait -PassThru
             if ($p.ExitCode -ne 0) { Get-Content "$log-$name.log" -Tail 80; throw "msiexec $action exited with $($p.ExitCode)" }
@@ -108,9 +110,24 @@ jobs:
           if (-not (Test-Path $exe)) { throw "$exe was not installed" }
           if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing: $lnk" }
           if (-not (Test-OnPath)) { throw "$dir is not on the machine PATH" }
+          $autostart = Get-Autostart
+          if ($autostart -ne "`"$exe`" --background") { throw "Unexpected autostart entry: $autostart" }
 
-          # Same-version reinstall is how nightlies replace each other.
+          # The resident launcher, as sign-in starts it.
+          $resident = Start-Process $exe -ArgumentList '--background' -PassThru
+          Start-Sleep -Seconds 3
+          $resident.Refresh()
+          if ($resident.HasExited) { throw "resident exited during startup with code $($resident.ExitCode)" }
+          $residentPrivate = '{0:N1}' -f ($resident.PrivateMemorySize64 / 1MB)
+
+          # A second resident must step aside for the first.
+          $second = Start-Process $exe -ArgumentList '--background' -PassThru
+          if (-not $second.WaitForExit(10000)) { throw "a second resident kept running" }
+
+          # Same-version reinstall is how nightlies replace each other. It must
+          # close the running resident to replace aeon.exe.
           Invoke-Msi '/i' 'reinstall'
+          if (-not $resident.WaitForExit(10000)) { throw "the upgrade left the resident running" }
 
           $aeon = Start-Process $exe -PassThru
           Start-Sleep -Seconds 5
@@ -120,11 +137,12 @@ jobs:
           $ws = '{0:N1}' -f ($aeon.WorkingSet64 / 1MB)
           Stop-Process -Id $aeon.Id -Force
           $size = '{0:N0}' -f ((Get-Item $exe).Length / 1KB)
-          "### aeon $env:VERSION ($env:ARCH)`n`n| Binary | Private memory | Working set |`n| --- | --- | --- |`n| $size KB | $private MB | $ws MB |" >> $env:GITHUB_STEP_SUMMARY
+          "### aeon $env:VERSION ($env:ARCH)`n`n| Binary | Terminal private memory | Terminal working set | Resident private memory |`n| --- | --- | --- | --- |`n| $size KB | $private MB | $ws MB | $residentPrivate MB |" >> $env:GITHUB_STEP_SUMMARY
 
           Invoke-Msi '/x' 'uninstall'
           if (Test-Path $exe) { throw "$exe survived uninstall" }
           if (Test-OnPath) { throw "$dir is still on the machine PATH after uninstall" }
+          if (Get-Autostart) { throw "the autostart entry survived uninstall" }
 
       - name: Upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

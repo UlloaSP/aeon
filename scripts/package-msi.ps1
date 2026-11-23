@@ -7,8 +7,9 @@
   (.github/workflows/release-windows.yml) and local builds use this same
   script, so a packaging change is testable without a release.
 
-  Requires the WiX v5 CLI on PATH:
+  Requires the WiX v5 CLI on PATH and its Util extension:
     dotnet tool install --global wix --version 5.0.2
+    wix extension add -g WixToolset.Util.wixext/5.0.2
 
 .EXAMPLE
   cargo build --release --locked --target x86_64-pc-windows-msvc -p aeon
@@ -60,6 +61,7 @@ $zip = Join-Path $OutDir "$name.zip"
 
 & wix build (Join-Path $root 'packaging/windows/aeon.wxs') `
   -arch $Arch `
+  -ext WixToolset.Util.wixext `
   -d "Version=$msiVersion" `
   -d "BinDir=$binDir" `
   -intermediatefolder (Join-Path $root "packaging/windows/obj/$Arch") `

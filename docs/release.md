@@ -43,7 +43,9 @@ After a stable release, nightlies automatically move to the next patch version (
 ## MSI details
 
 - Built with WiX **5.0.2** from [packaging/windows/aeon.wxs](../packaging/windows/aeon.wxs). WiX 6 and later require accepting the Open Source Maintenance Fee EULA on every build, so upgrading is a deliberate decision, not a Dependabot bump.
-- Per-machine install to `Program Files\Aeon`, a Start menu shortcut, and `Program Files\Aeon` appended to the machine `PATH`. Uninstall removes all three.
+- Per-machine install to `Program Files\Aeon`, a Start menu shortcut, `Program Files\Aeon` appended to the machine `PATH`, and an `HKLM\...\Run` entry that starts the resident launcher (`aeon.exe --background`) at every sign-in. Uninstall removes all four.
+- An interactive install also starts the resident at the end, from the UI sequence so it runs as the installing user without elevation. Silent installs (`/qn`) skip that; the resident starts at the next sign-in.
+- Upgrades and uninstalls close every running `aeon.exe` first (WiX Util `CloseApplication`: `WM_CLOSE`, then termination), since `aeon.exe` cannot be replaced while it runs. Open terminals close too.
 - MSI versions are numeric `major.minor.patch` (at most 255.255.65535). Prerelease suffixes are stripped, so a nightly installs as its base version. `AllowSameVersionUpgrades` lets each nightly replace the previous one.
 - The `UpgradeCode` identifies Aeon across every version. Changing it makes new installs sit next to old ones instead of replacing them. Never change it.
 - `aeon.exe` links the C runtime statically (`.cargo/config.toml`), so the MSI needs no Visual C++ Redistributable.
@@ -55,6 +57,7 @@ Needs the .NET SDK for the WiX CLI:
 
 ```powershell
 dotnet tool install --global wix --version 5.0.2
+wix extension add -g WixToolset.Util.wixext/5.0.2
 cargo build --release --locked --target x86_64-pc-windows-msvc -p aeon
 ./scripts/package-msi.ps1 -Version 0.1.0 -Arch x64
 ```

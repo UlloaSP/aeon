@@ -14,6 +14,7 @@ repository = "https://github.com/UlloaSP/aeon"
 [workspace.dependencies]
 aeon-config = { path = "crates/aeon-config" }
 aeon-context = { path = "crates/aeon-context" }
+aeon-launcher = { path = "crates/aeon-launcher" }
 aeon-pty = { path = "crates/aeon-pty" }
 aeon-term = { path = "crates/aeon-term" }
 

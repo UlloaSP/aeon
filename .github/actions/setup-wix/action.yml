@@ -19,6 +19,17 @@ runs:
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
 
+    # Same version as the CLI: WiX refuses extensions from another major.
+    - name: Install WiX extensions
+      shell: pwsh
+      env:
+        WIX_VERSION: ${{ inputs.version }}
+      run: |
+        wix extension add -g "WixToolset.Util.wixext/$env:WIX_VERSION"
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
     - name: Check WiX
       shell: pwsh
-      run: wix --version
+      run: |
+        wix --version
+        wix extension list -g

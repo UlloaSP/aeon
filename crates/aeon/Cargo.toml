@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 aeon-config.workspace = true
 aeon-context.workspace = true
+aeon-launcher.workspace = true
 aeon-pty.workspace = true
 aeon-term.workspace = true
 fontdue.workspace = true

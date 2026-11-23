@@ -17,11 +17,11 @@ pub struct Frame<'a> {
 
 /// The config's colors resolved to pixels once, not per cell.
 pub struct Theme {
-    fg: u32,
-    bg: u32,
-    cursor: u32,
-    bar_bg: u32,
-    ansi: [u32; 16],
+    pub(crate) fg: u32,
+    pub(crate) bg: u32,
+    pub(crate) cursor: u32,
+    pub(crate) bar_bg: u32,
+    pub(crate) ansi: [u32; 16],
 }
 
 impl Theme {
@@ -207,7 +207,7 @@ fn display_path(path: &Path) -> String {
     }
 }
 
-fn fill_rect(frame: &mut Frame<'_>, x: u32, y: u32, w: u32, h: u32, color: u32) {
+pub(crate) fn fill_rect(frame: &mut Frame<'_>, x: u32, y: u32, w: u32, h: u32, color: u32) {
     for py in y..(y + h).min(frame.height) {
         let start = (py * frame.width + x.min(frame.width)) as usize;
         let end = (py * frame.width + (x + w).min(frame.width)) as usize;
@@ -215,7 +215,14 @@ fn fill_rect(frame: &mut Frame<'_>, x: u32, y: u32, w: u32, h: u32, color: u32) 
     }
 }
 
-fn draw_glyph(frame: &mut Frame<'_>, atlas: &mut Atlas, ch: char, x: i32, y: i32, fg: u32) {
+pub(crate) fn draw_glyph(
+    frame: &mut Frame<'_>,
+    atlas: &mut Atlas,
+    ch: char,
+    x: i32,
+    y: i32,
+    fg: u32,
+) {
     let baseline = atlas.baseline;
     let glyph = atlas.glyph(ch);
     let m = glyph.metrics;
@@ -242,7 +249,7 @@ fn draw_glyph(frame: &mut Frame<'_>, atlas: &mut Atlas, ch: char, x: i32, y: i32
     }
 }
 
-fn blend(dst: u32, src: u32, alpha: u8) -> u32 {
+pub(crate) fn blend(dst: u32, src: u32, alpha: u8) -> u32 {
     let a = u32::from(alpha);
     let mix = |shift: u32| {
         let d = (dst >> shift) & 0xff;

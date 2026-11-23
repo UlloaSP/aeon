@@ -35,6 +35,8 @@ pub struct App {
     config: Config,
     config_error: Option<String>,
     theme: Theme,
+    /// A first command for the shell, from `--command` (the launcher's Ctrl+Enter).
+    run: Option<String>,
     session: Option<Session>,
 }
 
@@ -59,7 +61,7 @@ struct Layout {
 }
 
 impl App {
-    pub fn new(proxy: EventLoopProxy<Event>) -> Self {
+    pub fn new(proxy: EventLoopProxy<Event>, run: Option<String>) -> Self {
         let (config, config_error) = match Config::default_path().map(|p| Config::load(&p)) {
             Some(Ok(config)) => (config, None),
             Some(Err(e)) => (Config::default(), Some(e.to_string())),
@@ -70,6 +72,7 @@ impl App {
             theme: Theme::new(&config.colors),
             config,
             config_error,
+            run,
             session: None,
         }
     }
@@ -83,7 +86,7 @@ impl App {
         let font = font::load(self.config.font.path.as_deref())?;
         // The window starts at the default scale and is resized on the first
         // ScaleFactorChanged, so size it from 96-DPI metrics.
-        let atlas = Atlas::new(font, points_to_px(self.config.font.size, 1.0));
+        let atlas = Atlas::new(Rc::new(font), points_to_px(self.config.font.size, 1.0));
         let bar_height = if self.config.bar.enabled {
             atlas.cell_height + pad
         } else {
@@ -149,7 +152,7 @@ impl App {
             None => aeon_pty::default_shell(),
         };
         if shell.integration {
-            command = aeon_pty::integrate(command);
+            command = aeon_pty::integrate(command, self.run.as_deref());
         }
         command.cwd = shell.cwd.clone().or_else(start_dir);
         command
@@ -343,7 +346,7 @@ impl ApplicationHandler<Event> for App {
 /// Launched from a shell, Aeon starts where that shell was. Launched from the
 /// Start menu or Explorer, the working directory is the install or system
 /// folder, which no one wants a prompt in, so start at home instead.
-fn start_dir() -> Option<PathBuf> {
+pub(crate) fn start_dir() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_owned();
     let windir = std::env::var_os("WINDIR").map(PathBuf::from);
@@ -355,7 +358,7 @@ fn start_dir() -> Option<PathBuf> {
     }
 }
 
-fn points_to_px(points: f32, scale_factor: f64) -> f32 {
+pub(crate) fn points_to_px(points: f32, scale_factor: f64) -> f32 {
     (f64::from(points) * 96.0 / 72.0 * scale_factor) as f32
 }
 
