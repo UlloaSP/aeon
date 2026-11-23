@@ -301,12 +301,21 @@ impl Drop for HotkeyListener {
     }
 }
 
+/// The resident's hidden tray window, which terminals find by class.
+/// Development builds use their own, so a debug terminal talks to a debug
+/// resident and never to an installed one.
+const TRAY_CLASS: &str = if cfg!(debug_assertions) {
+    "AeonTrayDev"
+} else {
+    "AeonTray"
+};
+
 /// The message a terminal sends the resident; the command travels in wParam.
 const RESIDENT_COMMAND: &str = "AeonResidentCommand";
 
 /// Sends `command` to the running resident. `false` when none runs.
 pub fn send_to_resident(command: crate::ResidentCommand) -> bool {
-    let (class, message) = (wide("AeonTray"), wide(RESIDENT_COMMAND));
+    let (class, message) = (wide(TRAY_CLASS), wide(RESIDENT_COMMAND));
     // SAFETY: NUL-terminated strings; posting to a window that vanished in
     // between only fails.
     unsafe {
@@ -678,7 +687,7 @@ mod tray {
         std::thread::Builder::new()
             .name("tray".into())
             .spawn(move || {
-                let class = wide("AeonTray");
+                let class = wide(super::TRAY_CLASS);
                 let title = wide("Aeon");
                 // SAFETY: a plain window class and a hidden top-level window
                 // owned by this thread; the icon is the exe's resource 1.
