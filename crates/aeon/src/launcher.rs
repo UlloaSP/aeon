@@ -1,6 +1,7 @@
 //! The resident Aeon (`aeon --background`): no terminal, a global hotkey, and
 //! the launcher window it toggles. Started at sign-in by the MSI's Run entry.
 
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -8,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use aeon_config::Config;
 use aeon_launcher::{
-    Action, App, Hotkey, Item, Launcher, Theme as WindowsTheme, apps, history, sys,
+    Action, App, Hotkey, Icon, Icons, Item, Launcher, Theme as WindowsTheme, apps, history, sys,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
@@ -42,11 +43,15 @@ const ROW_HEIGHT: f64 = 34.0;
 const PAD: f64 = 8.0;
 const INPUT_POINTS: f32 = 14.0;
 const LIST_POINTS: f32 = 11.0;
+/// App icons in the list, in logical pixels.
+const ICON_SIZE: f64 = 20.0;
 
 pub enum Event {
     Hotkey,
     /// The installed apps, from a background load.
     Apps(Vec<App>),
+    /// An app's icon, or `None` when the shell has none, from the icon thread.
+    Icon(String, Option<Icon>),
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,6 +74,10 @@ struct Resident {
     apps: Vec<App>,
     /// When the app list was last requested; `None` before the first load.
     apps_requested: Option<Instant>,
+    icons: Icons,
+    /// Icons by app id, at the current scale. `None`: the shell has none.
+    icon_cache: HashMap<String, Option<Icon>>,
+    icons_pending: HashSet<String>,
     modifiers: ModifiersState,
     /// Shown in place of the placeholder: a bad hotkey or a failed launch.
     error: Option<String>,
@@ -92,6 +101,12 @@ impl Resident {
             .hotkey
             .parse::<Hotkey>()
             .map_err(|e| format!("Invalid [launcher] hotkey: {e}"));
+        let icons = {
+            let proxy = proxy.clone();
+            Icons::spawn(move |id, icon| {
+                let _ = proxy.send_event(Event::Icon(id, icon));
+            })
+        };
         Self {
             proxy,
             theme: Theme::new(&config.colors),
@@ -101,6 +116,9 @@ impl Resident {
             launcher: Launcher::default(),
             apps: Vec::new(),
             apps_requested: None,
+            icons,
+            icon_cache: HashMap::new(),
+            icons_pending: HashSet::new(),
             modifiers: ModifiersState::empty(),
             error: None,
         }
@@ -176,8 +194,8 @@ impl Resident {
     }
 
     fn show(&mut self) {
-        let Some(view) = &self.view else { return };
         self.resize();
+        let Some(view) = &self.view else { return };
         // Open on the monitor under the mouse, a quarter of the way down.
         let cursor = sys::cursor_position();
         let monitor = view
@@ -209,8 +227,23 @@ impl Resident {
         }
     }
 
+    /// Asks for the icons of listed apps that have none yet.
+    fn request_icons(&mut self) {
+        let Some(view) = &self.view else { return };
+        let size = (ICON_SIZE * view.window.scale_factor()).round() as u32;
+        for item in self.launcher.items() {
+            if let Item::App(app) = item
+                && !self.icon_cache.contains_key(&app.id)
+                && self.icons_pending.insert(app.id.clone())
+            {
+                self.icons.request(&app.id, size);
+            }
+        }
+    }
+
     /// Height follows the number of results.
-    fn resize(&self) {
+    fn resize(&mut self) {
+        self.request_icons();
         let Some(view) = &self.view else { return };
         let rows = self.launcher.items().len() as f64;
         let list = if rows > 0.0 {
@@ -334,24 +367,35 @@ impl Resident {
             &mut frame,
             &mut view.input,
             &mut view.list,
-            &self.theme,
-            &self.launcher,
-            self.error.as_deref(),
-            view.window.scale_factor(),
+            &Content {
+                theme: &self.theme,
+                launcher: &self.launcher,
+                icons: &self.icon_cache,
+                error: self.error.as_deref(),
+                scale: view.window.scale_factor(),
+            },
         );
         let _ = buffer.present();
     }
 }
 
-fn draw(
-    frame: &mut Frame<'_>,
-    input: &mut Atlas,
-    list: &mut Atlas,
-    theme: &Theme,
-    launcher: &Launcher,
-    error: Option<&str>,
+/// What one frame of the launcher shows.
+struct Content<'a> {
+    theme: &'a Theme,
+    launcher: &'a Launcher,
+    icons: &'a HashMap<String, Option<Icon>>,
+    error: Option<&'a str>,
     scale: f64,
-) {
+}
+
+fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Content<'_>) {
+    let Content {
+        theme,
+        launcher,
+        icons,
+        error,
+        scale,
+    } = *content;
     let px = |logical: f64| (logical * scale).round() as u32;
     let [_, red, green, yellow, blue, magenta, ..] = theme.ansi;
     let muted = theme.ansi[8];
@@ -429,7 +473,15 @@ fn draw(
             Item::App(_) => ('\u{25C6}', blue),
             Item::Builtin(_) => ('\u{25D0}', magenta),
         };
-        render::draw_glyph(frame, list, icon, left as i32, y, color);
+        match item {
+            Item::App(app) if let Some(Some(image)) = icons.get(&app.id) => {
+                let box_size = px(ICON_SIZE);
+                let x = left as i32 + (list.cell_width as i32 * 2 - box_size as i32) / 2;
+                let y = (top + row_h.saturating_sub(box_size) / 2) as i32;
+                draw_icon(frame, image, x, y, box_size);
+            }
+            _ => render::draw_glyph(frame, list, icon, left as i32, y, color),
+        }
 
         let hint = match (item, selected) {
             (_, false) => "",
@@ -452,6 +504,38 @@ fn draw(
         if hint_cols > 0 {
             let hint_x = frame.width - px(18.0) - hint_cols as u32 * list.cell_width;
             draw_text(frame, list, hint_x, y, hint, muted, hint_cols);
+        }
+    }
+}
+
+/// Draws a premultiplied icon into a `size` square, scaling it by nearest
+/// pixel when the shell returned another size.
+fn draw_icon(frame: &mut Frame<'_>, icon: &Icon, x: i32, y: i32, size: u32) {
+    for dy in 0..size {
+        let py = y + dy as i32;
+        if py < 0 || py >= frame.height as i32 {
+            continue;
+        }
+        let sy = (dy * icon.height / size) as usize;
+        for dx in 0..size {
+            let px = x + dx as i32;
+            if px < 0 || px >= frame.width as i32 {
+                continue;
+            }
+            let sx = (dx * icon.width / size) as usize;
+            let src = icon.pixels[sy * icon.width as usize + sx];
+            let alpha = src >> 24;
+            if alpha == 0 {
+                continue;
+            }
+            let i = (py as u32 * frame.width + px as u32) as usize;
+            let dst = frame.pixels[i];
+            let channel = |shift: u32| {
+                let s = (src >> shift) & 0xff;
+                let d = (dst >> shift) & 0xff;
+                (s + d * (255 - alpha) / 255).min(255) << shift
+            };
+            frame.pixels[i] = channel(16) | channel(8) | channel(0);
         }
     }
 }
@@ -517,6 +601,13 @@ impl ApplicationHandler<Event> for Resident {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Hotkey => self.toggle(),
+            Event::Icon(id, icon) => {
+                self.icons_pending.remove(&id);
+                self.icon_cache.insert(id, icon);
+                if let Some(view) = &self.view {
+                    view.window.request_redraw();
+                }
+            }
             Event::Apps(mut list) => {
                 if let Some(dir) = history::dir() {
                     apps::count_uses(&mut list, &history::app_uses(&dir));
@@ -540,6 +631,9 @@ impl ApplicationHandler<Event> for Resident {
             WindowEvent::KeyboardInput { event, .. } => self.key(&event),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // Icons were drawn for the old scale.
+                self.icon_cache.clear();
+                self.icons_pending.clear();
                 if let Some(view) = self.view.take() {
                     self.view = Some(View {
                         input: view.input.with_px(points_to_px(INPUT_POINTS, scale_factor)),

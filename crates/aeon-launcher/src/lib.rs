@@ -8,6 +8,7 @@ pub mod apps;
 mod calc;
 pub mod history;
 mod hotkey;
+pub mod icons;
 #[cfg(windows)]
 pub mod sys;
 
@@ -17,6 +18,7 @@ use std::process::{Command, Stdio};
 
 pub use apps::App;
 pub use hotkey::Hotkey;
+pub use icons::{Icon, Icons};
 
 /// How many results the box lists below the query.
 pub const MAX_ITEMS: usize = 8;

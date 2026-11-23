@@ -7,8 +7,13 @@ use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::mpsc;
 
 use windows_sys::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, POINT,
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, POINT, SIZE,
 };
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+};
+use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
@@ -18,12 +23,131 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_AppsFolder, KF_FLAG_DEFAULT, SHCreateItemInKnownFolder, SIIGBF_BIGGERSIZEOK,
+    SIIGBF_ICONONLY,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
     WM_HOTKEY, WM_SETTINGCHANGE,
 };
+use windows_sys::core::{GUID, HRESULT};
 
 const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// `IShellItemImageFactory`: the shell's own icon for any item, Store apps
+/// included. windows-sys has no COM wrappers, so its vtable is spelled out.
+const IID_ISHELL_ITEM_IMAGE_FACTORY: GUID = GUID::from_u128(0xbcc18b79_ba16_442f_80c4_8a59c30c463b);
+
+#[repr(C)]
+struct ImageFactoryVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: unsafe extern "system" fn(this: *mut c_void) -> u32,
+    get_image: unsafe extern "system" fn(
+        this: *mut c_void,
+        size: SIZE,
+        flags: i32,
+        bitmap: *mut HBITMAP,
+    ) -> HRESULT,
+}
+
+/// Prepares the calling thread for [`app_icon`]. Call once per thread.
+pub fn init_com() {
+    // SAFETY: plain initialization; a second call on the same thread only
+    // returns S_FALSE.
+    unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
+}
+
+/// The Start menu icon of an app, `size` pixels square, as the shell draws it.
+/// Takes a few to tens of milliseconds: call it on a background thread that
+/// called [`init_com`].
+pub fn app_icon(id: &str, size: u32) -> Option<Icon> {
+    let id = wide(id);
+    let mut factory: *mut c_void = null_mut();
+    // SAFETY: `id` is NUL-terminated and `factory` receives the requested
+    // interface, released below.
+    let hr = unsafe {
+        SHCreateItemInKnownFolder(
+            &FOLDERID_AppsFolder,
+            KF_FLAG_DEFAULT as u32,
+            id.as_ptr(),
+            &IID_ISHELL_ITEM_IMAGE_FACTORY,
+            &mut factory,
+        )
+    };
+    if hr < 0 || factory.is_null() {
+        return None;
+    }
+    // SAFETY: a COM object's first field points at its vtable, which for this
+    // interface starts with the layout above.
+    let vtbl = unsafe { &**(factory as *mut *const ImageFactoryVtbl) };
+    let mut bitmap: HBITMAP = null_mut();
+    let side = size as i32;
+    // SAFETY: `factory` is live; `bitmap` receives an HBITMAP we delete.
+    let hr = unsafe {
+        (vtbl.get_image)(
+            factory,
+            SIZE { cx: side, cy: side },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            &mut bitmap,
+        )
+    };
+    // SAFETY: balances the reference SHCreateItemInKnownFolder handed out.
+    unsafe { (vtbl.release)(factory) };
+    if hr < 0 || bitmap.is_null() {
+        return None;
+    }
+    let icon = bitmap_pixels(bitmap);
+    // SAFETY: the bitmap is ours and no longer used.
+    unsafe { DeleteObject(bitmap) };
+    icon
+}
+
+/// Reads a 32-bit shell bitmap as premultiplied `0xAARRGGBB`, top row first.
+fn bitmap_pixels(bitmap: HBITMAP) -> Option<Icon> {
+    // SAFETY: BITMAP and BITMAPINFO are plain data; GetObjectW and GetDIBits
+    // write at most their sizes, and `pixels` holds width * height u32s.
+    unsafe {
+        let mut info: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            bitmap,
+            size_of::<BITMAP>() as i32,
+            (&mut info as *mut BITMAP).cast(),
+        ) == 0
+        {
+            return None;
+        }
+        let (width, height) = (info.bmWidth, info.bmHeight.abs());
+        if width <= 0 || height <= 0 || width > 256 || height > 256 {
+            return None;
+        }
+        let mut header: BITMAPINFO = std::mem::zeroed();
+        header.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        header.bmiHeader.biWidth = width;
+        header.bmiHeader.biHeight = -height; // top-down rows
+        header.bmiHeader.biPlanes = 1;
+        header.bmiHeader.biBitCount = 32;
+        header.bmiHeader.biCompression = BI_RGB;
+        let mut pixels = vec![0u32; (width * height) as usize];
+        let dc = CreateCompatibleDC(null_mut());
+        let rows = GetDIBits(
+            dc,
+            bitmap,
+            0,
+            height as u32,
+            pixels.as_mut_ptr().cast(),
+            &mut header,
+            DIB_RGB_COLORS,
+        );
+        DeleteDC(dc);
+        (rows == height).then_some(Icon {
+            width: width as u32,
+            height: height as u32,
+            pixels,
+        })
+    }
+}
 
 /// Whether apps use the light theme. `None` when Windows has no setting yet.
 pub fn light_theme() -> Option<bool> {
@@ -86,7 +210,7 @@ pub fn set_light_theme(light: bool) -> bool {
     ok
 }
 
-use crate::Hotkey;
+use crate::{Hotkey, Icon};
 
 const CF_UNICODETEXT: u32 = 13;
 
