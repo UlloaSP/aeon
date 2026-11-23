@@ -1,19 +1,234 @@
-//! Win32 for the launcher: the global hotkey, the clipboard, and the
-//! one-resident-per-session lock. The only `unsafe` code in this crate.
+//! Win32 for the launcher: the global hotkey, the clipboard, the
+//! one-resident-per-session lock, and the light/dark theme. The only `unsafe`
+//! code in this crate.
 
+use std::ffi::c_void;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::mpsc;
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, POINT};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, POINT, SIZE,
+};
+use windows_sys::Win32::Graphics::Gdi::{
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+    DeleteObject, GetDIBits, GetObjectW, HBITMAP,
+};
+use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
+};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetMessageW, MSG, WM_HOTKEY};
+use windows_sys::Win32::UI::Shell::{
+    FOLDERID_AppsFolder, KF_FLAG_DEFAULT, SHCreateItemInKnownFolder, SIIGBF_BIGGERSIZEOK,
+    SIIGBF_ICONONLY, ShellExecuteW,
+};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
+    SendMessageTimeoutW, WM_HOTKEY, WM_SETTINGCHANGE,
+};
+use windows_sys::core::{GUID, HRESULT};
 
-use crate::Hotkey;
+const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// `IShellItemImageFactory`: the shell's own icon for any item, Store apps
+/// included. windows-sys has no COM wrappers, so its vtable is spelled out.
+const IID_ISHELL_ITEM_IMAGE_FACTORY: GUID = GUID::from_u128(0xbcc18b79_ba16_442f_80c4_8a59c30c463b);
+
+#[repr(C)]
+struct ImageFactoryVtbl {
+    query_interface: usize,
+    add_ref: usize,
+    release: unsafe extern "system" fn(this: *mut c_void) -> u32,
+    get_image: unsafe extern "system" fn(
+        this: *mut c_void,
+        size: SIZE,
+        flags: i32,
+        bitmap: *mut HBITMAP,
+    ) -> HRESULT,
+}
+
+/// Opens `url` in the default browser.
+pub fn open_url(url: &str) -> bool {
+    let (verb, url) = (wide("open"), wide(url));
+    // SAFETY: NUL-terminated strings; ShellExecuteW returns a value above 32
+    // on success.
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            url.as_ptr(),
+            null(),
+            null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as isize > 32
+}
+
+/// Prepares the calling thread for [`app_icon`]. Call once per thread.
+pub fn init_com() {
+    // SAFETY: plain initialization; a second call on the same thread only
+    // returns S_FALSE.
+    unsafe { CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32) };
+}
+
+/// The Start menu icon of an app, `size` pixels square, as the shell draws it.
+/// Takes a few to tens of milliseconds: call it on a background thread that
+/// called [`init_com`].
+pub fn app_icon(id: &str, size: u32) -> Option<Icon> {
+    let id = wide(id);
+    let mut factory: *mut c_void = null_mut();
+    // SAFETY: `id` is NUL-terminated and `factory` receives the requested
+    // interface, released below.
+    let hr = unsafe {
+        SHCreateItemInKnownFolder(
+            &FOLDERID_AppsFolder,
+            KF_FLAG_DEFAULT as u32,
+            id.as_ptr(),
+            &IID_ISHELL_ITEM_IMAGE_FACTORY,
+            &mut factory,
+        )
+    };
+    if hr < 0 || factory.is_null() {
+        return None;
+    }
+    // SAFETY: a COM object's first field points at its vtable, which for this
+    // interface starts with the layout above.
+    let vtbl = unsafe { &**(factory as *mut *const ImageFactoryVtbl) };
+    let mut bitmap: HBITMAP = null_mut();
+    let side = size as i32;
+    // SAFETY: `factory` is live; `bitmap` receives an HBITMAP we delete.
+    let hr = unsafe {
+        (vtbl.get_image)(
+            factory,
+            SIZE { cx: side, cy: side },
+            SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            &mut bitmap,
+        )
+    };
+    // SAFETY: balances the reference SHCreateItemInKnownFolder handed out.
+    unsafe { (vtbl.release)(factory) };
+    if hr < 0 || bitmap.is_null() {
+        return None;
+    }
+    let icon = bitmap_pixels(bitmap);
+    // SAFETY: the bitmap is ours and no longer used.
+    unsafe { DeleteObject(bitmap) };
+    icon
+}
+
+/// Reads a 32-bit shell bitmap as premultiplied `0xAARRGGBB`, top row first.
+fn bitmap_pixels(bitmap: HBITMAP) -> Option<Icon> {
+    // SAFETY: BITMAP and BITMAPINFO are plain data; GetObjectW and GetDIBits
+    // write at most their sizes, and `pixels` holds width * height u32s.
+    unsafe {
+        let mut info: BITMAP = std::mem::zeroed();
+        if GetObjectW(
+            bitmap,
+            size_of::<BITMAP>() as i32,
+            (&mut info as *mut BITMAP).cast(),
+        ) == 0
+        {
+            return None;
+        }
+        let (width, height) = (info.bmWidth, info.bmHeight.abs());
+        if width <= 0 || height <= 0 || width > 256 || height > 256 {
+            return None;
+        }
+        let mut header: BITMAPINFO = std::mem::zeroed();
+        header.bmiHeader.biSize = size_of::<BITMAPINFOHEADER>() as u32;
+        header.bmiHeader.biWidth = width;
+        header.bmiHeader.biHeight = -height; // top-down rows
+        header.bmiHeader.biPlanes = 1;
+        header.bmiHeader.biBitCount = 32;
+        header.bmiHeader.biCompression = BI_RGB;
+        let mut pixels = vec![0u32; (width * height) as usize];
+        let dc = CreateCompatibleDC(null_mut());
+        let rows = GetDIBits(
+            dc,
+            bitmap,
+            0,
+            height as u32,
+            pixels.as_mut_ptr().cast(),
+            &mut header,
+            DIB_RGB_COLORS,
+        );
+        DeleteDC(dc);
+        (rows == height).then_some(Icon {
+            width: width as u32,
+            height: height as u32,
+            pixels,
+        })
+    }
+}
+
+/// Whether apps use the light theme. `None` when Windows has no setting yet.
+pub fn light_theme() -> Option<bool> {
+    let (key, value) = (wide(PERSONALIZE), wide("AppsUseLightTheme"));
+    let mut data = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: the strings are NUL-terminated and `data` holds the DWORD
+    // RRF_RT_REG_DWORD restricts the read to.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut data as *mut u32).cast::<c_void>(),
+            &mut size,
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(data != 0)
+}
+
+/// Sets both the apps' and the system's (taskbar, Start) theme, the way the
+/// Settings app does, then tells every window so they repaint without a
+/// sign-out. Blocks for up to a few hundred ms on unresponsive windows: call
+/// it off the UI thread.
+pub fn set_light_theme(light: bool) -> bool {
+    let key = wide(PERSONALIZE);
+    let data = u32::from(light);
+    let mut ok = true;
+    for name in ["AppsUseLightTheme", "SystemUsesLightTheme"] {
+        let name = wide(name);
+        // SAFETY: NUL-terminated strings and a 4-byte DWORD, as REG_DWORD needs.
+        let status = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                REG_DWORD,
+                (&data as *const u32).cast::<c_void>(),
+                size_of::<u32>() as u32,
+            )
+        };
+        ok &= status == ERROR_SUCCESS;
+    }
+    let area = wide("ImmersiveColorSet");
+    // SAFETY: `area` outlives the call; SMTO_ABORTIFHUNG keeps a hung window
+    // from stalling the broadcast past its timeout.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            area.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            200,
+            null_mut(),
+        );
+    }
+    ok
+}
+
+use crate::{Hotkey, Icon};
 
 const CF_UNICODETEXT: u32 = 13;
 

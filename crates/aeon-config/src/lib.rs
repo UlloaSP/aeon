@@ -66,12 +66,16 @@ impl Default for Bar {
 pub struct Launcher {
     /// Global hotkey, such as `"Ctrl+Alt+Space"` or `"Win+`"`.
     pub hotkey: String,
+    /// Web search for queries that are not a command or an app. `{query}`
+    /// marks where the words go; empty turns web search off.
+    pub search_url: String,
 }
 
 impl Default for Launcher {
     fn default() -> Self {
         Self {
             hotkey: "Ctrl+Alt+Space".to_owned(),
+            search_url: "https://www.google.com/search?q={query}".to_owned(),
         }
     }
 }

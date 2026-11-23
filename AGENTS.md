@@ -52,7 +52,7 @@ The most common defect is a change that works on the path you tested and is miss
 - **Display.** 100%, 150%, and 200% scale, moving a window between monitors with different scales, and resizing to tiny sizes.
 - **Architectures.** x64 and arm64. arm64 is cross-compiled in CI; a dependency with native code must build for both.
 - **Launch paths.** From the Start menu, from another shell (`aeon` on PATH), from Explorer, and from the launcher's Ctrl+Enter (`aeon --command`). They start with different working directories.
-- **Two processes.** A terminal (`aeon`) and the resident launcher (`aeon --background`, one per session, started at sign-in) are separate processes. The resident stays running for days: it must stay small and must not leak.
+- **Two processes.** A terminal (`aeon`) and the resident launcher (`aeon --background`, one per session, started at sign-in) are separate processes. The resident stays running for days: it must stay small and must not leak. To try a resident while the developer's installed one runs, use a debug build (it takes its own single-instance lock) with a different `[launcher] hotkey` in a temporary `APPDATA`.
 - **Config.** A new option has a default, rejects typos (`deny_unknown_fields`), and appears in the README's config section.
 - **Integration off.** With `shell.integration = false` or custom `args`, the shell reports no directory: the bar must still make sense with only the starting directory.
 - **Reverse states.** Every way in needs a way out: what opens closes, what resizes up resizes down.
@@ -131,7 +131,7 @@ Most code changes do not need a documentation change. Agents can read the code.
 - `crates/aeon-term` - VT parsing into a grid. Pure and synchronous: no I/O, no clock, no window. Most terminal behavior lives and is tested here.
 - `crates/aeon-pty` - ConPTY process spawning, command-line quoting, and shell integration (`shell.rs`, with the PowerShell script in `aeon.ps1`). Its Win32 code is in `conpty.rs`.
 - `crates/aeon-context` - what the context bar shows: git state and the servers under the shell, gathered on a background thread. Its Win32 code is in `sys.rs`.
-- `crates/aeon-launcher` - the launcher's state (query, results, calculator, history) as pure, tested code, plus `sys.rs` for the global hotkey, clipboard, and single-instance lock. The window itself is `crates/aeon/src/launcher.rs`.
+- `crates/aeon-launcher` - the launcher's state (query, results, calculator, history, installed apps, built-in commands such as `theme`) as pure, tested code, plus `sys.rs` for the global hotkey, clipboard, single-instance lock, and Windows theme. The window itself is `crates/aeon/src/launcher.rs`.
 - `crates/aeon-config` - `config.toml` schema and loading.
 - `packaging/windows` - the WiX source for the MSI. Its `UpgradeCode` must never change.
 - `scripts/` - developer and CI scripts that are not workflow-specific.
