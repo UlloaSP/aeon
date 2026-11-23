@@ -290,8 +290,11 @@ impl ApplicationHandler<Event> for App {
             Event::Output(bytes) => {
                 session.term.advance(&bytes);
                 let mut redraw = session.term.take_dirty();
+                // The first report usually repeats the starting directory,
+                // which the bar already shows in full.
                 if session.term.take_cwd_changed()
                     && let Some(cwd) = session.term.cwd().map(PathBuf::from)
+                    && session.context.cwd.as_ref() != Some(&cwd)
                 {
                     // Show the new directory now; git and servers follow
                     // from the watcher.

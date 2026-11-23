@@ -74,6 +74,9 @@ impl Watcher {
                         Ok(cwd) => {
                             context.cwd = Some(cwd);
                             last_git = None;
+                            // The UI blanks git while it waits for this answer,
+                            // so send it even if nothing differs.
+                            reported = None;
                         }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => return,
@@ -118,7 +121,7 @@ fn descendants(root: u32, processes: &[(u32, u32)]) -> Vec<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::descendants;
+    use super::*;
 
     #[test]
     fn descendants_follow_the_whole_tree() {
@@ -126,6 +129,21 @@ mod tests {
         let mut found = descendants(10, &processes);
         found.sort();
         assert_eq!(found, [11, 12, 13]);
+    }
+
+    /// The UI clears what it shows when the shell reports a directory, so the
+    /// watcher must answer every report, even when nothing it knows changed.
+    #[test]
+    fn every_reported_directory_gets_an_answer() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let (tx, rx) = mpsc::channel();
+        let watcher = Watcher::spawn(u32::MAX, Some(dir.clone()), move |context| {
+            let _ = tx.send(context);
+        });
+        let wait = || rx.recv_timeout(Duration::from_secs(10)).expect("a report");
+        let first = wait();
+        watcher.set_cwd(dir);
+        assert_eq!(wait(), first);
     }
 
     #[test]
