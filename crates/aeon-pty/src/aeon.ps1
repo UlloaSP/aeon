@@ -20,8 +20,8 @@ function global:prompt {
         # OSC 9;9 reports the working directory to Aeon's context bar.
         $report = "$e]9;9;`"$($location.ProviderPath)`"$e\"
     }
-    $leaf = Split-Path -Leaf $location.Path
-    if (-not $leaf) { $leaf = $location.Path }
+    # The context bar shows where you are, so the prompt is just the mark:
+    # a bold chevron, green after success and red after a failure.
     $color = if ($ok) { 32 } else { 31 }
-    "$report$e[34m$leaf$e[0m $e[${color}m$([char]0x203A)$e[0m "
+    "$report$e[1;${color}m$([char]0x276F)$e[0m "
 }

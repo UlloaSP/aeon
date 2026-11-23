@@ -115,6 +115,11 @@ pub fn draw(
             }
             if cell.ch != ' ' {
                 draw_glyph(frame, atlas, cell.ch, x as i32, y as i32, fg);
+                // No bold font is loaded: bold is the same glyph drawn again
+                // one stroke to the right.
+                if cell.flags.contains(Flags::BOLD) {
+                    draw_glyph(frame, atlas, cell.ch, (x + line) as i32, y as i32, fg);
+                }
             }
             if cell.flags.contains(Flags::UNDERLINE) {
                 let underline = (y + atlas.baseline as u32 + line).min(y + ch - line);
