@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use aeon_config::Colors;
+use aeon_config::{Colors, CursorStyle};
 use aeon_context::Context;
 use aeon_term::{Cell, Color, Flags, Terminal};
 
@@ -26,12 +26,13 @@ pub struct Theme {
 
 impl Theme {
     pub fn new(colors: &Colors) -> Self {
+        let colors = colors.resolve();
         Self {
             fg: colors.foreground.to_u32(),
             bg: colors.background.to_u32(),
             cursor: colors.cursor.to_u32(),
             bar_bg: colors.bar_background.to_u32(),
-            ansi: colors.ansi().map(|c| c.to_u32()),
+            ansi: colors.ansi.map(|c| c.to_u32()),
         }
     }
 
@@ -96,6 +97,7 @@ pub fn draw(
     atlas: &mut Atlas,
     theme: &Theme,
     origin: (u32, u32),
+    cursor_style: CursorStyle,
 ) {
     frame.pixels.fill(theme.bg);
     let (left, top) = origin;
@@ -109,8 +111,10 @@ pub fn draw(
         let y = top + row as u32 * ch;
         for (col, cell) in grid.row(row).iter().enumerate() {
             let x = left + col as u32 * cw;
-            let is_cursor = cursor.row == row && cursor.col == col;
-            let (fg, bg) = theme.cell_colors(cell, is_cursor);
+            let at_cursor = cursor.row == row && cursor.col == col;
+            // A block cursor inverts its cell; bar and underline are drawn on top.
+            let block = at_cursor && cursor_style == CursorStyle::Block;
+            let (fg, bg) = theme.cell_colors(cell, block);
             if bg != theme.bg {
                 fill_rect(frame, x, y, cw, ch, bg);
             }
@@ -128,6 +132,16 @@ pub fn draw(
             }
             if cell.flags.contains(Flags::STRIKE) {
                 fill_rect(frame, x, y + ch / 2, cw, line, fg);
+            }
+            if at_cursor {
+                let thick = (cw / 6).max(2);
+                match cursor_style {
+                    CursorStyle::Block => {}
+                    CursorStyle::Bar => fill_rect(frame, x, y, thick, ch, theme.cursor),
+                    CursorStyle::Underline => {
+                        fill_rect(frame, x, y + ch - thick, cw, thick, theme.cursor)
+                    }
+                }
             }
         }
     }

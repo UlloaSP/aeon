@@ -5,6 +5,7 @@
 //! back to a default.
 
 pub mod edit;
+pub mod themes;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,8 @@ pub struct Config {
     pub colors: Colors,
     pub bar: Bar,
     pub launcher: Launcher,
+    pub keys: Keys,
+    pub cursor: Cursor,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -71,6 +74,9 @@ pub struct Launcher {
     /// Web search for queries that are not a command or an app. `{query}`
     /// marks where the words go; empty turns web search off.
     pub search_url: String,
+    /// Whether the resident starts at sign-in. The installer's startup entry
+    /// always runs; the resident exits at once when this is off.
+    pub start_with_windows: bool,
 }
 
 impl Default for Launcher {
@@ -78,8 +84,50 @@ impl Default for Launcher {
         Self {
             hotkey: "Ctrl+Alt+Space".to_owned(),
             search_url: "https://www.google.com/search?q={query}".to_owned(),
+            start_with_windows: true,
         }
     }
+}
+
+/// Aeon's own shortcuts in the terminal window, as `"Ctrl+Shift+T"`. The
+/// defaults use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, Ctrl+B.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Keys {
+    pub new_session: String,
+    pub close_session: String,
+    pub next_session: String,
+    pub previous_session: String,
+    pub toggle_sidebar: String,
+    pub settings: String,
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Self {
+            new_session: "Ctrl+Shift+T".to_owned(),
+            close_session: "Ctrl+Shift+W".to_owned(),
+            next_session: "Ctrl+Tab".to_owned(),
+            previous_session: "Ctrl+Shift+Tab".to_owned(),
+            toggle_sidebar: "Ctrl+Shift+B".to_owned(),
+            settings: "Ctrl+,".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cursor {
+    pub style: CursorStyle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CursorStyle {
+    #[default]
+    Block,
+    Bar,
+    Underline,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -122,55 +170,62 @@ impl Default for Window {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Colors {
-    pub foreground: Rgb,
-    pub background: Rgb,
-    pub cursor: Rgb,
-    pub bar_background: Rgb,
-    /// ANSI colors 0-7. Unset entries keep Aeon's theme.
+    /// Built-in theme the colors start from; see [`themes::PRESETS`].
+    #[serde(deserialize_with = "theme_id")]
+    pub theme: String,
+    /// Each set color overrides the theme's.
+    pub foreground: Option<Rgb>,
+    pub background: Option<Rgb>,
+    pub cursor: Option<Rgb>,
+    /// The context bar and sidebar. Unset: a step from the background toward
+    /// the foreground.
+    pub bar_background: Option<Rgb>,
+    /// ANSI colors 0-7. Unset entries keep the theme's.
     pub normal: Palette,
-    /// ANSI colors 8-15. Unset entries keep Aeon's theme.
+    /// ANSI colors 8-15. Unset entries keep the theme's.
     pub bright: Palette,
 }
 
 impl Default for Colors {
     fn default() -> Self {
         Self {
-            // Aeon's brand: ink, paper, and the amber of the logo's cursor.
-            foreground: Rgb::new(0xf2, 0xf1, 0xec),
-            background: Rgb::new(0x0c, 0x0d, 0x10),
-            cursor: Rgb::new(0xff, 0xb5, 0x47),
-            bar_background: Rgb::new(0x17, 0x18, 0x1c),
+            theme: "aeon".to_owned(),
+            foreground: None,
+            background: None,
+            cursor: None,
+            bar_background: None,
             normal: Palette::default(),
             bright: Palette::default(),
         }
     }
 }
 
-/// Aeon's theme: warm, high contrast on the near-black background, with
-/// bright variants that stay readable rather than neon.
-const AEON_ANSI: [Rgb; 16] = [
-    Rgb::new(0x1d, 0x1f, 0x25), // black
-    Rgb::new(0xe0, 0x6c, 0x75), // red
-    Rgb::new(0x8f, 0xc7, 0x7f), // green
-    Rgb::new(0xe8, 0xb7, 0x5f), // yellow
-    Rgb::new(0x61, 0xa6, 0xf2), // blue
-    Rgb::new(0xc3, 0x8a, 0xe6), // magenta
-    Rgb::new(0x4f, 0xc1, 0xc9), // cyan
-    Rgb::new(0xc8, 0xcc, 0xd6), // white
-    Rgb::new(0x4b, 0x4f, 0x5c), // bright black
-    Rgb::new(0xff, 0x7a, 0x85), // bright red
-    Rgb::new(0xa6, 0xe0, 0x95), // bright green
-    Rgb::new(0xf6, 0xcd, 0x7d), // bright yellow
-    Rgb::new(0x82, 0xbc, 0xff), // bright blue
-    Rgb::new(0xd7, 0xa6, 0xf7), // bright magenta
-    Rgb::new(0x72, 0xd9, 0xe0), // bright cyan
-    Rgb::new(0xf2, 0xf4, 0xf8), // bright white
-];
+fn theme_id<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if themes::preset(&id).is_some() {
+        return Ok(id);
+    }
+    let known: Vec<&str> = themes::PRESETS.iter().map(|p| p.id).collect();
+    Err(de::Error::custom(format!(
+        "unknown theme {id:?}, expected one of: {}",
+        known.join(", ")
+    )))
+}
+
+/// The colors to paint with: the theme with the user's overrides applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Resolved {
+    pub foreground: Rgb,
+    pub background: Rgb,
+    pub cursor: Rgb,
+    pub bar_background: Rgb,
+    pub ansi: [Rgb; 16],
+}
 
 impl Colors {
-    /// The 16 ANSI colors with the user's overrides applied.
-    pub fn ansi(&self) -> [Rgb; 16] {
-        let mut ansi = AEON_ANSI;
+    pub fn resolve(&self) -> Resolved {
+        let preset = themes::preset(&self.theme).unwrap_or(&themes::PRESETS[0]);
+        let mut ansi = preset.ansi;
         for (offset, palette) in [(0, &self.normal), (8, &self.bright)] {
             for (i, color) in palette.entries().into_iter().enumerate() {
                 if let Some(color) = color {
@@ -178,7 +233,23 @@ impl Colors {
                 }
             }
         }
-        ansi
+        let foreground = self.foreground.unwrap_or(preset.foreground);
+        let background = self.background.unwrap_or(preset.background);
+        Resolved {
+            foreground,
+            background,
+            cursor: self.cursor.unwrap_or(preset.cursor),
+            bar_background: self
+                .bar_background
+                .or(preset.bar_background.filter(|_| self.background.is_none()))
+                .unwrap_or_else(|| background.mix(foreground, 0.05)),
+            ansi,
+        }
+    }
+
+    /// The 16 ANSI colors with the user's overrides applied.
+    pub fn ansi(&self) -> [Rgb; 16] {
+        self.resolve().ansi
     }
 }
 
@@ -220,6 +291,13 @@ pub struct Rgb {
 impl Rgb {
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
+    }
+
+    /// `amount` (0 to 1) of the way from `self` to `other`.
+    pub fn mix(self, other: Rgb, amount: f32) -> Rgb {
+        let m =
+            |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
+        Rgb::new(m(self.r, other.r), m(self.g, other.g), m(self.b, other.b))
     }
 
     /// `0x00RRGGBB`, the pixel format softbuffer expects.
@@ -317,8 +395,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.font.size, 14.0);
-        assert_eq!(config.colors.background, Rgb::new(0, 0, 0));
-        assert_eq!(config.colors.foreground, Colors::default().foreground);
+        assert_eq!(config.colors.resolve().background, Rgb::new(0, 0, 0));
+        assert_eq!(
+            config.colors.resolve().foreground,
+            Colors::default().resolve().foreground
+        );
         assert_eq!(config.window, Window::default());
     }
 
@@ -351,8 +432,8 @@ red = \"#ff0000\"",
         .unwrap();
         let ansi = config.colors.ansi();
         assert_eq!(ansi[9], Rgb::new(0xff, 0, 0));
-        assert_eq!(ansi[1], AEON_ANSI[1]);
-        assert_eq!(ansi[10], AEON_ANSI[10]);
+        assert_eq!(ansi[1], themes::PRESETS[0].ansi[1]);
+        assert_eq!(ansi[10], themes::PRESETS[0].ansi[10]);
     }
 
     #[test]
@@ -364,6 +445,45 @@ program = \"cmd.exe\"",
         .unwrap();
         assert!(config.shell.integration);
         assert!(config.bar.enabled);
+    }
+
+    #[test]
+    fn themes_resolve_with_overrides() {
+        let config = Config::parse("[colors]\ntheme = \"dracula\"\ncursor = \"#ff0000\"").unwrap();
+        let colors = config.colors.resolve();
+        assert_eq!(colors.background, Rgb::new(0x28, 0x2a, 0x36));
+        assert_eq!(colors.cursor, Rgb::new(0xff, 0, 0));
+        // The bar is derived from the theme when not set.
+        assert_ne!(colors.bar_background, colors.background);
+    }
+
+    #[test]
+    fn unknown_themes_are_an_error() {
+        let err = Config::parse("[colors]\ntheme = \"draculaa\"")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("unknown theme") && err.contains("dracula"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn aeon_bar_matches_the_brand() {
+        assert_eq!(
+            Colors::default().resolve().bar_background,
+            Rgb::new(0x17, 0x18, 0x1c)
+        );
+    }
+
+    #[test]
+    fn keys_and_cursor_style_parse() {
+        let config =
+            Config::parse("[keys]\nnew_session = \"Ctrl+N\"\n[cursor]\nstyle = \"bar\"").unwrap();
+        assert_eq!(config.keys.new_session, "Ctrl+N");
+        assert_eq!(config.keys.settings, "Ctrl+,");
+        assert_eq!(config.cursor.style, CursorStyle::Bar);
+        assert!(Config::parse("[cursor]\nstyle = \"beam\"").is_err());
     }
 
     #[test]

@@ -64,7 +64,7 @@
             Key="Software\Microsoft\Windows\CurrentVersion\Run"
             Name="Aeon"
             Type="string"
-            Value="&quot;[INSTALLFOLDER]aeon.exe&quot; --background"
+            Value="&quot;[INSTALLFOLDER]aeon.exe&quot; --background --at-sign-in"
             KeyPath="yes" />
         </Component>
       </Directory>

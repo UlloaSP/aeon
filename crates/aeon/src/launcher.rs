@@ -61,7 +61,15 @@ pub enum Event {
     Tray(TrayCommand),
 }
 
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(at_sign_in: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if at_sign_in {
+        let config = Config::default_path()
+            .and_then(|p| Config::load(&p).ok())
+            .unwrap_or_default();
+        if !config.launcher.start_with_windows {
+            return Ok(());
+        }
+    }
     if !sys::single_instance(INSTANCE_LOCK) {
         return Ok(());
     }

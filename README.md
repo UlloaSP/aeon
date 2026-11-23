@@ -63,7 +63,7 @@ One window holds as many shells as you want, listed in the sidebar with their fo
 | Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
 | Ctrl+Shift+B | Show or hide the sidebar |
 
-Aeon's shortcuts use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%\aeon\state`, apart from your `config.toml`.
+These are the defaults; change any of them in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%\aeon\state`, apart from your `config.toml`.
 
 ### The launcher
 
@@ -79,7 +79,7 @@ Aeon starts with Windows and waits in the background, using about 8 MB. Press **
 
 While it runs, Aeon has an icon in the notification area (under the taskbar's hidden icons). Click it to open the launcher, or right-click for a new terminal, your settings, or to quit.
 
-To stop it from starting with Windows, turn off Aeon in Task Manager, under Startup apps.
+To stop it from starting with Windows, turn off **Start with Windows** in Settings > General.
 
 ### Your shell inside Aeon
 
@@ -106,19 +106,30 @@ padding = 8
 [launcher]
 hotkey = "Ctrl+Alt+Space"     # Ctrl, Alt, Shift, Win + a letter, digit, F1-F24, Space, or `
 search_url = "https://www.google.com/search?q={query}"   # empty turns web search off
+start_with_windows = true
+
+[keys]                        # Aeon's shortcuts in the terminal window
+new_session = "Ctrl+Shift+T"
+close_session = "Ctrl+Shift+W"
+next_session = "Ctrl+Tab"
+previous_session = "Ctrl+Shift+Tab"
+toggle_sidebar = "Ctrl+Shift+B"
+settings = "Ctrl+,"
 
 [bar]
 enabled = true                # directory, git, and servers under the terminal
 
-[colors]
-foreground = "#f2f1ec"
-background = "#0c0d10"
-cursor = "#ffb547"
-bar_background = "#17181c"
+[cursor]
+style = "block"               # block, bar, or underline
 
-[colors.normal]               # ANSI 0-7; any color left out keeps Aeon's theme
+[colors]
+theme = "aeon"                # aeon, aeon-light, dracula, nord, gruvbox-dark, solarized-dark,
+                              # solarized-light, catppuccin-mocha, one-dark, tokyo-night
+cursor = "#ffb547"            # any color set here overrides the theme's:
+                              # foreground, background, cursor, bar_background
+
+[colors.normal]               # ANSI 0-7; any color left out keeps the theme's
 red = "#e06c75"
-blue = "#61a6f2"
 
 [colors.bright]               # ANSI 8-15
 red = "#ff7a85"

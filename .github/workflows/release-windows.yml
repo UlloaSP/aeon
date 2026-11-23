@@ -111,7 +111,7 @@ jobs:
           if (-not (Test-Path $lnk)) { throw "Start menu shortcut missing: $lnk" }
           if (-not (Test-OnPath)) { throw "$dir is not on the machine PATH" }
           $autostart = Get-Autostart
-          if ($autostart -ne "`"$exe`" --background") { throw "Unexpected autostart entry: $autostart" }
+          if ($autostart -ne "`"$exe`" --background --at-sign-in") { throw "Unexpected autostart entry: $autostart" }
 
           # The resident launcher, as sign-in starts it.
           $resident = Start-Process $exe -ArgumentList '--background' -PassThru

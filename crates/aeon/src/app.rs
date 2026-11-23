@@ -15,9 +15,10 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::IconExtWindows;
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
+use crate::keys::Combo;
 use crate::render::{self, Frame, Sidebar, SidebarEntry, Theme};
 use crate::settings::{self, Outcome, Settings};
 
@@ -49,6 +50,8 @@ pub struct App {
     sidebar_visible: bool,
     /// The settings panel, in place of the terminal while open.
     settings: Option<Settings>,
+    /// Whether the mouse pointer is the hand shown over clickable things.
+    pointer: bool,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
 }
@@ -103,6 +106,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(-1.0, -1.0),
             settings: None,
+            pointer: false,
         }
     }
 
@@ -364,6 +368,7 @@ impl App {
                 &mut view.atlas,
                 &self.theme,
                 layout.origin,
+                self.config.cursor.style,
             );
         }
         if let Some(top) = layout.bar_top.filter(|_| self.settings.is_none()) {
@@ -398,61 +403,61 @@ impl App {
         let _ = buffer.present();
     }
 
-    /// Aeon's own shortcuts. Returns whether the key was one of them.
-    ///
-    /// They all use Ctrl+Shift (or Ctrl with Tab and digits): plain Ctrl+T,
-    /// Ctrl+W and Ctrl+B already mean something to shells and readline.
+    /// Aeon's own shortcuts, from `[keys]`, plus Ctrl+1-9 to jump to a
+    /// session. Returns whether the key was one of them.
     fn shortcut(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) -> bool {
-        let (ctrl, shift, alt) = (
-            self.modifiers.control_key(),
-            self.modifiers.shift_key(),
-            self.modifiers.alt_key(),
-        );
-        if !ctrl || alt {
-            return false;
+        #[derive(Clone, Copy)]
+        enum Action {
+            New,
+            Close,
+            Next,
+            Previous,
+            Sidebar,
+            Settings,
         }
-        match &event.logical_key {
-            Key::Named(NamedKey::Tab) => {
-                let n = self.sessions.len();
-                if n > 1 {
-                    let next = if shift {
-                        (self.active + n - 1) % n
-                    } else {
-                        (self.active + 1) % n
-                    };
-                    self.select(next);
+        let (key, mods) = (&event.logical_key, self.modifiers);
+        let keys = &self.config.keys;
+        let action = [
+            (&keys.new_session, Action::New),
+            (&keys.close_session, Action::Close),
+            (&keys.next_session, Action::Next),
+            (&keys.previous_session, Action::Previous),
+            (&keys.toggle_sidebar, Action::Sidebar),
+            (&keys.settings, Action::Settings),
+        ]
+        .into_iter()
+        .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
+        .map(|(_, action)| action);
+        let n = self.sessions.len();
+        match action {
+            Some(Action::New) => self.new_session(),
+            Some(Action::Close) => self.close_session(self.active, event_loop),
+            Some(Action::Next) if n > 1 => self.select((self.active + 1) % n),
+            Some(Action::Previous) if n > 1 => self.select((self.active + n - 1) % n),
+            Some(Action::Next | Action::Previous) => {}
+            Some(Action::Sidebar) => self.toggle_sidebar(),
+            Some(Action::Settings) => self.toggle_settings(),
+            None => {
+                let digit = match key {
+                    Key::Character(c) if mods == ModifiersState::CONTROL => c.parse::<usize>().ok(),
+                    _ => None,
+                };
+                match digit {
+                    Some(d @ 1..=9) => self.select(d - 1),
+                    _ => return false,
                 }
-                true
             }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("t") => {
-                self.new_session();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("w") => {
-                self.close_session(self.active, event_loop);
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("b") => {
-                self.toggle_sidebar();
-                true
-            }
-            Key::Character(c) if !shift && c == "," => {
-                self.toggle_settings();
-                true
-            }
-            Key::Character(c) if !shift => match c.parse::<usize>() {
-                Ok(n @ 1..=9) => {
-                    self.select(n - 1);
-                    true
-                }
-                _ => false,
-            },
-            _ => false,
         }
+        true
     }
 
     fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
-        if event.state != ElementState::Pressed || self.shortcut(event, event_loop) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        // While a shortcut is being recorded, every key belongs to the recorder.
+        let recording = self.settings.as_ref().is_some_and(Settings::is_recording);
+        if !recording && self.shortcut(event, event_loop) {
             return;
         }
         if let Some(panel) = &mut self.settings {
@@ -511,6 +516,36 @@ impl App {
             self.settings = None;
             self.select(i);
             self.request_redraw();
+        }
+    }
+
+    /// Shows a hand over anything a click acts on, the arrow elsewhere.
+    fn update_pointer(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let layout = self.layout(view);
+        let scale = view.window.scale_factor();
+        let size = view.window.inner_size();
+        let clickable = if x < f64::from(layout.sidebar) {
+            let sidebar = Sidebar::new(&view.atlas, scale);
+            sidebar.is_settings_button(x, y, size.height)
+                || sidebar.is_new_button(x, y, &view.atlas)
+                || sidebar.row_at(x, y, self.sessions.len()).is_some()
+        } else {
+            self.settings.as_ref().is_some_and(|panel| {
+                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
+                panel.is_clickable(x, y, &geo)
+            })
+        };
+        if clickable != self.pointer {
+            self.pointer = clickable;
+            view.window.set_cursor(if clickable {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
         }
     }
 
@@ -652,7 +687,10 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(&event, event_loop),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = position,
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = position;
+                self.update_pointer();
+            }
             WindowEvent::CursorLeft { .. } => self.cursor = PhysicalPosition::new(-1.0, -1.0),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,

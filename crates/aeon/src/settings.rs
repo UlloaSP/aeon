@@ -4,24 +4,27 @@
 
 use std::path::{Path, PathBuf};
 
-use aeon_config::Config;
 use aeon_config::edit::{Change, Value};
+use aeon_config::{Config, CursorStyle, themes};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 use crate::font::Atlas;
+use crate::keys::Combo;
 use crate::render::{self, Frame, Theme};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     General,
     Appearance,
+    Keyboard,
     Launcher,
     About,
 }
 
-const SECTIONS: [(Section, &str); 4] = [
+const SECTIONS: [(Section, &str); 5] = [
     (Section::General, "General"),
     (Section::Appearance, "Appearance"),
+    (Section::Keyboard, "Keyboard"),
     (Section::Launcher, "Launcher"),
     (Section::About, "About"),
 ];
@@ -54,8 +57,11 @@ enum Control {
         key: &'static str,
         integer: bool,
     },
+    /// A key combination, recorded by pressing it.
     Hotkey {
         value: String,
+        table: &'static str,
+        key: &'static str,
     },
     Info(String),
     Button(&'static str),
@@ -119,7 +125,7 @@ impl Settings {
 
     pub fn key(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> Outcome {
         if self.recording {
-            return self.record(key, mods);
+            return self.record(key, mods, config);
         }
         match key {
             Key::Named(NamedKey::Escape) => Outcome::Close,
@@ -210,34 +216,68 @@ impl Settings {
         }
     }
 
+    pub fn is_recording(&self) -> bool {
+        self.recording
+    }
+
     /// While recording, the next key with at least one modifier becomes the
-    /// hotkey. Escape cancels.
-    fn record(&mut self, key: &Key, mods: ModifiersState) -> Outcome {
+    /// selected row's shortcut. Escape cancels.
+    fn record(&mut self, key: &Key, mods: ModifiersState, config: &Config) -> Outcome {
         if let Key::Named(NamedKey::Escape) = key {
             self.recording = false;
             return Outcome::Redraw;
         }
-        let Some(name) = hotkey_key(key) else {
+        let Some(combo) = Combo::from_event(key, mods) else {
             return Outcome::None; // a modifier alone: keep waiting
         };
-        let mut text = String::new();
-        for (on, label) in [
-            (mods.control_key(), "Ctrl+"),
-            (mods.alt_key(), "Alt+"),
-            (mods.shift_key(), "Shift+"),
-            (mods.super_key(), "Win+"),
-        ] {
-            if on {
-                text.push_str(label);
-            }
-        }
-        if text.is_empty() {
-            self.error = Some("A hotkey needs Ctrl, Alt, Shift, or Win.".into());
+        if !combo.has_modifier() {
+            self.error = Some("A shortcut needs Ctrl, Alt, Shift, or Win.".into());
             return Outcome::Redraw;
         }
-        text.push_str(&name);
+        let Some(Row {
+            control: Control::Hotkey {
+                table, key: name, ..
+            },
+            ..
+        }) = self.rows.get(self.selected)
+        else {
+            self.recording = false;
+            return Outcome::Redraw;
+        };
+        let (table, name) = (*table, *name);
+        let text = combo.to_string();
+        // The launcher's hotkey is registered with Windows, which takes
+        // fewer keys than a window does.
+        if table == "launcher" && text.parse::<aeon_launcher::Hotkey>().is_err() {
+            self.error = Some(format!(
+                "{text} can't be a global hotkey. Try a letter, digit, F-key, or Space."
+            ));
+            return Outcome::Redraw;
+        }
+        if let Some(other) = shortcut_names(config)
+            .into_iter()
+            .find(|(key, value)| *key != name && value.parse::<Combo>().is_ok_and(|c| c == combo))
+        {
+            self.error = Some(format!(
+                "{text} is already used for {}.",
+                other.0.replace('_', " ")
+            ));
+            return Outcome::Redraw;
+        }
         self.recording = false;
-        Outcome::Save(vec![change("launcher", "hotkey", Some(Value::Str(text)))])
+        self.error = None;
+        Outcome::Save(vec![change(table, name, Some(Value::Str(text)))])
+    }
+
+    /// Whether a click at this point would do something: a section or a row.
+    pub fn is_clickable(&self, x: f64, y: f64, geo: &Geometry) -> bool {
+        if x < f64::from(geo.left) {
+            return false;
+        }
+        if x < f64::from(geo.left + geo.nav) {
+            return geo.nav_item_at(y).is_some_and(|i| i < SECTIONS.len());
+        }
+        geo.row_at(y, self.rows.len()).is_some()
     }
 
     pub fn click(&mut self, x: f64, y: f64, geo: &Geometry, config: &Config) -> Outcome {
@@ -431,7 +471,7 @@ impl Settings {
                 let text = format!("\u{2039} {number} {unit} \u{203a}");
                 self.arrows(frame, atlas, theme, &text, right(&text), y, cols, selected);
             }
-            Control::Hotkey { value } => {
+            Control::Hotkey { value, .. } => {
                 let text = if self.recording && selected {
                     "Press keys\u{2026}".to_owned()
                 } else {
@@ -562,8 +602,60 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
                     key: "enabled",
                 },
             },
+            Row {
+                title: "Start with Windows",
+                description: "Keep the launcher ready from sign-in.",
+                control: Control::Toggle {
+                    on: config.launcher.start_with_windows,
+                    table: "launcher",
+                    key: "start_with_windows",
+                },
+            },
         ],
         Section::Appearance => vec![
+            Row {
+                title: "Theme",
+                description: "Colors for the terminal, sidebar, and launcher.",
+                control: Control::Choice {
+                    index: themes::PRESETS
+                        .iter()
+                        .position(|p| p.id == config.colors.theme)
+                        .unwrap_or(0),
+                    options: themes::PRESETS
+                        .iter()
+                        .map(|p| Choice {
+                            label: p.name.to_owned(),
+                            changes: vec![change(
+                                "colors",
+                                "theme",
+                                Some(Value::Str(p.id.to_owned())),
+                            )],
+                        })
+                        .collect(),
+                },
+            },
+            Row {
+                title: "Cursor",
+                description: "How the text cursor is drawn.",
+                control: Control::Choice {
+                    index: match config.cursor.style {
+                        CursorStyle::Block => 0,
+                        CursorStyle::Bar => 1,
+                        CursorStyle::Underline => 2,
+                    },
+                    options: ["Block", "Bar", "Underline"]
+                        .iter()
+                        .map(|label| Choice {
+                            label: (*label).to_owned(),
+                            changes: vec![change(
+                                "cursor",
+                                "style",
+                                Some(Value::Str(label.to_lowercase())),
+                            )],
+                        })
+                        .collect(),
+                },
+            },
             Row {
                 title: "Font",
                 description: "Monospace fonts installed on this PC.",
@@ -601,6 +693,39 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
                 },
             },
         ],
+        Section::Keyboard => {
+            let key_row = |title: &'static str, key: &'static str, value: &str| Row {
+                title,
+                description: "Enter, then press the new shortcut.",
+                control: Control::Hotkey {
+                    value: value.to_owned(),
+                    table: "keys",
+                    key,
+                },
+            };
+            let keys = &config.keys;
+            vec![
+                key_row("New session", "new_session", &keys.new_session),
+                key_row("Close session", "close_session", &keys.close_session),
+                key_row("Next session", "next_session", &keys.next_session),
+                key_row(
+                    "Previous session",
+                    "previous_session",
+                    &keys.previous_session,
+                ),
+                key_row(
+                    "Show or hide the sidebar",
+                    "toggle_sidebar",
+                    &keys.toggle_sidebar,
+                ),
+                key_row("Settings", "settings", &keys.settings),
+                Row {
+                    title: "Go to a session",
+                    description: "Fixed: by its number in the sidebar.",
+                    control: Control::Info("Ctrl+1 \u{2026} Ctrl+9".to_owned()),
+                },
+            ]
+        }
         Section::Launcher => {
             let engines = search_engines();
             let index = engines
@@ -635,6 +760,8 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
                     description: "Opens the launcher from anywhere. Enter to record.",
                     control: Control::Hotkey {
                         value: config.launcher.hotkey.clone(),
+                        table: "launcher",
+                        key: "hotkey",
                     },
                 },
                 Row {
@@ -657,6 +784,20 @@ fn rows(section: Section, config: &Config, shells: &[Choice], fonts: &[Choice]) 
             },
         ],
     }
+}
+
+/// Every configurable shortcut by its config key, to catch duplicates.
+fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
+    let k = &config.keys;
+    vec![
+        ("new_session", k.new_session.clone()),
+        ("close_session", k.close_session.clone()),
+        ("next_session", k.next_session.clone()),
+        ("previous_session", k.previous_session.clone()),
+        ("toggle_sidebar", k.toggle_sidebar.clone()),
+        ("settings", k.settings.clone()),
+        ("hotkey", config.launcher.hotkey.clone()),
+    ]
 }
 
 fn search_engines() -> [(&'static str, &'static str); 4] {
@@ -827,29 +968,6 @@ fn font_name(stem: &str, known: &[(&str, &str)]) -> Option<String> {
     Some(name)
 }
 
-/// The key part of a hotkey, in config.toml's spelling.
-fn hotkey_key(key: &Key) -> Option<String> {
-    match key {
-        Key::Named(NamedKey::Space) => Some("Space".into()),
-        Key::Named(NamedKey::Enter) => Some("Enter".into()),
-        Key::Named(NamedKey::Tab) => Some("Tab".into()),
-        Key::Named(named) => {
-            let text = format!("{named:?}");
-            let n: u32 = text.strip_prefix('F')?.parse().ok()?;
-            (1..=24).contains(&n).then(|| format!("F{n}"))
-        }
-        Key::Character(c) => {
-            let ch = c.chars().next()?;
-            match ch {
-                '`' => Some("`".into()),
-                c if c.is_ascii_alphanumeric() => Some(c.to_ascii_uppercase().to_string()),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,6 +1054,14 @@ mod tests {
         let mut s = settings();
         let config = Config::default();
         s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config); // Appearance
+        // Past Theme and Cursor; the next Down lands on Font size.
+        for _ in 0..2 {
+            s.key(
+                &named(NamedKey::ArrowDown),
+                ModifiersState::empty(),
+                &config,
+            );
+        }
         s.key(
             &named(NamedKey::ArrowDown),
             ModifiersState::empty(),
@@ -968,8 +1094,9 @@ mod tests {
     fn records_a_hotkey_with_modifiers() {
         let mut s = settings();
         let config = Config::default();
-        s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config);
-        s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config); // Launcher
+        for _ in 0..3 {
+            s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config);
+        } // Launcher
         assert_eq!(
             s.key(&named(NamedKey::Enter), ModifiersState::empty(), &config),
             Outcome::Redraw
@@ -991,6 +1118,47 @@ mod tests {
             )])
         );
         assert!(!s.recording);
+    }
+
+    #[test]
+    fn shortcuts_record_reject_duplicates_and_launcher_limits() {
+        let mut s = settings();
+        let config = Config::default();
+        s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config);
+        s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config); // Keyboard
+        let ctrl_shift = ModifiersState::CONTROL | ModifiersState::SHIFT;
+        // New session -> Ctrl+Shift+W is taken by Close session.
+        s.key(&named(NamedKey::Enter), ModifiersState::empty(), &config);
+        s.key(&Key::Character(SmolStr::new("W")), ctrl_shift, &config);
+        assert!(
+            s.recording
+                && s.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("close session"))
+        );
+        assert_eq!(
+            s.key(&Key::Character(SmolStr::new("N")), ctrl_shift, &config),
+            Outcome::Save(vec![change(
+                "keys",
+                "new_session",
+                Some(Value::Str("Ctrl+Shift+N".into()))
+            )])
+        );
+        // The launcher's hotkey must be one Windows can register.
+        for _ in 0..1 {
+            s.key(&named(NamedKey::Tab), ModifiersState::empty(), &config);
+        } // Launcher
+        s.key(&named(NamedKey::Enter), ModifiersState::empty(), &config);
+        s.key(
+            &Key::Character(SmolStr::new(",")),
+            ModifiersState::CONTROL,
+            &config,
+        );
+        assert!(
+            s.error
+                .as_deref()
+                .is_some_and(|e| e.contains("global hotkey"))
+        );
     }
 
     #[test]
