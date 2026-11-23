@@ -22,7 +22,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **Fast.** Native Rust, built with full link-time optimization. Startup is instant, and a dropped frame is a bug.
 - **Small.** One static `aeon.exe` under 1 MB. A window with a shell uses about 13 MB of private memory. Every release build reports both numbers, so regressions are caught before they ship.
 - **Native to Windows.** ConPTY, per-monitor DPI, x64 and arm64, and an MSI installer that puts `aeon` on your PATH.
-- **A launcher on Ctrl+Alt+Space.** From anywhere, type a command and press Enter to run it, or do quick math. Your history comes with you.
+- **A launcher on Ctrl+Alt+Space.** From anywhere, open any app by name, run a command, switch Windows between light and dark, or do quick math. Your history comes with you.
 - **Context at a glance.** A bar under the terminal shows where you are, the git branch and pending changes, and the servers you started from that shell (`node :5173`). No prompt framework needed.
 - **Full color.** 16, 256, and 24-bit color, with Aeon's own theme or yours.
 - **No account, no telemetry.** It is a terminal.
@@ -55,6 +55,8 @@ Aeon starts with Windows and waits in the background, using about 8 MB. Press **
 
 - Type a command, such as `code C:\code\app`, and press **Enter**. It starts in the background, the way Win+R would, and the launcher closes.
 - **Ctrl+Enter** opens it in an Aeon terminal instead, so you can watch the output.
+- Type part of an app's name, such as `disc` for Discord or `vsc` for Visual Studio Code, and press **Enter** to open it. Every app in the Start menu is there, Store apps included, and the ones you open most rise to the top.
+- Type `theme` to switch Windows between light and dark, or `theme dark` and `theme light` to pick one (`tema oscuro` and `tema claro` work too).
 - Type math, such as `5*3-2` or `sqrt(2)`, and the result appears as you type. **Enter** copies it.
 - The list shows what you ran from the launcher, then your PowerShell history in Aeon, filtered as you type. **Up** and **Down** pick one, and **Tab** puts it in the box to edit.
 

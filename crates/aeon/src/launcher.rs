@@ -4,9 +4,12 @@
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use aeon_config::Config;
-use aeon_launcher::{Action, Hotkey, Item, Launcher, history, sys};
+use aeon_launcher::{
+    Action, App, Hotkey, Item, Launcher, Theme as WindowsTheme, apps, history, sys,
+};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -21,7 +24,17 @@ use crate::font::{self, Atlas};
 use crate::render::{self, Frame, Theme};
 
 /// One resident per sign-in session; a second `--background` just exits.
-const INSTANCE_LOCK: &str = "Local\\AeonResident";
+/// Development builds take their own lock, so they run beside an installed
+/// Aeon instead of exiting.
+const INSTANCE_LOCK: &str = if cfg!(debug_assertions) {
+    "Local\\AeonResidentDev"
+} else {
+    "Local\\AeonResident"
+};
+
+/// Apps come and go rarely; the list is reloaded when the launcher opens and
+/// the last load is older than this.
+const APPS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 const WIDTH: f64 = 680.0;
 const INPUT_HEIGHT: f64 = 52.0;
@@ -32,6 +45,8 @@ const LIST_POINTS: f32 = 11.0;
 
 pub enum Event {
     Hotkey,
+    /// The installed apps, from a background load.
+    Apps(Vec<App>),
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -51,6 +66,9 @@ struct Resident {
     hotkey: Result<Hotkey, String>,
     view: Option<View>,
     launcher: Launcher,
+    apps: Vec<App>,
+    /// When the app list was last requested; `None` before the first load.
+    apps_requested: Option<Instant>,
     modifiers: ModifiersState,
     /// Shown in place of the placeholder: a bad hotkey or a failed launch.
     error: Option<String>,
@@ -81,6 +99,8 @@ impl Resident {
             hotkey,
             view: None,
             launcher: Launcher::default(),
+            apps: Vec::new(),
+            apps_requested: None,
             modifiers: ModifiersState::empty(),
             error: None,
         }
@@ -127,11 +147,32 @@ impl Resident {
         let history = history::dir()
             .map(|d| history::load(&d))
             .unwrap_or_default();
-        self.launcher = Launcher::open(history);
+        if let Some(dir) = history::dir() {
+            apps::count_uses(&mut self.apps, &history::app_uses(&dir));
+        }
+        self.launcher = Launcher::open(history, self.apps.clone());
+        self.load_apps_if_stale();
         if self.hotkey.is_ok() {
             self.error = None;
         }
         self.show();
+    }
+
+    /// Loads the app list on a background thread when it is missing or old.
+    fn load_apps_if_stale(&mut self) {
+        if self
+            .apps_requested
+            .is_some_and(|t| t.elapsed() < APPS_MAX_AGE)
+        {
+            return;
+        }
+        self.apps_requested = Some(Instant::now());
+        let proxy = self.proxy.clone();
+        let _ = std::thread::Builder::new()
+            .name("apps".into())
+            .spawn(move || {
+                let _ = proxy.send_event(Event::Apps(apps::load()));
+            });
     }
 
     fn show(&mut self) {
@@ -237,13 +278,29 @@ impl Resident {
                     .spawn()
                     .map(drop)
             }),
+            Action::OpenApp(id) => apps::open(id),
+            Action::SetTheme(theme) => {
+                let light = match theme {
+                    WindowsTheme::Toggle => !sys::light_theme().unwrap_or(false),
+                    WindowsTheme::Dark => false,
+                    WindowsTheme::Light => true,
+                };
+                // The change broadcast waits on every window; keep it off the
+                // UI thread so the launcher closes at once.
+                std::thread::spawn(move || sys::set_light_theme(light));
+                Ok(())
+            }
         };
         match result {
             Ok(()) => {
-                if let (Action::Run(command) | Action::RunInTerminal(command), Some(dir)) =
-                    (&action, history::dir())
-                {
-                    let _ = history::append(&dir, command);
+                match (&action, history::dir()) {
+                    (Action::Run(command) | Action::RunInTerminal(command), Some(dir)) => {
+                        let _ = history::append(&dir, command);
+                    }
+                    (Action::OpenApp(id), Some(dir)) => {
+                        let _ = history::record_app(&dir, id);
+                    }
+                    _ => {}
                 }
                 self.hide();
             }
@@ -296,7 +353,7 @@ fn draw(
     scale: f64,
 ) {
     let px = |logical: f64| (logical * scale).round() as u32;
-    let [_, red, green, yellow, ..] = theme.ansi;
+    let [_, red, green, yellow, blue, magenta, ..] = theme.ansi;
     let muted = theme.ansi[8];
     frame.pixels.fill(theme.bar_bg);
 
@@ -369,12 +426,16 @@ fn draw(
             Item::Calc { .. } => ('=', yellow),
             Item::Run(_) => ('\u{276F}', green),
             Item::History(_) => ('\u{25F7}', muted),
+            Item::App(_) => ('\u{25C6}', blue),
+            Item::Builtin(_) => ('\u{25D0}', magenta),
         };
         render::draw_glyph(frame, list, icon, left as i32, y, color);
 
         let hint = match (item, selected) {
             (_, false) => "",
             (Item::Calc { .. }, true) => "Enter copies",
+            (Item::App(_), true) => "Enter opens",
+            (Item::Builtin(_), true) => "Enter applies",
             (_, true) => "Enter runs \u{b7} Ctrl+Enter in a terminal",
         };
         let hint_cols = hint.chars().count();
@@ -445,6 +506,7 @@ impl ApplicationHandler<Event> for Resident {
                 let _ = proxy.send_event(Event::Hotkey);
             })
         });
+        self.load_apps_if_stale();
         // A resident nobody can reach is useless: say why, once, on screen.
         if let Err(e) = registered {
             self.error = Some(e);
@@ -455,6 +517,16 @@ impl ApplicationHandler<Event> for Resident {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Hotkey => self.toggle(),
+            Event::Apps(mut list) => {
+                if let Some(dir) = history::dir() {
+                    apps::count_uses(&mut list, &history::app_uses(&dir));
+                }
+                self.apps = list;
+                if self.view.as_ref().and_then(|v| v.window.is_visible()) == Some(true) {
+                    self.launcher.set_apps(self.apps.clone());
+                    self.resize();
+                }
+            }
         }
     }
 

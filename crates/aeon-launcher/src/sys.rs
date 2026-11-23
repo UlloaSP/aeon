@@ -1,17 +1,90 @@
-//! Win32 for the launcher: the global hotkey, the clipboard, and the
-//! one-resident-per-session lock. The only `unsafe` code in this crate.
+//! Win32 for the launcher: the global hotkey, the clipboard, the
+//! one-resident-per-session lock, and the light/dark theme. The only `unsafe`
+//! code in this crate.
 
+use std::ffi::c_void;
 use std::ptr::{copy_nonoverlapping, null, null_mut};
 use std::sync::mpsc;
 
-use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE, POINT};
+use windows_sys::Win32::Foundation::{
+    ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HANDLE, POINT,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::Registry::{
+    HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
+};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
-use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetMessageW, MSG, WM_HOTKEY};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SendMessageTimeoutW,
+    WM_HOTKEY, WM_SETTINGCHANGE,
+};
+
+const PERSONALIZE: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+/// Whether apps use the light theme. `None` when Windows has no setting yet.
+pub fn light_theme() -> Option<bool> {
+    let (key, value) = (wide(PERSONALIZE), wide("AppsUseLightTheme"));
+    let mut data = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    // SAFETY: the strings are NUL-terminated and `data` holds the DWORD
+    // RRF_RT_REG_DWORD restricts the read to.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.as_ptr(),
+            value.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            (&mut data as *mut u32).cast::<c_void>(),
+            &mut size,
+        )
+    };
+    (status == ERROR_SUCCESS).then_some(data != 0)
+}
+
+/// Sets both the apps' and the system's (taskbar, Start) theme, the way the
+/// Settings app does, then tells every window so they repaint without a
+/// sign-out. Blocks for up to a few hundred ms on unresponsive windows: call
+/// it off the UI thread.
+pub fn set_light_theme(light: bool) -> bool {
+    let key = wide(PERSONALIZE);
+    let data = u32::from(light);
+    let mut ok = true;
+    for name in ["AppsUseLightTheme", "SystemUsesLightTheme"] {
+        let name = wide(name);
+        // SAFETY: NUL-terminated strings and a 4-byte DWORD, as REG_DWORD needs.
+        let status = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                REG_DWORD,
+                (&data as *const u32).cast::<c_void>(),
+                size_of::<u32>() as u32,
+            )
+        };
+        ok &= status == ERROR_SUCCESS;
+    }
+    let area = wide("ImmersiveColorSet");
+    // SAFETY: `area` outlives the call; SMTO_ABORTIFHUNG keeps a hung window
+    // from stalling the broadcast past its timeout.
+    unsafe {
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            area.as_ptr() as isize,
+            SMTO_ABORTIFHUNG,
+            200,
+            null_mut(),
+        );
+    }
+    ok
+}
 
 use crate::Hotkey;
 
