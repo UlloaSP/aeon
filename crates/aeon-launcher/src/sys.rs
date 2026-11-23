@@ -21,15 +21,18 @@ use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock,
 use windows_sys::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
 };
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOD_NOREPEAT, RegisterHotKey};
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+    MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey,
+};
 use windows_sys::Win32::UI::Shell::{
     FOLDERID_AppsFolder, KF_FLAG_DEFAULT, SHCreateItemInKnownFolder, SIIGBF_BIGGERSIZEOK,
     SIIGBF_ICONONLY, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, SMTO_ABORTIFHUNG, SW_SHOWNORMAL,
-    SendMessageTimeoutW, WM_HOTKEY, WM_SETTINGCHANGE,
+    FindWindowW, GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, PostMessageW, PostThreadMessageW,
+    RegisterWindowMessageW, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, WM_HOTKEY,
+    WM_QUIT, WM_SETTINGCHANGE,
 };
 use windows_sys::core::{GUID, HRESULT};
 
@@ -241,7 +244,10 @@ fn wide(s: &str) -> Vec<u16> {
 ///
 /// The hotkey belongs to the thread that registered it and arrives as a
 /// thread message, which winit's loop would drop, so it gets its own loop.
-pub fn listen(hotkey: Hotkey, on_press: impl Fn() + Send + 'static) -> Result<(), String> {
+pub fn listen(
+    hotkey: Hotkey,
+    on_press: impl Fn() + Send + 'static,
+) -> Result<HotkeyListener, String> {
     let (registered, result) = mpsc::channel();
     std::thread::Builder::new()
         .name("hotkey".into())
@@ -250,7 +256,9 @@ pub fn listen(hotkey: Hotkey, on_press: impl Fn() + Send + 'static) -> Result<()
             let ok = unsafe {
                 RegisterHotKey(null_mut(), 1, hotkey.modifiers | MOD_NOREPEAT, hotkey.key)
             };
-            let _ = registered.send(ok != 0);
+            // SAFETY: no preconditions.
+            let thread = unsafe { GetCurrentThreadId() };
+            let _ = registered.send((ok != 0).then_some(thread));
             if ok == 0 {
                 return;
             }
@@ -263,11 +271,43 @@ pub fn listen(hotkey: Hotkey, on_press: impl Fn() + Send + 'static) -> Result<()
                     on_press();
                 }
             }
+            // SAFETY: releases the registration this thread made.
+            unsafe { UnregisterHotKey(null_mut(), 1) };
         })
         .map_err(|e| e.to_string())?;
     match result.recv() {
-        Ok(true) => Ok(()),
+        Ok(Some(thread)) => Ok(HotkeyListener { thread }),
         _ => Err(format!("{hotkey} is already used by another app")),
+    }
+}
+
+/// A registered hotkey. Dropping it ends its thread and frees the keys, so a
+/// changed hotkey can be registered while the resident keeps running.
+pub struct HotkeyListener {
+    thread: u32,
+}
+
+impl Drop for HotkeyListener {
+    fn drop(&mut self) {
+        // SAFETY: WM_QUIT ends the listener's GetMessageW loop.
+        unsafe { PostThreadMessageW(self.thread, WM_QUIT, 0, 0) };
+    }
+}
+
+/// The message a terminal sends the resident after saving settings.
+const SETTINGS_CHANGED: &str = "AeonSettingsChanged";
+
+/// Tells a running resident to re-read config.toml. Does nothing when no
+/// resident runs.
+pub fn notify_settings_changed() {
+    let (class, message) = (wide("AeonTray"), wide(SETTINGS_CHANGED));
+    // SAFETY: NUL-terminated strings; posting to a window that vanished in
+    // between only fails.
+    unsafe {
+        let window = FindWindowW(class.as_ptr(), null());
+        if !window.is_null() {
+            PostMessageW(window, RegisterWindowMessageW(message.as_ptr()), 0, 0);
+        }
     }
 }
 
@@ -349,6 +389,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_dropped_hotkey_can_be_registered_again() {
+        // An unusual combination, so the test never fights a real app for it.
+        let hotkey: Hotkey = "Ctrl+Alt+Shift+F19".parse().unwrap();
+        let first = listen(hotkey, || {}).expect("first registration");
+        assert!(listen(hotkey, || {}).is_err(), "a hotkey has one owner");
+        drop(first);
+        // The listener thread unregisters asynchronously after WM_QUIT.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match listen(hotkey, || {}) {
+                Ok(_) => break,
+                Err(e) if std::time::Instant::now() > deadline => panic!("{e}"),
+                Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[test]
     fn second_holder_of_a_lock_is_refused() {
         let name = format!("Local\\aeon-test-{}", std::process::id());
         assert!(single_instance(&name));
@@ -389,6 +447,8 @@ mod tray {
         on_command: Box<dyn Fn(TrayCommand)>,
         /// Explorer broadcasts this after restarting; the icon must be re-added.
         taskbar_created: u32,
+        /// Sent by a terminal that saved settings.
+        settings_changed: u32,
         hwnd: HWND,
         icon: HICON,
         tooltip: String,
@@ -495,6 +555,11 @@ mod tray {
                 let state = State {
                     on_command: Box::new(on_command),
                     taskbar_created,
+                    settings_changed: {
+                        let name = wide(super::SETTINGS_CHANGED);
+                        // SAFETY: NUL-terminated name.
+                        unsafe { RegisterWindowMessageW(name.as_ptr()) }
+                    },
                     hwnd,
                     icon,
                     tooltip,
@@ -600,6 +665,10 @@ mod tray {
             }
             if msg == state.taskbar_created {
                 add_icon(state);
+                return Some(0);
+            }
+            if msg == state.settings_changed {
+                (state.on_command)(TrayCommand::Reload);
                 return Some(0);
             }
             None

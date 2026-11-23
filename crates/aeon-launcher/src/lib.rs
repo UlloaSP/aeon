@@ -107,6 +107,8 @@ pub enum TrayCommand {
     NewTerminal,
     OpenSettings,
     Quit,
+    /// A terminal saved settings; re-read config.toml.
+    Reload,
 }
 
 /// What choosing an item asks the caller to do.

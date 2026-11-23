@@ -15,10 +15,12 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::IconExtWindows;
-use winit::window::{Icon, Window, WindowId};
+use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
+use crate::keys::Combo;
 use crate::render::{self, Frame, Sidebar, SidebarEntry, Theme};
+use crate::settings::{self, Outcome, Settings};
 
 /// Identifies a session across threads; never reused within a process.
 type SessionId = u64;
@@ -46,6 +48,10 @@ pub struct App {
     active: usize,
     next_id: SessionId,
     sidebar_visible: bool,
+    /// The settings panel, in place of the terminal while open.
+    settings: Option<Settings>,
+    /// Whether the mouse pointer is the hand shown over clickable things.
+    pointer: bool,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
 }
@@ -99,6 +105,8 @@ impl App {
             sidebar_visible: state::sidebar_visible(),
             modifiers: ModifiersState::empty(),
             cursor: PhysicalPosition::new(-1.0, -1.0),
+            settings: None,
+            pointer: false,
         }
     }
 
@@ -349,14 +357,21 @@ impl App {
         let Some(session) = self.sessions.get(self.active) else {
             return;
         };
-        render::draw(
-            &mut frame,
-            &session.term,
-            &mut view.atlas,
-            &self.theme,
-            layout.origin,
-        );
-        if let Some(top) = layout.bar_top {
+        if let Some(panel) = &self.settings {
+            frame.pixels.fill(self.theme.bg);
+            let geo = settings::Geometry::new(layout.sidebar, frame.width, &view.atlas, scale);
+            panel.draw(&mut frame, &mut view.atlas, &self.theme, &geo);
+        } else {
+            render::draw(
+                &mut frame,
+                &session.term,
+                &mut view.atlas,
+                &self.theme,
+                layout.origin,
+                self.config.cursor.style,
+            );
+        }
+        if let Some(top) = layout.bar_top.filter(|_| self.settings.is_none()) {
             render::draw_bar(
                 &mut frame,
                 &mut view.atlas,
@@ -382,62 +397,72 @@ impl App {
                 &sidebar,
                 &entries,
                 self.active,
+                self.settings.is_some(),
             );
         }
         let _ = buffer.present();
     }
 
-    /// Aeon's own shortcuts. Returns whether the key was one of them.
-    ///
-    /// They all use Ctrl+Shift (or Ctrl with Tab and digits): plain Ctrl+T,
-    /// Ctrl+W and Ctrl+B already mean something to shells and readline.
+    /// Aeon's own shortcuts, from `[keys]`, plus Ctrl+1-9 to jump to a
+    /// session. Returns whether the key was one of them.
     fn shortcut(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) -> bool {
-        let (ctrl, shift, alt) = (
-            self.modifiers.control_key(),
-            self.modifiers.shift_key(),
-            self.modifiers.alt_key(),
-        );
-        if !ctrl || alt {
-            return false;
+        #[derive(Clone, Copy)]
+        enum Action {
+            New,
+            Close,
+            Next,
+            Previous,
+            Sidebar,
+            Settings,
         }
-        match &event.logical_key {
-            Key::Named(NamedKey::Tab) => {
-                let n = self.sessions.len();
-                if n > 1 {
-                    let next = if shift {
-                        (self.active + n - 1) % n
-                    } else {
-                        (self.active + 1) % n
-                    };
-                    self.select(next);
+        let (key, mods) = (&event.logical_key, self.modifiers);
+        let keys = &self.config.keys;
+        let action = [
+            (&keys.new_session, Action::New),
+            (&keys.close_session, Action::Close),
+            (&keys.next_session, Action::Next),
+            (&keys.previous_session, Action::Previous),
+            (&keys.toggle_sidebar, Action::Sidebar),
+            (&keys.settings, Action::Settings),
+        ]
+        .into_iter()
+        .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
+        .map(|(_, action)| action);
+        let n = self.sessions.len();
+        match action {
+            Some(Action::New) => self.new_session(),
+            Some(Action::Close) => self.close_session(self.active, event_loop),
+            Some(Action::Next) if n > 1 => self.select((self.active + 1) % n),
+            Some(Action::Previous) if n > 1 => self.select((self.active + n - 1) % n),
+            Some(Action::Next | Action::Previous) => {}
+            Some(Action::Sidebar) => self.toggle_sidebar(),
+            Some(Action::Settings) => self.toggle_settings(),
+            None => {
+                let digit = match key {
+                    Key::Character(c) if mods == ModifiersState::CONTROL => c.parse::<usize>().ok(),
+                    _ => None,
+                };
+                match digit {
+                    Some(d @ 1..=9) => self.select(d - 1),
+                    _ => return false,
                 }
-                true
             }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("t") => {
-                self.new_session();
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("w") => {
-                self.close_session(self.active, event_loop);
-                true
-            }
-            Key::Character(c) if shift && c.eq_ignore_ascii_case("b") => {
-                self.toggle_sidebar();
-                true
-            }
-            Key::Character(c) if !shift => match c.parse::<usize>() {
-                Ok(n @ 1..=9) => {
-                    self.select(n - 1);
-                    true
-                }
-                _ => false,
-            },
-            _ => false,
         }
+        true
     }
 
     fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
-        if event.state != ElementState::Pressed || self.shortcut(event, event_loop) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        // While a shortcut is being recorded, every key belongs to the recorder.
+        let recording = self.settings.as_ref().is_some_and(Settings::is_recording);
+        if !recording && self.shortcut(event, event_loop) {
+            return;
+        }
+        if let Some(panel) = &mut self.settings {
+            let outcome = panel.key(&event.logical_key, self.modifiers, &self.config);
+            self.settings_outcome(outcome);
             return;
         }
         let Some(session) = self.sessions.get_mut(self.active) else {
@@ -470,16 +495,106 @@ impl App {
         let Some(view) = &self.view else {
             return;
         };
-        if !self.sidebar_visible {
+        let scale = view.window.scale_factor();
+        let size = view.window.inner_size();
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let layout = self.layout(view);
+        if x >= f64::from(layout.sidebar) {
+            if let Some(panel) = &mut self.settings {
+                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
+                let outcome = panel.click(x, y, &geo, &self.config);
+                self.settings_outcome(outcome);
+            }
             return;
         }
-        let sidebar = Sidebar::new(&view.atlas, view.window.scale_factor());
-        let (x, y) = (self.cursor.x, self.cursor.y);
-        if sidebar.is_new_button(x, y, &view.atlas) {
+        let sidebar = Sidebar::new(&view.atlas, scale);
+        if sidebar.is_settings_button(x, y, size.height) {
+            self.toggle_settings();
+        } else if sidebar.is_new_button(x, y, &view.atlas) {
             self.new_session();
         } else if let Some(i) = sidebar.row_at(x, y, self.sessions.len()) {
+            self.settings = None;
             self.select(i);
+            self.request_redraw();
         }
+    }
+
+    /// Shows a hand over anything a click acts on, the arrow elsewhere.
+    fn update_pointer(&mut self) {
+        let Some(view) = &self.view else {
+            return;
+        };
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let layout = self.layout(view);
+        let scale = view.window.scale_factor();
+        let size = view.window.inner_size();
+        let clickable = if x < f64::from(layout.sidebar) {
+            let sidebar = Sidebar::new(&view.atlas, scale);
+            sidebar.is_settings_button(x, y, size.height)
+                || sidebar.is_new_button(x, y, &view.atlas)
+                || sidebar.row_at(x, y, self.sessions.len()).is_some()
+        } else {
+            self.settings.as_ref().is_some_and(|panel| {
+                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
+                panel.is_clickable(x, y, &geo)
+            })
+        };
+        if clickable != self.pointer {
+            self.pointer = clickable;
+            view.window.set_cursor(if clickable {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            });
+        }
+    }
+
+    fn toggle_settings(&mut self) {
+        self.settings = match self.settings {
+            Some(_) => None,
+            None => Some(Settings::new(&self.config)),
+        };
+        self.request_redraw();
+    }
+
+    fn settings_outcome(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::None => {}
+            Outcome::Redraw => self.request_redraw(),
+            Outcome::Close => {
+                self.settings = None;
+                self.request_redraw();
+            }
+            Outcome::OpenConfigFile => crate::launcher::open_settings(),
+            Outcome::Save(changes) => {
+                let result = self.save_settings(&changes);
+                if let Some(panel) = &mut self.settings {
+                    panel.error = result.err();
+                    panel.rebuild(&self.config);
+                }
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Writes `changes` to config.toml and applies the new config: theme and
+    /// font now, the shell for sessions opened from now on, and the launcher
+    /// through the resident.
+    fn save_settings(&mut self, changes: &[aeon_config::edit::Change]) -> Result<(), String> {
+        let path = Config::default_path().ok_or("no config folder (APPDATA is not set)")?;
+        aeon_config::edit::write(&path, changes)?;
+        let config = Config::load(&path).map_err(|e| e.to_string())?;
+        let font_changed = config.font != self.config.font;
+        if font_changed && let Some(view) = &mut self.view {
+            let font = font::load(config.font.path.as_deref())?;
+            let px = points_to_px(config.font.size, view.window.scale_factor());
+            view.atlas = Atlas::new(Rc::new(font), px);
+        }
+        self.theme = Theme::new(&config.colors);
+        self.config = config;
+        self.resize();
+        aeon_launcher::sys::notify_settings_changed();
+        Ok(())
     }
 
     fn session_index(&self, id: SessionId) -> Option<usize> {
@@ -572,7 +687,10 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(&event, event_loop),
-            WindowEvent::CursorMoved { position, .. } => self.cursor = position,
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = position;
+                self.update_pointer();
+            }
             WindowEvent::CursorLeft { .. } => self.cursor = PhysicalPosition::new(-1.0, -1.0),
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,

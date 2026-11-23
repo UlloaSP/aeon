@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use aeon_config::Colors;
+use aeon_config::{Colors, CursorStyle};
 use aeon_context::Context;
 use aeon_term::{Cell, Color, Flags, Terminal};
 
@@ -26,12 +26,13 @@ pub struct Theme {
 
 impl Theme {
     pub fn new(colors: &Colors) -> Self {
+        let colors = colors.resolve();
         Self {
             fg: colors.foreground.to_u32(),
             bg: colors.background.to_u32(),
             cursor: colors.cursor.to_u32(),
             bar_bg: colors.bar_background.to_u32(),
-            ansi: colors.ansi().map(|c| c.to_u32()),
+            ansi: colors.ansi.map(|c| c.to_u32()),
         }
     }
 
@@ -96,6 +97,7 @@ pub fn draw(
     atlas: &mut Atlas,
     theme: &Theme,
     origin: (u32, u32),
+    cursor_style: CursorStyle,
 ) {
     frame.pixels.fill(theme.bg);
     let (left, top) = origin;
@@ -109,8 +111,10 @@ pub fn draw(
         let y = top + row as u32 * ch;
         for (col, cell) in grid.row(row).iter().enumerate() {
             let x = left + col as u32 * cw;
-            let is_cursor = cursor.row == row && cursor.col == col;
-            let (fg, bg) = theme.cell_colors(cell, is_cursor);
+            let at_cursor = cursor.row == row && cursor.col == col;
+            // A block cursor inverts its cell; bar and underline are drawn on top.
+            let block = at_cursor && cursor_style == CursorStyle::Block;
+            let (fg, bg) = theme.cell_colors(cell, block);
             if bg != theme.bg {
                 fill_rect(frame, x, y, cw, ch, bg);
             }
@@ -128,6 +132,16 @@ pub fn draw(
             }
             if cell.flags.contains(Flags::STRIKE) {
                 fill_rect(frame, x, y + ch / 2, cw, line, fg);
+            }
+            if at_cursor {
+                let thick = (cw / 6).max(2);
+                match cursor_style {
+                    CursorStyle::Block => {}
+                    CursorStyle::Bar => fill_rect(frame, x, y, thick, ch, theme.cursor),
+                    CursorStyle::Underline => {
+                        fill_rect(frame, x, y + ch - thick, cw, thick, theme.cursor)
+                    }
+                }
             }
         }
     }
@@ -228,6 +242,11 @@ impl Sidebar {
         (i < sessions).then_some(i)
     }
 
+    /// Whether a point is on the footer's Settings row.
+    pub fn is_settings_button(&self, x: f64, y: f64, height: u32) -> bool {
+        x >= 0.0 && x < f64::from(self.width) && y >= f64::from(height.saturating_sub(self.header))
+    }
+
     /// Whether a point is on the header's "+" (new session).
     pub fn is_new_button(&self, x: f64, y: f64, atlas: &Atlas) -> bool {
         let button = f64::from(self.pad + 2 * atlas.cell_width);
@@ -250,6 +269,7 @@ pub fn draw_sidebar(
     sidebar: &Sidebar,
     entries: &[SidebarEntry<'_>],
     active: usize,
+    settings_open: bool,
 ) {
     let [_, _, green, yellow, _, magenta, ..] = theme.ansi;
     let muted = theme.ansi[8];
@@ -290,7 +310,7 @@ pub fn draw_sidebar(
 
     for (i, entry) in entries.iter().enumerate() {
         let top = sidebar.header + i as u32 * sidebar.row;
-        if top >= frame.height {
+        if top + sidebar.row > frame.height.saturating_sub(sidebar.header) {
             break;
         }
         if i == active {
@@ -349,6 +369,45 @@ pub fn draw_sidebar(
             );
         }
     }
+    // Footer: Settings, highlighted while the panel is open.
+    let top = frame.height.saturating_sub(sidebar.header);
+    let divider = blend(theme.bar_bg, theme.fg, 24);
+    fill_rect(frame, 0, top, w.saturating_sub(1), 1, divider);
+    if settings_open {
+        fill_rect(
+            frame,
+            0,
+            top + 1,
+            w.saturating_sub(1),
+            sidebar.header - 1,
+            blend(theme.bar_bg, theme.fg, 22),
+        );
+    }
+    let color = if settings_open {
+        theme.fg
+    } else {
+        blend(theme.bar_bg, theme.fg, 190)
+    };
+    draw_glyph(
+        frame,
+        atlas,
+        '\u{2261}',
+        pad as i32,
+        (top + pad) as i32,
+        color,
+    );
+    draw_text(
+        frame,
+        atlas,
+        pad + 2 * cw,
+        top + pad,
+        "Settings",
+        color,
+        cols.saturating_sub(9),
+    );
+    let hint = "Ctrl+,";
+    let hint_x = w.saturating_sub(pad + hint.len() as u32 * cw);
+    draw_text(frame, atlas, hint_x, top + pad, hint, muted, hint.len());
 }
 
 /// The last folder of `path`, or `~` for the home folder itself.

@@ -4,8 +4,10 @@
 
 mod app;
 mod font;
+mod keys;
 mod launcher;
 mod render;
+mod settings;
 
 use winit::event_loop::EventLoop;
 
@@ -17,28 +19,31 @@ pub const VERSION: &str = match option_env!("AEON_VERSION") {
 };
 
 /// `aeon` opens a terminal. `aeon --command <cmd>` opens one that runs `cmd`
-/// first. `aeon --background` is the resident launcher started at sign-in.
+/// first. `aeon --background` is the resident launcher; the installer's
+/// startup entry adds `--at-sign-in`, so the resident can honor the
+/// "Start with Windows" setting.
 enum Mode {
     Terminal { run: Option<String> },
-    Resident,
+    Resident { at_sign_in: bool },
 }
 
 fn mode() -> Mode {
-    let mut args = std::env::args().skip(1);
-    let mut run = None;
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--background" => return Mode::Resident,
-            "--command" => run = args.next(),
-            _ => {}
-        }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--background") {
+        return Mode::Resident {
+            at_sign_in: args.iter().any(|a| a == "--at-sign-in"),
+        };
     }
+    let run = args
+        .iter()
+        .position(|a| a == "--command")
+        .and_then(|i| args.get(i + 1).cloned());
     Mode::Terminal { run }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode() {
-        Mode::Resident => launcher::run(),
+        Mode::Resident { at_sign_in } => launcher::run(at_sign_in),
         Mode::Terminal { run } => {
             let event_loop = EventLoop::<app::Event>::with_user_event().build()?;
             let mut app = app::App::new(event_loop.create_proxy(), run);
