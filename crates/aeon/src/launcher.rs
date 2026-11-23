@@ -40,12 +40,12 @@ const APPS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 const WIDTH: f64 = 680.0;
 const INPUT_HEIGHT: f64 = 52.0;
-const ROW_HEIGHT: f64 = 34.0;
+const ROW_HEIGHT: f64 = 38.0;
 const PAD: f64 = 8.0;
 const INPUT_POINTS: f32 = 14.0;
 const LIST_POINTS: f32 = 11.0;
 /// App icons in the list, in logical pixels.
-const ICON_SIZE: f64 = 20.0;
+const ICON_SIZE: f64 = 24.0;
 
 pub enum Event {
     Hotkey,
@@ -473,6 +473,11 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
 
     let row_h = px(ROW_HEIGHT);
     let list_cols = (frame.width.saturating_sub(px(18.0) * 2) / list.cell_width) as usize;
+    // Every row has an icon column as wide as an app icon, then the text, so
+    // glyph markers and real icons line up.
+    let icon_box = px(ICON_SIZE);
+    let text_x = left + icon_box + px(12.0);
+    let icon_cols = (text_x - left).div_ceil(list.cell_width) as usize;
     for (i, item) in items.iter().enumerate() {
         let top = px(INPUT_HEIGHT + PAD) + i as u32 * row_h;
         let selected = i == launcher.selected();
@@ -498,12 +503,13 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
         };
         match item {
             Item::App(app) if let Some(Some(image)) = icons.get(&app.id) => {
-                let box_size = px(ICON_SIZE);
-                let x = left as i32 + (list.cell_width as i32 * 2 - box_size as i32) / 2;
-                let y = (top + row_h.saturating_sub(box_size) / 2) as i32;
-                draw_icon(frame, image, x, y, box_size);
+                let y = (top + row_h.saturating_sub(icon_box) / 2) as i32;
+                draw_icon(frame, image, left as i32, y, icon_box);
             }
-            _ => render::draw_glyph(frame, list, icon, left as i32, y, color),
+            _ => {
+                let x = left + icon_box.saturating_sub(list.cell_width) / 2;
+                render::draw_glyph(frame, list, icon, x as i32, y, color);
+            }
         }
 
         let hint = match (item, selected) {
@@ -515,16 +521,9 @@ fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Co
             (_, true) => "Enter runs \u{b7} Ctrl+Enter in a terminal",
         };
         let hint_cols = hint.chars().count();
-        let text_cols = list_cols.saturating_sub(3 + if hint_cols > 0 { hint_cols + 2 } else { 0 });
-        draw_text(
-            frame,
-            list,
-            left + list.cell_width * 3,
-            y,
-            item.text(),
-            theme.fg,
-            text_cols,
-        );
+        let text_cols =
+            list_cols.saturating_sub(icon_cols + if hint_cols > 0 { hint_cols + 2 } else { 0 });
+        draw_text(frame, list, text_x, y, item.text(), theme.fg, text_cols);
         if hint_cols > 0 {
             let hint_x = frame.width - px(18.0) - hint_cols as u32 * list.cell_width;
             draw_text(frame, list, hint_x, y, hint, muted, hint_cols);
