@@ -21,6 +21,7 @@ aeon-term.workspace = true
 fontdue.workspace = true
 softbuffer.workspace = true
 winit.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [build-dependencies]
 embed-resource.workspace = true

@@ -11,6 +11,14 @@ pub struct Git {
     pub behind: u32,
 }
 
+/// The repository `dir` belongs to: the nearest ancestor holding `.git`, a
+/// folder in a repository or a file in a worktree or submodule.
+pub fn root(dir: &Path) -> Option<std::path::PathBuf> {
+    dir.ancestors()
+        .find(|d| d.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
 /// `None` outside a repository, or when git is not installed.
 pub fn status(dir: &Path) -> Option<Git> {
     let mut command = Command::new("git");
@@ -72,6 +80,19 @@ fn parse(porcelain: &str) -> Git {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_is_the_nearest_folder_with_git() {
+        let base = std::env::temp_dir().join(format!("aeon-root-{}", std::process::id()));
+        let deep = base.join("repo").join("src").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::create_dir_all(base.join("repo").join(".git")).unwrap();
+        assert_eq!(root(&deep), Some(base.join("repo")));
+        // A worktree or submodule has a `.git` file instead.
+        std::fs::write(base.join("repo").join("src").join(".git"), "gitdir: x").unwrap();
+        assert_eq!(root(&deep), Some(base.join("repo").join("src")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn parses_branch_counts_and_changes() {

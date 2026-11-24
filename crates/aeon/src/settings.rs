@@ -11,9 +11,10 @@ use aeon_launcher::ResidentCommand;
 use aeon_launcher::update::Status;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
-use crate::font::Atlas;
 use crate::keys::Combo;
-use crate::render::{self, Frame, Theme};
+use crate::render::{Frame, blend, fill_rect};
+use crate::sys::Face;
+use crate::ui::{self, Palette, REGULAR, SEMIBOLD, Ui, icon};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -342,150 +343,191 @@ impl Settings {
         }
     }
 
-    pub fn draw(&self, frame: &mut Frame<'_>, atlas: &mut Atlas, theme: &Theme, geo: &Geometry) {
-        let muted = theme.ansi[8];
-        let (cw, ch) = (atlas.cell_width, atlas.cell_height);
-        let content_w = frame.width.saturating_sub(geo.left);
-        render::fill_rect(frame, geo.left, 0, content_w, frame.height, theme.bg);
-        render::fill_rect(frame, geo.left, 0, geo.nav, frame.height, theme.bar_bg);
+    pub fn draw(&self, frame: &mut Frame<'_>, ui: &mut Ui, pal: &Palette, geo: &Geometry) {
+        let body = ui.font(Face::Ui, 14.0, REGULAR);
+        let strong = ui.font(Face::Ui, 14.0, SEMIBOLD);
+        let small = ui.font(Face::Ui, 12.0, REGULAR);
+        let width = frame.width;
+        let content = geo.left + geo.nav;
+        fill_rect(
+            frame,
+            geo.left,
+            0,
+            width.saturating_sub(geo.left),
+            frame.height,
+            pal.canvas,
+        );
+        fill_rect(
+            frame,
+            content.saturating_sub(1),
+            0,
+            1,
+            frame.height,
+            pal.border,
+        );
 
         for (i, (_, name)) in SECTIONS.iter().enumerate() {
             let top = geo.nav_top + i as u32 * geo.nav_row;
-            if i == self.section {
-                let highlight = render::blend(theme.bar_bg, theme.fg, 22);
-                render::fill_rect(frame, geo.left, top, geo.nav, geo.nav_row, highlight);
-                render::fill_rect(
-                    frame,
-                    geo.left,
-                    top,
-                    (geo.pad / 3).max(2),
-                    geo.nav_row,
-                    theme.cursor,
-                );
+            let x = geo.left + geo.inset;
+            let w = geo.nav.saturating_sub(2 * geo.inset);
+            let on = i == self.section;
+            if on {
+                ui::round_rect(frame, x, top, w, geo.nav_row, ui.px(6.0), pal.highlight);
             }
-            let color = if i == self.section { theme.fg } else { muted };
-            let y = top + (geo.nav_row - ch) / 2;
-            render::draw_text(
+            let mid = top + geo.nav_row / 2;
+            let color = if on { pal.fg } else { pal.muted };
+            ui.text_mid(
                 frame,
-                atlas,
-                geo.left + geo.pad,
-                y,
+                x + ui.px(10.0),
+                mid,
                 name,
+                if on { strong } else { body },
                 color,
-                ((geo.nav - 2 * geo.pad) / cw) as usize,
+                w,
             );
         }
 
-        let x = geo.left + geo.nav + geo.pad * 2;
+        // Header: the section, and where changes go.
+        let hx = content + geo.pad + ui.px(8.0);
+        let hmid = geo.header / 2;
+        fill_rect(
+            frame,
+            content,
+            geo.header.saturating_sub(1),
+            width.saturating_sub(content),
+            1,
+            pal.border,
+        );
         let title = SECTIONS[self.section].1;
-        render::draw_text(frame, atlas, x, geo.pad * 2, title, theme.fg, 40);
+        let tw = ui.text_mid(frame, hx, hmid, title, strong, pal.fg, ui.px(240.0));
+        ui.text_mid(
+            frame,
+            hx + tw + ui.px(12.0),
+            hmid,
+            "Saved to config.toml, comments kept",
+            small,
+            pal.label,
+            width.saturating_sub(hx + tw + ui.px(28.0)),
+        );
 
-        let title_cols = ((geo.control_x.saturating_sub(x + geo.pad)) / cw) as usize;
+        let rows = self.rows.len() as u32;
+        let card_h = rows * geo.row;
+        if rows > 0 {
+            let fill = blend(pal.canvas, pal.raised, 120);
+            ui::card(
+                frame,
+                geo.card_x,
+                geo.card_y,
+                geo.card_w,
+                card_h,
+                ui.px(12.0),
+                fill,
+                pal.border,
+            );
+        }
+        let text_x = geo.card_x + geo.pad;
+        let text_w = geo.control_x.saturating_sub(text_x + geo.pad);
         for (i, row) in self.rows.iter().enumerate() {
-            let top = geo.rows_top + i as u32 * geo.row;
+            let top = geo.card_y + i as u32 * geo.row;
             if top + geo.row > frame.height {
                 break;
             }
-            if i == self.selected {
-                let highlight = render::blend(theme.bg, theme.fg, 18);
-                render::fill_rect(
+            if i > 0 {
+                fill_rect(
                     frame,
-                    x - geo.pad,
+                    geo.card_x + 1,
                     top,
-                    frame.width.saturating_sub(x),
-                    geo.row,
-                    highlight,
+                    geo.card_w.saturating_sub(2),
+                    1,
+                    pal.border,
                 );
             }
-            let line1 = top + geo.pad;
-            render::draw_text(frame, atlas, x, line1, row.title, theme.fg, title_cols);
-            render::draw_text(
+            let selected = i == self.selected;
+            if selected {
+                let inset = ui.px(4.0);
+                ui::round_rect(
+                    frame,
+                    geo.card_x + inset,
+                    top + inset,
+                    geo.card_w.saturating_sub(2 * inset),
+                    geo.row.saturating_sub(2 * inset),
+                    ui.px(8.0),
+                    blend(fill_of(pal), pal.fg, 14),
+                );
+            }
+            let mid = top + geo.row / 2;
+            ui.text_mid(
                 frame,
-                atlas,
-                x,
-                line1 + ch,
+                text_x,
+                mid - ui.px(9.0),
+                row.title,
+                body,
+                pal.fg,
+                text_w,
+            );
+            ui.text_mid(
+                frame,
+                text_x,
+                mid + ui.px(10.0),
                 &row.description,
-                muted,
-                title_cols,
+                small,
+                pal.label,
+                text_w,
             );
-            self.draw_control(
-                frame,
-                atlas,
-                theme,
-                geo,
-                &row.control,
-                line1 + ch / 2,
-                i == self.selected,
-            );
+            self.draw_control(frame, ui, pal, geo, &row.control, mid, selected);
         }
 
         let hint = if self.recording {
-            "Press the new hotkey \u{b7} Esc cancels"
+            "Press the new shortcut \u{b7} Esc cancels"
         } else {
-            "\u{2191}\u{2193} move \u{b7} \u{2190}\u{2192} change \u{b7} Enter toggle \u{b7} Tab section \u{b7} Esc close"
+            "\u{2191}\u{2193} move \u{b7} \u{2190}\u{2192} change \u{b7} Enter toggles \u{b7} Tab next section \u{b7} Esc closes"
         };
-        let bottom = frame.height.saturating_sub(geo.pad + ch);
-        render::draw_text(
-            frame,
-            atlas,
-            x,
-            bottom,
-            hint,
-            muted,
-            ((frame.width - x) / cw) as usize,
-        );
+        let below = geo.card_y + card_h + ui.px(16.0);
+        let line = ui.line_height(small);
+        let mut y = below;
         if let Some(error) = &self.error {
-            let [_, red, ..] = theme.ansi;
-            render::draw_text(
-                frame,
-                atlas,
-                x,
-                bottom.saturating_sub(ch + geo.pad),
-                error,
-                red,
-                ((frame.width - x) / cw) as usize,
-            );
+            ui.text(frame, geo.card_x, y, error, small, pal.red, geo.card_w);
+            y += line + ui.px(6.0);
         }
+        ui.text(frame, geo.card_x, y, hint, small, pal.label, geo.card_w);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn draw_control(
         &self,
         frame: &mut Frame<'_>,
-        atlas: &mut Atlas,
-        theme: &Theme,
+        ui: &mut Ui,
+        pal: &Palette,
         geo: &Geometry,
         control: &Control,
-        y: u32,
+        mid: u32,
         selected: bool,
     ) {
-        let muted = theme.ansi[8];
-        let [_, _, _, _, blue, ..] = theme.ansi;
-        let cw = atlas.cell_width;
-        let cols = (geo.control_w / cw) as usize;
-        // Right-aligned text inside the control column.
-        let right =
-            |text: &str| geo.control_x + geo.control_w - text.chars().count().min(cols) as u32 * cw;
+        let body = ui.font(Face::Ui, 14.0, REGULAR);
+        let small = ui.font(Face::Ui, 12.0, REGULAR);
+        let right = geo.control_x + geo.control_w;
         match control {
             Control::Toggle { on, .. } => {
-                let h = atlas.cell_height;
-                let w = h * 2;
-                let x = geo.control_x + geo.control_w - w;
+                let (w, h) = (ui.px(32.0), ui.px(18.0));
+                let x = right - w;
                 let track = if *on {
-                    theme.cursor
+                    pal.accent
                 } else {
-                    render::blend(theme.bg, theme.fg, 60)
+                    blend(pal.canvas, pal.fg, 34)
                 };
-                render::fill_rect(frame, x, y, w, h, track);
-                let inset = (h / 6).max(1);
-                let knob = h - 2 * inset;
-                let kx = if *on { x + w - inset - knob } else { x + inset };
-                render::fill_rect(frame, kx, y + inset, knob, knob, theme.bg);
+                ui::round_rect(frame, x, mid - h / 2, w, h, h / 2, track);
+                let knob = ui.px(14.0);
+                let inset = (h - knob) / 2;
+                let kx = if *on {
+                    x + w - inset - knob / 2
+                } else {
+                    x + inset + knob / 2
+                };
+                ui::dot(frame, kx, mid, knob, pal.canvas);
             }
             Control::Choice { options, index } => {
                 let label = options.get(*index).map_or("", |o| o.label.as_str());
-                let text = format!("\u{2039} {label} \u{203a}");
-                self.arrows(frame, atlas, theme, &text, right(&text), y, cols, selected);
+                self.stepper(frame, ui, pal, geo, label, mid, selected);
             }
             Control::Number {
                 value,
@@ -498,87 +540,161 @@ impl Settings {
                 } else {
                     format!("{value:.1}")
                 };
-                let text = format!("\u{2039} {number} {unit} \u{203a}");
-                self.arrows(frame, atlas, theme, &text, right(&text), y, cols, selected);
+                self.stepper(
+                    frame,
+                    ui,
+                    pal,
+                    geo,
+                    &format!("{number} {unit}"),
+                    mid,
+                    selected,
+                );
             }
             Control::Hotkey { value, .. } => {
-                let text = if self.recording && selected {
-                    "Press keys\u{2026}".to_owned()
+                let recording = self.recording && selected;
+                let text = if recording {
+                    "Press keys\u{2026}"
                 } else {
-                    value.clone()
+                    value.as_str()
                 };
-                let color = if self.recording && selected {
-                    theme.cursor
+                let tw = ui.measure(text, small);
+                let (w, h) = (tw + ui.px(16.0), ui.px(24.0));
+                let x = right - w;
+                let (bg, fg) = if recording {
+                    (blend(pal.canvas, pal.accent, 36), pal.accent)
                 } else {
-                    theme.fg
+                    (blend(pal.canvas, pal.fg, 20), pal.fg)
                 };
-                render::draw_text(frame, atlas, right(&text), y, &text, color, cols);
+                ui::round_rect(frame, x, mid - h / 2, w, h, ui.px(5.0), bg);
+                ui.text_mid(frame, x + ui.px(8.0), mid, text, small, fg, w);
             }
             Control::Info(text) => {
-                render::draw_text(frame, atlas, right(text), y, text, muted, cols)
+                ui.text_right(frame, right, mid, text, body, pal.muted);
             }
             Control::Button { label, .. } => {
-                let text = format!("{label} \u{203a}");
-                render::draw_text(frame, atlas, right(&text), y, &text, blue, cols);
+                let tw = ui.measure(label, body);
+                let (w, h) = (tw + ui.px(24.0), ui.px(30.0));
+                let x = right - w;
+                let border = if selected {
+                    pal.accent
+                } else {
+                    blend(pal.canvas, pal.fg, 31)
+                };
+                ui::card(
+                    frame,
+                    x,
+                    mid - h / 2,
+                    w,
+                    h,
+                    ui.px(8.0),
+                    blend(pal.canvas, pal.fg, 9),
+                    border,
+                );
+                ui.text_mid(frame, x + ui.px(12.0), mid, label, body, pal.fg, w);
             }
         }
     }
 
-    /// A value between `‹ ›`, with the arrows dimmed unless the row is selected.
+    /// A value in a select-like box with ‹ › at its ends; clicking the left
+    /// half steps back, the right half forward.
     #[allow(clippy::too_many_arguments)]
-    fn arrows(
+    fn stepper(
         &self,
         frame: &mut Frame<'_>,
-        atlas: &mut Atlas,
-        theme: &Theme,
-        text: &str,
-        x: u32,
-        y: u32,
-        cols: usize,
+        ui: &mut Ui,
+        pal: &Palette,
+        geo: &Geometry,
+        label: &str,
+        mid: u32,
         selected: bool,
     ) {
-        render::draw_text(frame, atlas, x, y, text, theme.fg, cols);
-        let arrow = if selected {
-            theme.cursor
+        let body = ui.font(Face::Ui, 14.0, REGULAR);
+        let h = ui.px(32.0);
+        let x = geo.control_x;
+        let w = geo.control_w;
+        let border = if selected {
+            pal.accent
         } else {
-            theme.ansi[8]
+            blend(pal.canvas, pal.fg, 31)
         };
-        let n = text.chars().count().min(cols) as u32;
-        render::draw_glyph(frame, atlas, '\u{2039}', x as i32, y as i32, arrow);
-        let last = x + (n.saturating_sub(1)) * atlas.cell_width;
-        render::draw_glyph(frame, atlas, '\u{203a}', last as i32, y as i32, arrow);
+        ui::card(
+            frame,
+            x,
+            mid - h / 2,
+            w,
+            h,
+            ui.px(8.0),
+            blend(pal.canvas, pal.fg, 9),
+            border,
+        );
+        let arrows = if selected { pal.accent } else { pal.label };
+        ui.icon(
+            frame,
+            x + ui.px(14.0),
+            mid,
+            icon::CHEVRON_LEFT,
+            10.0,
+            arrows,
+        );
+        ui.icon(
+            frame,
+            x + w - ui.px(14.0),
+            mid,
+            icon::CHEVRON_RIGHT,
+            10.0,
+            arrows,
+        );
+        let room = w.saturating_sub(ui.px(56.0));
+        let tw = ui.measure(label, body).min(room);
+        ui.text_mid(frame, x + (w - tw) / 2, mid, label, body, pal.fg, room);
     }
+}
+
+fn fill_of(pal: &Palette) -> u32 {
+    blend(pal.canvas, pal.raised, 120)
 }
 
 /// The panel's measurements, shared by drawing and click handling.
 pub struct Geometry {
     /// First pixel column of the panel (right of the sidebar).
     left: u32,
-    pad: u32,
     nav: u32,
+    inset: u32,
+    pad: u32,
     nav_top: u32,
     nav_row: u32,
-    rows_top: u32,
+    header: u32,
+    card_x: u32,
+    card_y: u32,
+    card_w: u32,
     row: u32,
     control_x: u32,
     control_w: u32,
 }
 
 impl Geometry {
-    pub fn new(left: u32, width: u32, atlas: &Atlas, scale: f64) -> Self {
+    pub fn new(left: u32, width: u32, scale: f64) -> Self {
         let px = |logical: f64| (logical * scale).round() as u32;
-        let pad = px(10.0);
-        let nav = px(170.0).min(width.saturating_sub(left) / 3);
-        let control_w = px(240.0).min(width.saturating_sub(left + nav) / 2);
+        let nav = px(240.0).min(width.saturating_sub(left) / 3);
+        let content = left + nav;
+        let pad = px(16.0);
+        let card_x = content + px(24.0);
+        let card_w = width.saturating_sub(content + px(48.0)).min(px(896.0));
+        let control_w = px(220.0).min(card_w / 2);
+        let header = px(44.0);
         Self {
             left,
-            pad,
             nav,
-            nav_top: pad * 2,
-            nav_row: atlas.cell_height + 2 * pad,
-            rows_top: pad * 4 + atlas.cell_height,
-            row: 2 * atlas.cell_height + 2 * pad,
-            control_x: width.saturating_sub(control_w + pad * 2),
+            inset: px(8.0),
+            pad,
+            nav_top: px(12.0),
+            nav_row: px(32.0),
+            header,
+            card_x,
+            card_y: header + px(24.0),
+            card_w,
+            row: px(60.0),
+            control_x: (card_x + card_w).saturating_sub(pad + control_w),
             control_w,
         }
     }
@@ -591,10 +707,10 @@ impl Geometry {
     }
 
     fn row_at(&self, y: f64, rows: usize) -> Option<usize> {
-        if y < f64::from(self.rows_top) {
+        if y < f64::from(self.card_y) {
             return None;
         }
-        let i = ((y - f64::from(self.rows_top)) / f64::from(self.row)) as usize;
+        let i = ((y - f64::from(self.card_y)) / f64::from(self.row)) as usize;
         (i < rows).then_some(i)
     }
 }
@@ -630,8 +746,8 @@ fn rows(
                 },
             },
             Row {
-                title: "Context bar",
-                description: "Folder, git, and servers under the terminal.".into(),
+                title: "Session header",
+                description: "Project, branch, changes, and servers above the terminal.".into(),
                 control: Control::Toggle {
                     on: config.bar.enabled,
                     table: "bar",

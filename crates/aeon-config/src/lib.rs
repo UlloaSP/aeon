@@ -52,7 +52,8 @@ impl Default for Shell {
     }
 }
 
-/// The context bar under the terminal: directory, git, and running servers.
+/// The session header above the terminal: project, git, and running servers.
+/// The key keeps its old name, `[bar]`, so existing configs still load.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Bar {
@@ -206,7 +207,7 @@ pub struct Colors {
     pub foreground: Option<Rgb>,
     pub background: Option<Rgb>,
     pub cursor: Option<Rgb>,
-    /// The context bar and sidebar. Unset: a step from the background toward
+    /// The sidebar and other raised surfaces. Unset: a step from the background toward
     /// the foreground.
     pub bar_background: Option<Rgb>,
     /// ANSI colors 0-7. Unset entries keep the theme's.

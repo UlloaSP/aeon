@@ -23,7 +23,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **Small.** One static `aeon.exe` under 1 MB. A window with a shell uses about 13 MB of private memory. Every release build reports both numbers, so regressions are caught before they ship.
 - **Native to Windows.** ConPTY, per-monitor DPI, x64 and arm64, and an MSI installer that puts `aeon` on your PATH.
 - **A launcher on Ctrl+Alt+Space.** From anywhere, open any app by name, run a command, search the web, switch Windows between light and dark, or do quick math. Your history comes with you.
-- **Context at a glance.** A bar under the terminal shows where you are, the git branch and pending changes, and the servers you started from that shell (`node :5173`). No prompt framework needed.
+- **Projects, not tabs.** The sidebar groups your shells by the repository they run in, and each one shows the servers it started (`:5173`). A header above the terminal shows the project, the git branch and pending changes. No prompt framework needed.
 - **Full color.** 16, 256, and 24-bit color, with Aeon's own theme or yours.
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
@@ -49,17 +49,17 @@ Builds are not code-signed yet, so Windows SmartScreen may warn the first time y
 
 ## Configuration
 
-Press **Ctrl+,** (or click **Settings** at the bottom of the sidebar) to change the shell, font, size, padding, context bar, launcher hotkey, and web search from inside Aeon. Changes apply at once and are saved to `config.toml` without touching anything else in it, comments included.
+Press **Ctrl+,** (or click **Settings** at the bottom of the sidebar) to change the shell, font, size, padding, session header, launcher hotkey, and web search from inside Aeon. Changes apply at once and are saved to `config.toml` without touching anything else in it, comments included.
 
 Aeon reads `%APPDATA%\aeon\config.toml`. Every setting is optional, and an unknown key is an error, so typos don't fail silently. If the file is invalid, Aeon starts with the defaults and says so in the window title.
 
 ### Sessions
 
-One window holds as many shells as you want, listed in the sidebar with their folder, git branch, pending changes, and running servers. A new session starts in the folder of the one you are in.
+One window holds as many shells as you want. The sidebar groups them by project: the git repository they run in, or their folder outside one, with your home folder under **Home**. Inside a project, a session is named after its shell, or after its folder when it is deeper in the repository; a session serving a port shows it (`:5173`). A new session starts in the folder of the one you are in, and Ctrl+Tab and Ctrl+1 to Ctrl+9 follow the sidebar's order.
 
 | Keys | Action |
 | --- | --- |
-| Ctrl+Shift+T | New session (or click **+**) |
+| Ctrl+Shift+T | New session (or click **New session**) |
 | Ctrl+Shift+W | Close the session |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous session |
 | Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
@@ -85,7 +85,7 @@ To stop it from starting with Windows, turn off **Start with Windows** in Settin
 
 ### Your shell inside Aeon
 
-Aeon starts PowerShell **without your profile**, with its own prompt and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. Prompt themes like Oh My Posh are not needed: the context bar shows the same information, for every shell. cmd keeps its usual prompt and reports its directory to the bar.
+Aeon starts PowerShell **without your profile**, with its own prompt and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. Prompt themes like Oh My Posh are not needed: the session header shows the same information, for every shell. cmd keeps its usual prompt and reports its directory to Aeon.
 
 Aeon sets `TERM_PROGRAM=aeon` and `COLORTERM=truecolor` for everything it runs. To start a shell exactly as you configured it, profile included, set `integration = false` or give it `args`.
 
@@ -119,7 +119,7 @@ toggle_sidebar = "Ctrl+Shift+B"
 settings = "Ctrl+,"
 
 [bar]
-enabled = true                # directory, git, and servers under the terminal
+enabled = true                # the session header: project, git, and servers above the terminal
 
 [cursor]
 style = "block"               # block, bar, or underline

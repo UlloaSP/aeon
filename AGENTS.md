@@ -54,7 +54,7 @@ The most common defect is a change that works on the path you tested and is miss
 - **Launch paths.** From the Start menu, from another shell (`aeon` on PATH), from Explorer, and from the launcher's Ctrl+Enter (`aeon --command`). They start with different working directories.
 - **Two processes.** A terminal (`aeon`) and the resident launcher (`aeon --background`, one per session, started at sign-in) are separate processes. The resident stays running for days: it must stay small and must not leak. To try a resident while the developer's installed one runs, use a debug build (it takes its own single-instance lock) with a different `[launcher] hotkey` in a temporary `APPDATA`.
 - **Config.** A new option has a default, rejects typos (`deny_unknown_fields`), and appears in the README's config section.
-- **Integration off.** With `shell.integration = false` or custom `args`, the shell reports no directory: the bar must still make sense with only the starting directory.
+- **Integration off.** With `shell.integration = false` or custom `args`, the shell reports no directory: the sidebar and header must still make sense with only the starting directory.
 - **Reverse states.** Every way in needs a way out: what opens closes, what resizes up resizes down.
 - **Docs.** Check whether the change makes existing guidance inaccurate. Follow [Documentation](#documentation).
 
@@ -127,10 +127,10 @@ Most code changes do not need a documentation change. Agents can read the code.
 
 ## Where code lives
 
-- `crates/aeon` - the binary. The terminal window and its sessions (`app.rs`), the settings panel (`settings.rs`), the resident launcher (`launcher.rs`), CPU rendering including the sidebar (`render.rs`), and fonts (`font.rs`). Thin: it wires the other crates together.
+- `crates/aeon` - the binary. The terminal window and its sessions (`app.rs`), the sidebar and session header (`chrome.rs`), the settings panel (`settings.rs`), the resident launcher (`launcher.rs`), terminal rendering (`render.rs`), interface drawing (`ui.rs`, with text rendered by Windows through GDI in `sys.rs`), and terminal fonts (`font.rs`). Thin: it wires the other crates together.
 - `crates/aeon-term` - VT parsing into a grid. Pure and synchronous: no I/O, no clock, no window. Most terminal behavior lives and is tested here.
 - `crates/aeon-pty` - ConPTY process spawning, command-line quoting, and shell integration (`shell.rs`, with the PowerShell script in `aeon.ps1`). Its Win32 code is in `conpty.rs`.
-- `crates/aeon-context` - what the context bar shows: git state and the servers under the shell, gathered on a background thread. Its Win32 code is in `sys.rs`.
+- `crates/aeon-context` - what the sidebar and header show: the repository root, git state, and the servers under the shell, gathered on a background thread. Its Win32 code is in `sys.rs`.
 - `crates/aeon-launcher` - the launcher's state (query, results, calculator, history, installed apps, built-in commands such as `theme`) and update decisions (`update.rs`) as pure, tested code; the resident's update thread (`updater.rs`); and `sys.rs` for the global hotkey, notification-area icon, clipboard, single-instance lock, Windows theme, HTTPS downloads, and SHA-256. The window itself is `crates/aeon/src/launcher.rs`.
 - `crates/aeon-config` - `config.toml` schema and loading, and `edit.rs`, which changes single keys while keeping the user's comments and layout. Aeon writes the file only through it.
 - `packaging/windows` - the WiX source for the MSI. Its `UpgradeCode` must never change.
@@ -139,7 +139,7 @@ Most code changes do not need a documentation change. Agents can read the code.
 
 ## Taste
 
-- Complexity belongs at the boundary. `aeon-term` stays pure, `aeon` stays thin, and Win32 details stay in one `sys`-style module per crate (`aeon-pty/src/conpty.rs`, `aeon-context/src/sys.rs`, `aeon-launcher/src/sys.rs`). `unsafe` lives nowhere else.
+- Complexity belongs at the boundary. `aeon-term` stays pure, `aeon` stays thin, and Win32 details stay in one `sys`-style module per crate (`aeon-pty/src/conpty.rs`, `aeon-context/src/sys.rs`, `aeon-launcher/src/sys.rs`, `aeon/src/sys.rs`). `unsafe` lives nowhere else.
 - No allocation per cell or per byte on the hot path. Reuse buffers; allocate per chunk at most.
 - Redraw only when something changed (`Terminal::take_dirty`). No timers or animations that repaint while idle.
 - Every `unsafe` block has a `// SAFETY:` comment saying why it is sound (`clippy::undocumented_unsafe_blocks` enforces this).

@@ -21,10 +21,12 @@ use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::IconExtWindows;
 use winit::window::{CursorIcon, Icon, Window, WindowId};
 
+use crate::chrome::{self, Hit, Pill, Project, SessionRow, Sidebar, SidebarState};
 use crate::font::{self, Atlas};
 use crate::keys::Combo;
-use crate::render::{self, Frame, Sidebar, SidebarContent, SidebarEntry, Theme, UpdateRow};
+use crate::render::{self, Frame, Theme};
 use crate::settings::{self, Outcome, Settings};
+use crate::ui::{Palette, Ui};
 
 /// Identifies a session across threads; never reused within a process.
 type SessionId = u64;
@@ -44,6 +46,11 @@ pub struct App {
     config: Config,
     config_error: Option<String>,
     theme: Theme,
+    palette: Palette,
+    /// The user's home folder: sessions there belong to no project.
+    home: Option<PathBuf>,
+    /// What the mouse is over in the sidebar, drawn highlighted.
+    hover: Option<Hit>,
     /// A first command for the first shell, from `--command` (the launcher's
     /// Ctrl+Enter).
     run: Option<String>,
@@ -74,6 +81,7 @@ struct View {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
     atlas: Atlas,
+    ui: Ui,
 }
 
 /// One shell: its PTY, what it printed, and what the bar and sidebar show.
@@ -83,6 +91,9 @@ struct Session {
     pty: Pty,
     input: File,
     context: Context,
+    /// The shell's program name, such as `pwsh`: the session's title at the
+    /// top of its project.
+    shell: String,
     watcher: Option<Watcher>,
 }
 
@@ -94,9 +105,14 @@ struct Layout {
     origin: (u32, u32),
     rows: usize,
     cols: usize,
-    /// First pixel row of the context bar, when it is shown.
-    bar_top: Option<u32>,
+    /// Height of the session header above the terminal; 0 when it is off.
+    header: u32,
 }
+
+/// The sidebar's width in logical pixels, as in T3 Code.
+const SIDEBAR_WIDTH: f64 = 256.0;
+/// The session header's height in logical pixels.
+const HEADER_HEIGHT: f64 = 44.0;
 
 impl App {
     pub fn new(proxy: EventLoopProxy<Event>, run: Option<String>) -> Self {
@@ -105,9 +121,13 @@ impl App {
             Some(Err(e)) => (Config::default(), Some(e.to_string())),
             None => (Config::default(), None),
         };
+        let theme = Theme::new(&config.colors);
         Self {
             proxy,
-            theme: Theme::new(&config.colors),
+            palette: Palette::new(&theme),
+            theme,
+            home: std::env::var_os("USERPROFILE").map(PathBuf::from),
+            hover: None,
             config,
             config_error,
             run,
@@ -135,19 +155,19 @@ impl App {
         // The window starts at the default scale and is resized on the first
         // ScaleFactorChanged, so size it from 96-DPI metrics.
         let atlas = Atlas::new(Rc::new(font), points_to_px(self.config.font.size, 1.0));
-        let bar_height = if self.config.bar.enabled {
-            atlas.cell_height + pad
+        let header = if self.config.bar.enabled {
+            HEADER_HEIGHT as u32
         } else {
             0
         };
         let sidebar = if self.sidebar_visible {
-            Sidebar::new(&atlas, 1.0).width
+            SIDEBAR_WIDTH as u32
         } else {
             0
         };
         let inner = winit::dpi::LogicalSize::new(
             sidebar + u32::from(window_cfg.columns) * atlas.cell_width + 2 * pad,
-            u32::from(window_cfg.rows) * atlas.cell_height + 2 * pad + bar_height,
+            u32::from(window_cfg.rows) * atlas.cell_height + 2 * pad + header,
         );
 
         let mut title = format!("Aeon {}", crate::VERSION);
@@ -159,6 +179,7 @@ impl App {
                 Window::default_attributes()
                     .with_title(title)
                     .with_window_icon(Icon::from_resource(1, None).ok())
+                    .with_theme(Some(window_theme(&self.theme)))
                     .with_inner_size(inner),
             )?,
         );
@@ -166,6 +187,7 @@ impl App {
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
         Ok(View {
+            ui: Ui::new(window.scale_factor()),
             window,
             surface,
             atlas,
@@ -186,6 +208,12 @@ impl App {
         self.next_id += 1;
 
         let shell = self.shell_command(cwd, run.as_deref());
+        let shell_name = std::path::Path::new(&shell.program)
+            .file_stem()
+            .map_or_else(
+                || "shell".to_owned(),
+                |n| n.to_string_lossy().to_lowercase(),
+            );
         let mut pty = Pty::spawn(&shell, pty_size(layout.rows, layout.cols))?;
         let output = pty.take_reader().ok_or("pty reader already taken")?;
         let input = pty.take_writer().ok_or("pty writer already taken")?;
@@ -209,6 +237,7 @@ impl App {
                 cwd: shell.cwd,
                 ..Context::default()
             },
+            shell: shell_name,
             watcher,
         });
         self.active = self.sessions.len() - 1;
@@ -307,25 +336,60 @@ impl App {
         let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
         let atlas = &view.atlas;
         let sidebar = if self.sidebar_visible {
-            Sidebar::new(atlas, scale).width.min(size.width / 2)
+            view.ui.px(SIDEBAR_WIDTH).min(size.width / 2)
         } else {
             0
         };
-        let bar_height = if self.config.bar.enabled {
-            atlas.cell_height + padding
+        let header = if self.config.bar.enabled {
+            view.ui.px(HEADER_HEIGHT)
         } else {
             0
         };
-        let term_height = size.height.saturating_sub(bar_height);
         let w = size.width.saturating_sub(sidebar + 2 * padding);
-        let h = term_height.saturating_sub(2 * padding);
+        let h = size.height.saturating_sub(header + 2 * padding);
         Layout {
             sidebar,
-            origin: (sidebar + padding, padding),
+            origin: (sidebar + padding, header + padding),
             rows: (h / atlas.cell_height).max(1) as usize,
             cols: (w / atlas.cell_width).max(1) as usize,
-            bar_top: self.config.bar.enabled.then_some(term_height),
+            header,
         }
+    }
+
+    /// Sessions grouped into projects, as the sidebar shows them.
+    fn projects(&self) -> Vec<Project> {
+        let contexts: Vec<&Context> = self.sessions.iter().map(|s| &s.context).collect();
+        chrome::projects(&contexts, self.home.as_deref())
+    }
+
+    /// Moves `step` sessions along the sidebar's order, wrapping around.
+    fn step(&mut self, step: isize) {
+        let order = chrome::display_order(&self.projects());
+        let Some(at) = order.iter().position(|&i| i == self.active) else {
+            return;
+        };
+        let n = order.len() as isize;
+        self.select(order[(at as isize + step).rem_euclid(n) as usize]);
+    }
+
+    /// What the sidebar has under (`x`, `y`), if anything.
+    fn sidebar_hit(&mut self, x: f64, y: f64) -> Option<Hit> {
+        let layout = self.layout(self.view.as_ref()?);
+        if x >= f64::from(layout.sidebar) {
+            return None;
+        }
+        let projects = self.projects();
+        let pill = self.pill();
+        let view = self.view.as_mut()?;
+        let height = view.window.inner_size().height;
+        Sidebar::new(
+            &mut view.ui,
+            layout.sidebar,
+            height,
+            &projects,
+            pill.as_ref(),
+        )
+        .hit(x, y)
     }
 
     /// Fits every session's grid and PTY to the window.
@@ -350,8 +414,8 @@ impl App {
         };
         let layout = self.layout(view);
         let scale = view.window.scale_factor();
-        let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
-        let update_row = self.update_row();
+        let projects = self.projects();
+        let pill = self.pill();
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -373,10 +437,20 @@ impl App {
         let Some(session) = self.sessions.get(self.active) else {
             return;
         };
+        let home = self.home.as_deref();
+        let title = |i: usize, s: &Session| {
+            projects
+                .iter()
+                .find(|p| p.sessions.contains(&i))
+                .map_or_else(
+                    || s.shell.clone(),
+                    |p| chrome::session_title(&s.context, &s.shell, p, home),
+                )
+        };
         if let Some(panel) = &self.settings {
-            frame.pixels.fill(self.theme.bg);
-            let geo = settings::Geometry::new(layout.sidebar, frame.width, &view.atlas, scale);
-            panel.draw(&mut frame, &mut view.atlas, &self.theme, &geo);
+            frame.pixels.fill(self.palette.canvas);
+            let geo = settings::Geometry::new(layout.sidebar, frame.width, scale);
+            panel.draw(&mut frame, &mut view.ui, &self.palette, &geo);
         } else {
             render::draw(
                 &mut frame,
@@ -386,36 +460,50 @@ impl App {
                 layout.origin,
                 self.config.cursor.style,
             );
-        }
-        if let Some(top) = layout.bar_top.filter(|_| self.settings.is_none()) {
-            render::draw_bar(
-                &mut frame,
-                &mut view.atlas,
-                &self.theme,
-                &session.context,
-                (layout.sidebar, top),
-                padding,
-            );
+            if layout.header > 0
+                && let Some(project) = projects.iter().find(|p| p.sessions.contains(&self.active))
+            {
+                chrome::draw_header(
+                    &mut frame,
+                    &mut view.ui,
+                    &self.palette,
+                    layout.sidebar,
+                    project,
+                    &title(self.active, session),
+                    &session.context,
+                );
+            }
         }
         if layout.sidebar > 0 {
-            let entries: Vec<SidebarEntry<'_>> = self
+            let rows: Vec<SessionRow<'_>> = self
                 .sessions
                 .iter()
-                .map(|s| SidebarEntry {
+                .enumerate()
+                .map(|(i, s)| SessionRow {
                     context: &s.context,
+                    title: title(i, s),
                 })
                 .collect();
-            let sidebar = Sidebar::new(&view.atlas, scale);
-            render::draw_sidebar(
+            let sidebar = Sidebar::new(
+                &mut view.ui,
+                layout.sidebar,
+                frame.height,
+                &projects,
+                pill.as_ref(),
+            );
+            chrome::draw_sidebar(
                 &mut frame,
-                &mut view.atlas,
-                &self.theme,
+                &mut view.ui,
+                &self.palette,
                 &sidebar,
-                &SidebarContent {
-                    entries: &entries,
+                &SidebarState {
+                    projects: &projects,
+                    sessions: &rows,
                     active: self.active,
                     settings_open: self.settings.is_some(),
-                    update: update_row,
+                    hover: self.hover,
+                    pill: pill.as_ref(),
+                    new_keys: &self.config.keys.new_session,
                 },
             );
         }
@@ -447,13 +535,11 @@ impl App {
         .into_iter()
         .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
         .map(|(_, action)| action);
-        let n = self.sessions.len();
         match action {
             Some(Action::New) => self.new_session(),
             Some(Action::Close) => self.close_session(self.active, event_loop),
-            Some(Action::Next) if n > 1 => self.select((self.active + 1) % n),
-            Some(Action::Previous) if n > 1 => self.select((self.active + n - 1) % n),
-            Some(Action::Next | Action::Previous) => {}
+            Some(Action::Next) => self.step(1),
+            Some(Action::Previous) => self.step(-1),
             Some(Action::Sidebar) => self.toggle_sidebar(),
             Some(Action::Settings) => self.toggle_settings(),
             None => {
@@ -462,7 +548,12 @@ impl App {
                     _ => None,
                 };
                 match digit {
-                    Some(d @ 1..=9) => self.select(d - 1),
+                    Some(d @ 1..=9) => {
+                        let order = chrome::display_order(&self.projects());
+                        if let Some(&i) = order.get(d - 1) {
+                            self.select(i);
+                        }
+                    }
                     _ => return false,
                 }
             }
@@ -520,55 +611,56 @@ impl App {
         let layout = self.layout(view);
         if x >= f64::from(layout.sidebar) {
             if let Some(panel) = &mut self.settings {
-                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
+                let geo = settings::Geometry::new(layout.sidebar, size.width, scale);
                 let outcome = panel.click(x, y, &geo, &self.config);
                 self.settings_outcome(outcome);
             }
             return;
         }
-        let sidebar = Sidebar::new(&view.atlas, scale);
-        if sidebar.is_settings_button(x, y, size.height) {
-            self.toggle_settings();
-        } else if self.update_row().is_some() && sidebar.is_update_button(x, y, size.height) {
-            let command = match self.update {
-                Status::Available(_) => Some(ResidentCommand::DownloadUpdate),
-                Status::Ready { .. } => Some(ResidentCommand::InstallUpdate),
-                Status::Error(_) => Some(ResidentCommand::CheckUpdates),
-                _ => None,
-            };
-            if let Some(command) = command {
-                self.update_command(command);
+        match self.sidebar_hit(x, y) {
+            Some(Hit::Settings) => self.toggle_settings(),
+            Some(Hit::Update) => {
+                let command = match self.update {
+                    Status::Available(_) => Some(ResidentCommand::DownloadUpdate),
+                    Status::Ready { .. } => Some(ResidentCommand::InstallUpdate),
+                    Status::Error(_) => Some(ResidentCommand::CheckUpdates),
+                    _ => None,
+                };
+                if let Some(command) = command {
+                    self.update_command(command);
+                }
             }
-        } else if sidebar.is_new_button(x, y, &view.atlas) {
-            self.new_session();
-        } else if let Some(i) = sidebar.row_at(x, y, self.sessions.len()) {
-            self.settings = None;
-            self.select(i);
-            self.request_redraw();
+            Some(Hit::NewSession) => self.new_session(),
+            Some(Hit::Session(i)) => {
+                self.settings = None;
+                self.select(i);
+                self.request_redraw();
+            }
+            None => {}
         }
     }
 
-    /// Shows a hand over anything a click acts on, the arrow elsewhere.
+    /// Shows a hand over anything a click acts on, and highlights what the
+    /// mouse is over in the sidebar.
     fn update_pointer(&mut self) {
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let hover = self.sidebar_hit(x, y);
+        if hover != self.hover {
+            self.hover = hover;
+            self.request_redraw();
+        }
         let Some(view) = &self.view else {
             return;
         };
-        let (x, y) = (self.cursor.x, self.cursor.y);
         let layout = self.layout(view);
         let scale = view.window.scale_factor();
         let size = view.window.inner_size();
-        let clickable = if x < f64::from(layout.sidebar) {
-            let sidebar = Sidebar::new(&view.atlas, scale);
-            sidebar.is_settings_button(x, y, size.height)
-                || (self.update_row().is_some() && sidebar.is_update_button(x, y, size.height))
-                || sidebar.is_new_button(x, y, &view.atlas)
-                || sidebar.row_at(x, y, self.sessions.len()).is_some()
-        } else {
-            self.settings.as_ref().is_some_and(|panel| {
-                let geo = settings::Geometry::new(layout.sidebar, size.width, &view.atlas, scale);
-                panel.is_clickable(x, y, &geo)
-            })
-        };
+        let clickable = hover.is_some()
+            || (x >= f64::from(layout.sidebar)
+                && self.settings.as_ref().is_some_and(|panel| {
+                    let geo = settings::Geometry::new(layout.sidebar, size.width, scale);
+                    panel.is_clickable(x, y, &geo)
+                }));
         if clickable != self.pointer {
             self.pointer = clickable;
             view.window.set_cursor(if clickable {
@@ -622,35 +714,26 @@ impl App {
             view.atlas = Atlas::new(Rc::new(font), px);
         }
         self.theme = Theme::new(&config.colors);
+        self.palette = Palette::new(&self.theme);
+        if let Some(view) = &self.view {
+            view.window.set_theme(Some(window_theme(&self.theme)));
+        }
         self.config = config;
         self.resize();
         aeon_launcher::sys::notify_settings_changed();
         Ok(())
     }
 
-    /// The sidebar's update row, when there is something to show.
-    fn update_row(&self) -> Option<UpdateRow> {
-        let [_, red, green, ..] = self.theme.ansi;
-        let muted = self.theme.ansi[8];
-        let (icon, label, color, percent) = match &self.update {
-            Status::Available(_) => ('\u{2193}', "Update available".to_owned(), green, None),
-            Status::Downloading { percent, .. } => (
-                '\u{2193}',
-                format!("Downloading {percent}%"),
-                self.theme.fg,
-                Some(*percent),
-            ),
-            Status::Ready { .. } => ('\u{25cf}', "Restart to update".to_owned(), green, None),
-            Status::Error(_) => ('!', "Update failed. Retry".to_owned(), red, None),
-            Status::Checking => ('\u{2022}', "Checking for updates".to_owned(), muted, None),
-            Status::Idle | Status::UpToDate => return None,
-        };
-        Some(UpdateRow {
-            icon,
-            label,
-            color,
-            percent,
-        })
+    /// The update notice in the sidebar's footer, when there is one.
+    fn pill(&self) -> Option<Pill> {
+        match &self.update {
+            Status::Available(_) => Some(Pill::Available),
+            Status::Downloading { percent, .. } => Some(Pill::Downloading(*percent)),
+            Status::Ready { .. } => Some(Pill::Ready),
+            Status::Error(_) => Some(Pill::Failed),
+            Status::Checking => Some(Pill::Checking),
+            Status::Idle | Status::UpToDate => None,
+        }
     }
 
     /// Asks the resident to act on updates, starting one when none runs:
@@ -784,8 +867,9 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(_) => self.resize(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                if let Some(view) = self.view.take() {
+                if let Some(mut view) = self.view.take() {
                     let px = points_to_px(self.config.font.size, scale_factor);
+                    view.ui.set_scale(scale_factor);
                     self.view = Some(View {
                         atlas: view.atlas.with_px(px),
                         ..view
@@ -801,7 +885,12 @@ impl ApplicationHandler<Event> for App {
                 self.cursor = position;
                 self.update_pointer();
             }
-            WindowEvent::CursorLeft { .. } => self.cursor = PhysicalPosition::new(-1.0, -1.0),
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = PhysicalPosition::new(-1.0, -1.0);
+                if self.hover.take().is_some() {
+                    self.request_redraw();
+                }
+            }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
                 button: MouseButton::Left,
@@ -850,6 +939,20 @@ pub(crate) fn start_dir() -> Option<PathBuf> {
         std::env::var_os("USERPROFILE").map(PathBuf::from)
     } else {
         Some(cwd)
+    }
+}
+
+/// Dark title bar for a dark theme, light for a light one.
+fn window_theme(theme: &Theme) -> winit::window::Theme {
+    let luma = |c: u32| {
+        0.299 * f64::from((c >> 16) & 0xff)
+            + 0.587 * f64::from((c >> 8) & 0xff)
+            + 0.114 * f64::from(c & 0xff)
+    };
+    if luma(theme.bg) < 128.0 {
+        winit::window::Theme::Dark
+    } else {
+        winit::window::Theme::Light
     }
 }
 

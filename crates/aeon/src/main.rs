@@ -3,11 +3,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod chrome;
 mod font;
 mod keys;
 mod launcher;
 mod render;
 mod settings;
+mod sys;
+mod ui;
 
 use winit::event_loop::EventLoop;
 
