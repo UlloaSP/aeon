@@ -202,17 +202,36 @@ impl ConPty {
         unsafe { GetProcessId(self.process.as_raw_handle_value()) }
     }
 
+    /// A second handle to the shell's process, for waiting on another
+    /// thread: the output pipe only breaks when the pseudo console closes,
+    /// so the shell's exit has to be watched on the process itself.
+    pub(crate) fn waiter(&self) -> io::Result<Waiter> {
+        Ok(Waiter(self.process.try_clone()?))
+    }
+
     pub(crate) fn wait(&self) -> io::Result<u32> {
-        let process = self.process.as_raw_handle_value();
-        // SAFETY: `process` is a live handle owned by self.
-        unsafe {
-            if WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0 {
-                return Err(io::Error::last_os_error());
-            }
-            let mut code = 0u32;
-            check(GetExitCodeProcess(process, &mut code))?;
-            Ok(code)
+        wait_for(&self.process)
+    }
+}
+
+pub(crate) struct Waiter(OwnedHandle);
+
+impl Waiter {
+    pub(crate) fn wait(self) -> io::Result<u32> {
+        wait_for(&self.0)
+    }
+}
+
+fn wait_for(process: &OwnedHandle) -> io::Result<u32> {
+    let process = process.as_raw_handle_value();
+    // SAFETY: `process` is a live process handle for the whole call.
+    unsafe {
+        if WaitForSingleObject(process, INFINITE) != WAIT_OBJECT_0 {
+            return Err(io::Error::last_os_error());
         }
+        let mut code = 0u32;
+        check(GetExitCodeProcess(process, &mut code))?;
+        Ok(code)
     }
 }
 
@@ -296,6 +315,18 @@ mod tests {
             }
         }
         (pty, out)
+    }
+
+    #[test]
+    fn a_waiter_sees_the_shell_exit_while_the_console_stays_open() {
+        let command = Command::new("cmd.exe").args(["/d", "/c", "exit 4"]);
+        let (pty, _) = spawn_until(&command, "");
+        let waiter = pty.waiter().unwrap();
+        let code = std::thread::spawn(move || waiter.wait().unwrap())
+            .join()
+            .unwrap();
+        assert_eq!(code, 4);
+        drop(pty);
     }
 
     #[test]

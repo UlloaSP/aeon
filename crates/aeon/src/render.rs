@@ -4,6 +4,7 @@
 use aeon_config::{Colors, CursorStyle};
 use aeon_term::{Cell, Color, Flags, Match, Point, Terminal};
 
+use crate::chrome::Rect;
 use crate::font::Atlas;
 
 pub struct Frame<'a> {
@@ -103,18 +104,22 @@ pub struct Overlay<'a> {
     /// Line ranges drawn on a tinted background: commands that failed.
     pub tints: &'a [(u64, u64)],
     pub tint: u32,
+    /// The keyboard is elsewhere: the cursor is drawn as an outline.
+    pub hollow_cursor: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame<'_>,
     term: &Terminal,
     atlas: &mut Atlas,
     theme: &Theme,
+    bounds: Rect,
     origin: (u32, u32),
     cursor_style: CursorStyle,
     overlay: &Overlay<'_>,
 ) {
-    frame.pixels.fill(theme.bg);
+    fill_rect(frame, bounds.x, bounds.y, bounds.w, bounds.h, theme.bg);
     let (left, top) = origin;
 
     let grid = term.grid();
@@ -140,7 +145,7 @@ pub fn draw(
                 frame,
                 left,
                 y,
-                frame.width.saturating_sub(left),
+                (bounds.x + bounds.w).saturating_sub(left),
                 ch,
                 overlay.tint,
             );
@@ -154,7 +159,7 @@ pub fn draw(
             let at_cursor =
                 show_cursor && overlay.scroll == 0 && cursor.row == row && cursor.col == col;
             // A block cursor inverts its cell; bar and underline are drawn on top.
-            let block = at_cursor && cursor_style == CursorStyle::Block;
+            let block = at_cursor && cursor_style == CursorStyle::Block && !overlay.hollow_cursor;
             let (mut fg, mut bg) = theme.cell_colors(cell, block);
             let here = Point { line: number, col };
             if let Some(i) = (from..to).find(|&i| {
@@ -197,7 +202,12 @@ pub fn draw(
             if cell.flags.contains(Flags::STRIKE) {
                 fill_rect(frame, x, y + ch / 2, cw, line, fg);
             }
-            if at_cursor {
+            if at_cursor && overlay.hollow_cursor {
+                fill_rect(frame, x, y, cw, line, theme.cursor);
+                fill_rect(frame, x, y + ch - line, cw, line, theme.cursor);
+                fill_rect(frame, x, y, line, ch, theme.cursor);
+                fill_rect(frame, x + cw - line, y, line, ch, theme.cursor);
+            } else if at_cursor {
                 let thick = (cw / 6).max(2);
                 match cursor_style {
                     CursorStyle::Block => {}

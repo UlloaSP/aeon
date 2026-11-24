@@ -755,6 +755,15 @@ fn rows(
                 },
             },
             Row {
+                title: "Restore sessions",
+                description: "Reopen the last window's sessions and panes.".into(),
+                control: Control::Toggle {
+                    on: config.window.restore,
+                    table: "window",
+                    key: "restore",
+                },
+            },
+            Row {
                 title: "Start with Windows",
                 description: "Keep the launcher ready from sign-in.".into(),
                 control: Control::Toggle {
@@ -875,6 +884,15 @@ fn rows(
                 key_row("Copy", "copy", &keys.copy),
                 key_row("Paste", "paste", &keys.paste),
                 key_row("Project panel", "project_panel", &keys.project_panel),
+                key_row("Split right", "split_right", &keys.split_right),
+                key_row("Split down", "split_down", &keys.split_down),
+                key_row("Zoom the pane", "zoom_pane", &keys.zoom_pane),
+                key_row("Rename session", "rename_session", &keys.rename_session),
+                Row {
+                    title: "Move between panes",
+                    description: "Fixed: in a split session.".into(),
+                    control: Control::Info("Alt+Arrows".to_owned()),
+                },
                 Row {
                     title: "Go to a session",
                     description: "Fixed: by its number in the sidebar.".into(),
@@ -1031,6 +1049,10 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("copy", k.copy.clone()),
         ("paste", k.paste.clone()),
         ("project_panel", k.project_panel.clone()),
+        ("split_right", k.split_right.clone()),
+        ("split_down", k.split_down.clone()),
+        ("zoom_pane", k.zoom_pane.clone()),
+        ("rename_session", k.rename_session.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
     ]
 }

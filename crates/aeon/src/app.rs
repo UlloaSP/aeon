@@ -26,12 +26,13 @@ use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 use crate::chrome::{
     self, BlockAction, BlockMark, BlockStatus, HeaderHit, Hit, Panel, PanelData, PanelHit,
-    PanelServer, Pill, Project, RowState, SessionRow, Sidebar, SidebarState, TermArea,
+    PanelServer, Pill, Project, Rect, RowState, SessionRow, Sidebar, SidebarState, TermArea,
 };
 use crate::font::{self, Atlas};
 use crate::input::{self, Button, MouseAction};
 use crate::keys::Combo;
 use crate::links::{self, Target};
+use crate::panes::{self, Direction, Split, Tree};
 use crate::render::{self, Frame, Overlay, Theme};
 use crate::settings::{self, Outcome, Settings};
 use crate::ui::{Palette, Ui};
@@ -65,9 +66,20 @@ pub struct App {
     /// Ctrl+Enter).
     run: Option<String>,
     view: Option<View>,
+    /// Every shell, in every pane of every session.
     sessions: Vec<Session>,
+    /// Sessions as the sidebar lists them, each with its panes.
+    groups: Vec<Group>,
+    /// The pane with the keyboard: an index into `sessions`.
     active: usize,
     next_id: SessionId,
+    /// The first terminal window: it restores the last sessions and saves
+    /// its own.
+    primary: bool,
+    /// The last run's sessions, until the window opens them.
+    restore: Option<(Vec<state::Group>, usize)>,
+    /// A session's name while it is being edited.
+    rename: Option<Rename>,
     sidebar_visible: bool,
     /// The settings panel, in place of the terminal while open.
     settings: Option<Settings>,
@@ -200,18 +212,35 @@ struct Session {
     muted: bool,
 }
 
+/// A session as the sidebar lists it: one shell, or several in panes.
+struct Group {
+    tree: Tree,
+    /// The pane that has the keyboard while the session is shown.
+    focus: SessionId,
+    /// Only the focused pane is shown, over the whole area.
+    zoomed: bool,
+    /// Given with F2; without one the title follows the shell.
+    name: Option<String>,
+}
+
+struct Rename {
+    group: usize,
+    text: String,
+    /// The title when editing began: committing it unchanged keeps the
+    /// title automatic.
+    original: String,
+}
+
 /// Where everything goes in a window of a given size.
 struct Layout {
     /// Width of the sidebar; 0 when it is hidden.
     sidebar: u32,
-    /// Top-left pixel of the grid.
-    origin: (u32, u32),
-    rows: usize,
-    cols: usize,
     /// Height of the session header above the terminal; 0 when it is off.
     header: u32,
     /// Width of the project panel at the right; 0 when it is closed.
     panel: u32,
+    /// What the panes share.
+    area: Rect,
 }
 
 /// The sidebar's width in logical pixels, as in T3 Code.
@@ -228,6 +257,11 @@ impl App {
         };
         let theme = Theme::new(&config.colors);
         let saved = state::load();
+        let primary = aeon_launcher::sys::single_instance(if cfg!(debug_assertions) {
+            "Local\\AeonWindowsDev"
+        } else {
+            "Local\\AeonWindows"
+        });
         // Finding VS Code means walking PATH; keep that off the UI thread.
         let editor_proxy = proxy.clone();
         let _ = std::thread::Builder::new()
@@ -246,8 +280,12 @@ impl App {
             run,
             view: None,
             sessions: Vec::new(),
+            groups: Vec::new(),
             active: 0,
             next_id: 0,
+            primary,
+            restore: Some((saved.sessions, saved.active)),
+            rename: None,
             sidebar_visible: saved.sidebar,
             pinned: saved.pinned,
             panel_visible: saved.panel,
@@ -320,19 +358,35 @@ impl App {
         })
     }
 
-    /// Starts a shell in `cwd` and makes it the active session.
+    /// Starts a shell in `cwd` as a new session and shows it.
     fn open_session(
         &mut self,
         cwd: Option<PathBuf>,
         run: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(view) = &self.view else {
-            return Err("no window".into());
-        };
-        let layout = self.layout(view);
+        let view = self.view.as_ref().ok_or("no window")?;
+        let (_, rows, cols) = self.grid_in(view, self.layout(view).area);
         let id = self.next_id;
         self.next_id += 1;
+        self.spawn_pane(id, cwd, run, (rows, cols))?;
+        self.groups.push(Group {
+            tree: Tree::Pane(id),
+            focus: id,
+            zoomed: false,
+            name: None,
+        });
+        self.focus_pane(self.sessions.len() - 1);
+        Ok(())
+    }
 
+    /// Starts a shell sized `rows` by `cols` and adds it to `sessions`.
+    fn spawn_pane(
+        &mut self,
+        id: SessionId,
+        cwd: Option<PathBuf>,
+        run: Option<String>,
+        (rows, cols): (usize, usize),
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let shell = self.shell_command(cwd, run.as_deref());
         let shell_name = std::path::Path::new(&shell.program)
             .file_stem()
@@ -340,10 +394,20 @@ impl App {
                 || "shell".to_owned(),
                 |n| n.to_string_lossy().to_lowercase(),
             );
-        let mut pty = Pty::spawn(&shell, pty_size(layout.rows, layout.cols))?;
+        let mut pty = Pty::spawn(&shell, pty_size(rows, cols))?;
         let output = pty.take_reader().ok_or("pty reader already taken")?;
         let input = pty.take_writer().ok_or("pty writer already taken")?;
         spawn_reader(id, output, self.proxy.clone());
+        // ConPTY keeps the output pipe open after the shell exits, so `exit`
+        // is noticed on the process itself.
+        let waiter = pty.exit_waiter()?;
+        let proxy = self.proxy.clone();
+        std::thread::Builder::new()
+            .name(format!("pty-exit-{id}"))
+            .spawn(move || {
+                let _ = waiter.wait();
+                let _ = proxy.send_event(Event::Exited(id));
+            })?;
 
         // The sidebar shows every session's branch, so each one is watched
         // whenever either the bar or the sidebar can show it.
@@ -356,11 +420,7 @@ impl App {
 
         self.sessions.push(Session {
             id,
-            term: Terminal::with_scrollback(
-                layout.rows,
-                layout.cols,
-                self.config.terminal.scrollback,
-            ),
+            term: Terminal::with_scrollback(rows, cols, self.config.terminal.scrollback),
             pty,
             input,
             context: Context {
@@ -378,10 +438,58 @@ impl App {
             attention: None,
             muted: false,
         });
-        self.active = self.sessions.len() - 1;
-        self.update_title();
-        self.request_redraw();
         Ok(())
+    }
+
+    /// Halves the focused pane, starting a shell in the new half where the
+    /// focused one is.
+    fn split(&mut self, split: Split) {
+        let (Some(view), Some(g)) = (self.view.as_ref(), self.active_group()) else {
+            return;
+        };
+        let id = self.next_id;
+        let mut tree = self.groups[g].tree.clone();
+        tree.split(self.groups[g].focus, id, split);
+        let (mut rects, mut dividers) = (Vec::new(), Vec::new());
+        tree.layout(
+            self.layout(view).area,
+            divider(view),
+            &mut rects,
+            &mut dividers,
+        );
+        let Some(&(_, rect)) = rects.iter().find(|(p, _)| *p == id) else {
+            return;
+        };
+        let (_, rows, cols) = self.grid_in(view, rect);
+        let (cwd, muted) = self
+            .sessions
+            .get(self.active)
+            .map_or((None, false), |s| (s.context.cwd.clone(), s.muted));
+        self.next_id += 1;
+        if let Err(e) = self.spawn_pane(id, cwd, None, (rows, cols)) {
+            eprintln!("aeon: could not split: {e}");
+            return;
+        }
+        if let Some(session) = self.sessions.last_mut() {
+            session.muted = muted;
+        }
+        let group = &mut self.groups[g];
+        group.tree = tree;
+        group.zoomed = false;
+        self.focus_pane(self.sessions.len() - 1);
+        self.resize();
+    }
+
+    /// Shows only the focused pane, or all of them again.
+    fn toggle_zoom(&mut self) {
+        let Some(g) = self.active_group() else {
+            return;
+        };
+        let group = &mut self.groups[g];
+        if matches!(group.tree, Tree::Split { .. }) || group.zoomed {
+            group.zoomed = !group.zoomed;
+            self.resize();
+        }
     }
 
     fn shell_command(&self, cwd: Option<PathBuf>, run: Option<&str>) -> aeon_pty::Command {
@@ -411,38 +519,200 @@ impl App {
         }
     }
 
-    fn close_session(&mut self, index: usize, event_loop: &ActiveEventLoop) {
-        if index >= self.sessions.len() {
+    /// Closes pane `index`. Its sibling takes its space; a session's last
+    /// pane closes the session, and the last session closes the window.
+    fn close_pane(&mut self, index: usize, event_loop: &ActiveEventLoop) {
+        let (Some(id), Some(g)) = (self.sessions.get(index).map(|s| s.id), self.group_of(index))
+        else {
             return;
+        };
+        let active = self.sessions.get(self.active).map(|s| s.id);
+        let group = &mut self.groups[g];
+        let kept = group.tree.remove(id);
+        if kept {
+            if group.focus == id {
+                group.focus = group.tree.panes()[0];
+            }
+            group.zoomed = false;
+        } else {
+            self.groups.remove(g);
+            self.rename = None;
         }
         // Dropping the session closes its pseudo console, which ends the shell.
         self.sessions.remove(index);
-        if self.sessions.is_empty() {
-            event_loop.exit();
+        if self.groups.is_empty() {
+            self.quit(event_loop);
             return;
         }
-        if self.active > index || self.active >= self.sessions.len() {
-            self.active = self.active.saturating_sub(1);
+        let next = match active {
+            Some(a) if a != id => a,
+            _ => self.groups[g.min(self.groups.len() - 1)].focus,
+        };
+        self.active = self.session_index(next).unwrap_or(0);
+        self.update_title();
+        self.resize();
+        self.mark_seen();
+    }
+
+    /// Closes the focused pane, asking first if a command is running in it.
+    fn close_focused(&mut self, event_loop: &ActiveEventLoop) {
+        if self.confirm_close(&[self.active]) {
+            self.close_pane(self.active, event_loop);
+        }
+    }
+
+    /// What pane `index` is running, when a command is under way.
+    fn running_command(&self, index: usize) -> Option<String> {
+        let session = self.sessions.get(index)?;
+        let (_, prompt) = session.running?;
+        Some(
+            session
+                .term
+                .blocks()
+                .find(|b| b.prompt == prompt)
+                .map(|b| b.command.clone())
+                .unwrap_or_default(),
+        )
+    }
+
+    /// Asks before closing panes with a command under way. Shells that
+    /// report no commands (integration off) never ask.
+    fn confirm_close(&self, panes: &[usize]) -> bool {
+        let running: Vec<String> = panes
+            .iter()
+            .filter_map(|&i| self.running_command(i))
+            .collect();
+        let text = match running.as_slice() {
+            [] => return true,
+            [one] if !one.is_empty() => {
+                format!("\u{201c}{one}\u{201d} is still running. Close it anyway?")
+            }
+            [_] => "A command is still running. Close it anyway?".to_owned(),
+            many => format!(
+                "{} commands are still running. Close them anyway?",
+                many.len()
+            ),
+        };
+        let owner = self.view.as_ref().map_or(0, |v| hwnd(&v.window));
+        crate::sys::confirm(owner, "Aeon", &text)
+    }
+
+    /// Saves what the next start restores, then closes the window.
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        self.save_state();
+        event_loop.exit();
+    }
+
+    /// Gives pane `index` the keyboard, showing its session.
+    fn focus_pane(&mut self, index: usize) {
+        let Some(id) = self.sessions.get(index).map(|s| s.id) else {
+            return;
+        };
+        if let Some(g) = self.group_of(index) {
+            self.groups[g].focus = id;
+        }
+        if index != self.active {
+            self.active = index;
+            self.drag = Drag::None;
+            self.link = None;
+            self.hover_block = None;
+            // Matches belong to the pane they were found in.
+            self.find = None;
         }
         self.update_title();
         self.request_redraw();
+        self.mark_seen();
     }
 
-    fn select(&mut self, index: usize) {
-        if index < self.sessions.len() && index != self.active {
-            self.active = index;
-            self.update_title();
-            self.request_redraw();
+    /// Shows session `g`, as the sidebar numbers them, at the pane it last
+    /// had focused.
+    fn select(&mut self, g: usize) {
+        if let Some(index) = self
+            .groups
+            .get(g)
+            .and_then(|group| self.session_index(group.focus))
+        {
+            self.focus_pane(index);
         }
-        self.mark_seen();
+    }
+
+    /// The session pane `index` belongs to.
+    fn group_of(&self, index: usize) -> Option<usize> {
+        let id = self.sessions.get(index)?.id;
+        self.groups.iter().position(|g| g.tree.contains(id))
+    }
+
+    fn active_group(&self) -> Option<usize> {
+        self.group_of(self.active)
+    }
+
+    /// The pane a session shows in the sidebar and header: its focused one.
+    fn lead(&self, group: &Group) -> Option<&Session> {
+        self.session_index(group.focus).map(|i| &self.sessions[i])
+    }
+
+    /// Whether pane `index` is on screen.
+    fn is_shown(&self, index: usize) -> bool {
+        let (Some(session), Some(g)) = (self.sessions.get(index), self.active_group()) else {
+            return false;
+        };
+        let group = &self.groups[g];
+        group.tree.contains(session.id) && (!group.zoomed || group.focus == session.id)
+    }
+
+    /// The panes of session `g` on screen and their rectangles, with the
+    /// dividers between them.
+    fn pane_rects(&self, view: &View, g: usize) -> (Vec<(SessionId, Rect)>, Vec<Rect>) {
+        let area = self.layout(view).area;
+        let group = &self.groups[g];
+        if group.zoomed {
+            return (vec![(group.focus, area)], Vec::new());
+        }
+        let (mut rects, mut dividers) = (Vec::new(), Vec::new());
+        group
+            .tree
+            .layout(area, divider(view), &mut rects, &mut dividers);
+        (rects, dividers)
+    }
+
+    /// The active session's panes on screen, by index into `sessions`.
+    fn shown_panes(&self) -> Vec<(usize, Rect)> {
+        let (Some(view), Some(g)) = (self.view.as_ref(), self.active_group()) else {
+            return Vec::new();
+        };
+        self.pane_rects(view, g)
+            .0
+            .into_iter()
+            .filter_map(|(id, rect)| Some((self.session_index(id)?, rect)))
+            .collect()
+    }
+
+    /// Where a pane's cells start in `rect`, and how many rows and columns
+    /// fit.
+    fn grid_in(&self, view: &View, rect: Rect) -> ((u32, u32), usize, usize) {
+        let scale = view.window.scale_factor();
+        let pad = (f64::from(self.config.window.padding) * scale).round() as u32;
+        let w = rect.w.saturating_sub(2 * pad);
+        let h = rect.h.saturating_sub(2 * pad);
+        (
+            (rect.x + pad, rect.y + pad),
+            (h / view.atlas.cell_height).max(1) as usize,
+            (w / view.atlas.cell_width).max(1) as usize,
+        )
     }
 
     /// The active session has been looked at: its marks clear.
     fn mark_seen(&mut self) {
-        if self.focused
-            && let Some(session) = self.sessions.get_mut(self.active)
-            && session.attention.take().is_some()
-        {
+        let Some(g) = self.active_group().filter(|_| self.focused) else {
+            return;
+        };
+        let mut cleared = false;
+        for id in self.groups[g].tree.panes() {
+            if let Some(i) = self.session_index(id) {
+                cleared |= self.sessions[i].attention.take().is_some();
+            }
+        }
+        if cleared {
             self.request_redraw();
         }
     }
@@ -450,12 +720,13 @@ impl App {
     /// Reacts to what happened in session `index`: timing, status, and a
     /// notification when a long command ends out of sight.
     fn shell_events(&mut self, index: usize) {
-        let visible = index == self.active && self.focused && self.settings.is_none();
+        let visible = self.is_shown(index) && self.focused && self.settings.is_none();
         let project = {
+            let group = self.group_of(index);
             let projects = self.projects();
             projects
                 .iter()
-                .find(|p| p.sessions.contains(&index))
+                .find(|p| group.is_some_and(|g| p.sessions.contains(&g)))
                 .map(|p| p.name.clone())
                 .unwrap_or_default()
         };
@@ -524,9 +795,16 @@ impl App {
         }
     }
 
-    /// What the sidebar shows for a session.
-    fn row_state(session: &Session) -> (RowState, bool) {
-        if let Some(attention) = session.attention {
+    /// What the sidebar shows for a session: the first of its panes that
+    /// needs a look, else what its panes are doing.
+    fn group_state(&self, group: &Group) -> (RowState, bool) {
+        let panes: Vec<&Session> = group
+            .tree
+            .panes()
+            .into_iter()
+            .filter_map(|id| self.session_index(id).map(|i| &self.sessions[i]))
+            .collect();
+        if let Some(attention) = panes.iter().find_map(|s| s.attention) {
             let state = match attention {
                 Attention::Failed(code) => RowState::Failed(code),
                 Attention::Done => RowState::Done,
@@ -534,11 +812,14 @@ impl App {
             };
             return (state, true);
         }
-        let state = if let Some(p) = session.progress {
+        let state = if let Some(p) = panes.iter().find_map(|s| s.progress) {
             RowState::Progress(p)
-        } else if let Some(server) = session.context.servers.first() {
-            RowState::Server(server.port)
-        } else if session.running.is_some() {
+        } else if let Some(port) = panes
+            .iter()
+            .find_map(|s| s.context.servers.first().map(|server| server.port))
+        {
+            RowState::Server(port)
+        } else if panes.iter().any(|s| s.running.is_some()) {
             RowState::Running
         } else {
             RowState::Idle
@@ -546,9 +827,9 @@ impl App {
         (state, false)
     }
 
-    /// Command blocks with their prompt on screen, for the active session.
-    fn visible_blocks(&self) -> (Vec<BlockMark>, Vec<(u64, u64)>) {
-        let Some(session) = self.sessions.get(self.active) else {
+    /// Command blocks with their prompt on screen, for pane `index`.
+    fn visible_blocks(&self, index: usize) -> (Vec<BlockMark>, Vec<(u64, u64)>) {
+        let Some(session) = self.sessions.get(index) else {
             return (Vec::new(), Vec::new());
         };
         let term = &session.term;
@@ -583,27 +864,33 @@ impl App {
                     row: (block.prompt - first) as u32,
                     prompt: block.prompt,
                     status,
-                    hovered: self.hover_block == Some(block.prompt),
+                    hovered: index == self.active && self.hover_block == Some(block.prompt),
                 });
             }
         }
         (marks, tints)
     }
 
-    fn term_area(&self) -> Option<TermArea> {
+    fn term_area(&self, index: usize, rect: Rect) -> Option<TermArea> {
         let view = self.view.as_ref()?;
-        let layout = self.layout(view);
+        let ((left, top), _, _) = self.grid_in(view, rect);
         // The chip covers the last columns exactly, so no glyph peeks out.
-        let cols = self
-            .sessions
-            .get(self.active)
-            .map_or(layout.cols, |s| s.term.grid().cols());
+        let cols = self.sessions.get(index)?.term.grid().cols();
         Some(TermArea {
-            left: layout.sidebar,
-            right: layout.origin.0 + cols as u32 * view.atlas.cell_width,
-            top: layout.origin.1,
+            left: rect.x,
+            right: left + cols as u32 * view.atlas.cell_width,
+            top,
             cell_height: view.atlas.cell_height,
         })
+    }
+
+    /// The focused pane's terminal area, for its block buttons.
+    fn active_term_area(&self) -> Option<TermArea> {
+        let (_, rect) = self
+            .shown_panes()
+            .into_iter()
+            .find(|(i, _)| *i == self.active)?;
+        self.term_area(self.active, rect)
     }
 
     /// Runs a block button: copy what the command printed, or run it again.
@@ -682,11 +969,21 @@ impl App {
     }
 
     fn save_state(&self) {
-        state::save(&state::Saved {
-            sidebar: self.sidebar_visible,
-            panel: self.panel_visible,
-            pinned: self.pinned.clone(),
-        });
+        // Only the first window's sessions are restored; another window
+        // keeps the ones already saved.
+        let sessions = self
+            .primary
+            .then(|| (self.saved_groups(), self.active_group().unwrap_or(0)));
+        state::save(
+            state::Saved {
+                sidebar: self.sidebar_visible,
+                panel: self.panel_visible,
+                pinned: self.pinned.clone(),
+                sessions: Vec::new(),
+                active: 0,
+            },
+            sessions,
+        );
     }
 
     fn toggle_panel(&mut self) {
@@ -697,9 +994,20 @@ impl App {
 
     /// The project the active session belongs to.
     fn active_project(&self) -> Option<Project> {
+        let g = self.active_group()?;
         self.projects()
             .into_iter()
-            .find(|p| p.sessions.contains(&self.active))
+            .find(|p| p.sessions.contains(&g))
+    }
+
+    /// Every pane of a project's sessions.
+    fn project_panes(&self, project: &Project) -> Vec<usize> {
+        project
+            .sessions
+            .iter()
+            .flat_map(|&g| self.groups[g].tree.panes())
+            .filter_map(|id| self.session_index(id))
+            .collect()
     }
 
     /// What the project panel shows for the active session's project.
@@ -718,18 +1026,18 @@ impl App {
             return Default::default();
         };
         let tasks = session.context.tasks.clone();
+        let panes = self.project_panes(&project);
         let running = tasks
             .iter()
             .map(|t| {
-                project.sessions.iter().any(|&i| {
+                panes.iter().any(|&i| {
                     self.sessions[i].task.as_deref() == Some(t.name.as_str())
                         && self.sessions[i].running.is_some()
                 })
             })
             .collect();
         let home = self.home.as_deref();
-        let servers = project
-            .sessions
+        let servers = panes
             .iter()
             .flat_map(|&i| {
                 let s = &self.sessions[i];
@@ -785,7 +1093,7 @@ impl App {
                     .and_then(|s| s.context.tasks.get(i))
                     .map(|t| t.name.clone());
                 if let (Some(name), Some(project)) = (name, self.active_project()) {
-                    let target = project.sessions.iter().copied().find(|&s| {
+                    let target = self.project_panes(&project).into_iter().find(|&s| {
                         self.sessions[s].task.as_deref() == Some(name.as_str())
                             && self.sessions[s].running.is_some()
                     });
@@ -798,10 +1106,10 @@ impl App {
                 let Some(project) = self.active_project() else {
                     return;
                 };
-                let owners: Vec<(usize, u16)> = project
-                    .sessions
-                    .iter()
-                    .flat_map(|&s| {
+                let owners: Vec<(usize, u16)> = self
+                    .project_panes(&project)
+                    .into_iter()
+                    .flat_map(|s| {
                         self.sessions[s]
                             .context
                             .servers
@@ -920,9 +1228,6 @@ impl App {
 
     fn layout(&self, view: &View) -> Layout {
         let size = view.window.inner_size();
-        let scale = view.window.scale_factor();
-        let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
-        let atlas = &view.atlas;
         let sidebar = if self.sidebar_visible {
             view.ui.px(SIDEBAR_WIDTH).min(size.width / 2)
         } else {
@@ -943,28 +1248,42 @@ impl App {
         } else {
             0
         };
-        let w = size.width.saturating_sub(sidebar + panel + 2 * padding);
-        let h = size.height.saturating_sub(header + 2 * padding);
         Layout {
             sidebar,
-            origin: (sidebar + padding, header + padding),
-            rows: (h / atlas.cell_height).max(1) as usize,
-            cols: (w / atlas.cell_width).max(1) as usize,
             header,
             panel,
+            area: Rect {
+                x: sidebar,
+                y: header,
+                w: size.width.saturating_sub(sidebar + panel),
+                h: size.height.saturating_sub(header),
+            },
         }
     }
 
-    /// Sessions grouped into projects, as the sidebar shows them.
+    /// Sessions grouped into projects, as the sidebar shows them. A
+    /// session belongs where its focused pane is.
     fn projects(&self) -> Vec<Project> {
-        let contexts: Vec<&Context> = self.sessions.iter().map(|s| &s.context).collect();
+        let contexts: Vec<&Context> = self
+            .groups
+            .iter()
+            .map(|g| {
+                &self
+                    .lead(g)
+                    .expect("a session's focus is one of its panes")
+                    .context
+            })
+            .collect();
         chrome::projects(&contexts, self.home.as_deref(), &self.pinned)
     }
 
     /// Moves `step` sessions along the sidebar's order, wrapping around.
     fn step(&mut self, step: isize) {
         let order = chrome::display_order(&self.projects());
-        let Some(at) = order.iter().position(|&i| i == self.active) else {
+        let Some(g) = self.active_group() else {
+            return;
+        };
+        let Some(at) = order.iter().position(|&i| i == g) else {
             return;
         };
         let n = order.len() as isize;
@@ -991,20 +1310,49 @@ impl App {
         .hit(x, y)
     }
 
-    /// Fits every session's grid and PTY to the window.
+    /// Fits every pane's grid and PTY to its place in the window.
     fn resize(&mut self) {
         let Some(view) = &self.view else {
             return;
         };
-        let layout = self.layout(view);
-        let (rows, cols) = (layout.rows, layout.cols);
-        for session in &mut self.sessions {
+        let mut sizes = Vec::new();
+        for g in 0..self.groups.len() {
+            for (id, rect) in self.pane_rects(view, g).0 {
+                let (_, rows, cols) = self.grid_in(view, rect);
+                sizes.push((id, rows, cols));
+            }
+        }
+        for (id, rows, cols) in sizes {
+            let Some(session) = self.session_index(id).map(|i| &mut self.sessions[i]) else {
+                continue;
+            };
             if (rows, cols) != (session.term.grid().rows(), session.term.grid().cols()) {
                 session.term.resize(rows, cols);
                 let _ = session.pty.resize(pty_size(rows, cols));
             }
         }
         self.request_redraw();
+    }
+
+    /// Session `g`'s title: its name, its task, or where its focused pane is.
+    fn group_title(&self, g: usize, projects: &[Project]) -> String {
+        let group = &self.groups[g];
+        if let Some(name) = &group.name {
+            return name.clone();
+        }
+        let Some(s) = self.lead(group) else {
+            return String::new();
+        };
+        if let Some(task) = &s.task {
+            return task.clone();
+        }
+        projects
+            .iter()
+            .find(|p| p.sessions.contains(&g))
+            .map_or_else(
+                || s.shell.clone(),
+                |p| chrome::session_title(&s.context, &s.shell, p, self.home.as_deref()),
+            )
     }
 
     fn redraw(&mut self) {
@@ -1015,8 +1363,19 @@ impl App {
         let scale = view.window.scale_factor();
         let projects = self.projects();
         let pill = self.pill();
-        let (marks, tints) = self.visible_blocks();
-        let area = self.term_area();
+        let active_group = self.active_group();
+        let dividers = active_group.map_or_else(Vec::new, |g| self.pane_rects(view, g).1);
+        // Everything each pane on screen needs, worked out before the
+        // window is borrowed for drawing.
+        let panes: Vec<_> = self
+            .shown_panes()
+            .into_iter()
+            .map(|(i, rect)| {
+                let (marks, tints) = self.visible_blocks(i);
+                let (origin, _, _) = self.grid_in(view, rect);
+                (i, rect, origin, marks, tints, self.term_area(i, rect))
+            })
+            .collect();
         let (tasks, running, servers, git) = self.panel_data();
         let panel_data = PanelData {
             tasks: &tasks,
@@ -1026,6 +1385,28 @@ impl App {
         };
         let panel = self.panel_layout(&panel_data);
         let editor = self.editor.is_some();
+        let header_title = active_group.map(|g| self.group_title(g, &projects));
+        let rows: Vec<SessionRow> = if layout.sidebar > 0 {
+            self.groups
+                .iter()
+                .enumerate()
+                .map(|(g, group)| {
+                    let (state, unseen) = self.group_state(group);
+                    let editing = self.rename.as_ref().filter(|r| r.group == g);
+                    SessionRow {
+                        title: editing
+                            .map_or_else(|| self.group_title(g, &projects), |r| r.text.clone()),
+                        state,
+                        unseen,
+                        muted: self.lead(group).is_some_and(|s| s.muted),
+                        panes: group.tree.panes().len(),
+                        editing: editing.is_some(),
+                    }
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -1047,44 +1428,70 @@ impl App {
         let Some(session) = self.sessions.get(self.active) else {
             return;
         };
-        let home = self.home.as_deref();
-        let title = |i: usize, s: &Session| {
-            if let Some(task) = &s.task {
-                return task.clone();
-            }
-            projects
-                .iter()
-                .find(|p| p.sessions.contains(&i))
-                .map_or_else(
-                    || s.shell.clone(),
-                    |p| chrome::session_title(&s.context, &s.shell, p, home),
-                )
-        };
         if let Some(panel) = &self.settings {
             frame.pixels.fill(self.palette.canvas);
             let geo = settings::Geometry::new(layout.sidebar, frame.width, scale);
             panel.draw(&mut frame, &mut view.ui, &self.palette, &geo);
         } else {
-            let overlay = Overlay {
-                scroll: session.scroll,
-                selection: session.selection.and_then(|s| s.ordered()),
-                matches: self.find.as_ref().map_or(&[], |f| &f.matches[..]),
-                current: self.find.as_ref().and_then(|f| f.current),
-                link: self.link.as_ref().map(|(line, a, b, _)| (*line, *a, *b)),
-                tints: &tints,
-                tint: render::blend(self.theme.bg, self.theme.ansi[1], 22),
-            };
-            render::draw(
-                &mut frame,
-                &session.term,
-                &mut view.atlas,
-                &self.theme,
-                layout.origin,
-                self.config.cursor.style,
-                &overlay,
-            );
+            let tint = render::blend(self.theme.bg, self.theme.ansi[1], 22);
+            for (i, rect, origin, marks, tints, area) in &panes {
+                let pane = &self.sessions[*i];
+                let overlay = if *i == self.active {
+                    Overlay {
+                        scroll: pane.scroll,
+                        selection: pane.selection.and_then(|s| s.ordered()),
+                        matches: self.find.as_ref().map_or(&[], |f| &f.matches[..]),
+                        current: self.find.as_ref().and_then(|f| f.current),
+                        link: self.link.as_ref().map(|(line, a, b, _)| (*line, *a, *b)),
+                        tints,
+                        tint,
+                        hollow_cursor: !self.focused,
+                    }
+                } else {
+                    Overlay {
+                        scroll: pane.scroll,
+                        selection: pane.selection.and_then(|s| s.ordered()),
+                        tints,
+                        tint,
+                        hollow_cursor: true,
+                        ..Overlay::default()
+                    }
+                };
+                render::draw(
+                    &mut frame,
+                    &pane.term,
+                    &mut view.atlas,
+                    &self.theme,
+                    *rect,
+                    *origin,
+                    self.config.cursor.style,
+                    &overlay,
+                );
+                if let Some(area) = area {
+                    chrome::draw_blocks(&mut frame, &mut view.ui, &self.palette, area, marks);
+                }
+            }
+            for d in &dividers {
+                render::fill_rect(&mut frame, d.x, d.y, d.w, d.h, self.palette.border);
+            }
+            // With more than one pane, a line over the focused one says
+            // where typing goes.
+            if panes.len() > 1
+                && let Some((_, rect, ..)) = panes.iter().find(|(i, ..)| *i == self.active)
+            {
+                let thick = view.ui.px(2.0).max(1);
+                render::fill_rect(
+                    &mut frame,
+                    rect.x,
+                    rect.y,
+                    rect.w,
+                    thick,
+                    self.palette.accent,
+                );
+            }
             if layout.header > 0
-                && let Some(project) = projects.iter().find(|p| p.sessions.contains(&self.active))
+                && let (Some(g), Some(title)) = (active_group, &header_title)
+                && let Some(project) = projects.iter().find(|p| p.sessions.contains(&g))
             {
                 let buttons = chrome::header_buttons(&mut view.ui, frame.width, editor);
                 chrome::draw_header(
@@ -1093,25 +1500,22 @@ impl App {
                     &self.palette,
                     layout.sidebar,
                     project,
-                    &title(self.active, session),
+                    title,
                     &session.context,
                     &buttons,
                     self.header_hover,
                     layout.panel > 0,
                 );
-                if let Some(panel) = &panel {
-                    chrome::draw_panel(
-                        &mut frame,
-                        &mut view.ui,
-                        &self.palette,
-                        panel,
-                        &panel_data,
-                        self.panel_hover,
-                    );
-                }
             }
-            if let Some(area) = &area {
-                chrome::draw_blocks(&mut frame, &mut view.ui, &self.palette, area, &marks);
+            if let Some(panel) = &panel {
+                chrome::draw_panel(
+                    &mut frame,
+                    &mut view.ui,
+                    &self.palette,
+                    panel,
+                    &panel_data,
+                    self.panel_hover,
+                );
             }
             if let Some(find) = &self.find {
                 let count = match (find.current, find.matches.len()) {
@@ -1131,20 +1535,6 @@ impl App {
             }
         }
         if layout.sidebar > 0 {
-            let rows: Vec<SessionRow> = self
-                .sessions
-                .iter()
-                .enumerate()
-                .map(|(i, s)| {
-                    let (state, unseen) = Self::row_state(s);
-                    SessionRow {
-                        title: title(i, s),
-                        state,
-                        unseen,
-                        muted: s.muted,
-                    }
-                })
-                .collect();
             let sidebar = Sidebar::new(
                 &mut view.ui,
                 layout.sidebar,
@@ -1160,7 +1550,7 @@ impl App {
                 &SidebarState {
                     projects: &projects,
                     sessions: &rows,
-                    active: self.active,
+                    active: active_group.unwrap_or(0),
                     settings_open: self.settings.is_some(),
                     hover: self.hover,
                     pill: pill.as_ref(),
@@ -1186,6 +1576,10 @@ impl App {
             Copy,
             Paste,
             Panel,
+            SplitRight,
+            SplitDown,
+            Zoom,
+            Rename,
         }
         let (key, mods) = (&event.logical_key, self.modifiers);
         let keys = &self.config.keys;
@@ -1200,13 +1594,17 @@ impl App {
             (&keys.copy, Action::Copy),
             (&keys.paste, Action::Paste),
             (&keys.project_panel, Action::Panel),
+            (&keys.split_right, Action::SplitRight),
+            (&keys.split_down, Action::SplitDown),
+            (&keys.zoom_pane, Action::Zoom),
+            (&keys.rename_session, Action::Rename),
         ]
         .into_iter()
         .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
         .map(|(_, action)| action);
         match action {
             Some(Action::New) => self.new_session(),
-            Some(Action::Close) => self.close_session(self.active, event_loop),
+            Some(Action::Close) => self.close_focused(event_loop),
             Some(Action::Next) => self.step(1),
             Some(Action::Previous) => self.step(-1),
             Some(Action::Sidebar) => self.toggle_sidebar(),
@@ -1217,6 +1615,10 @@ impl App {
             }
             Some(Action::Paste) => self.paste(),
             Some(Action::Panel) => self.toggle_panel(),
+            Some(Action::SplitRight) => self.split(Split::Right),
+            Some(Action::SplitDown) => self.split(Split::Down),
+            Some(Action::Zoom) => self.toggle_zoom(),
+            Some(Action::Rename) => self.start_rename(),
             None => {
                 if let Some(handled) = self.builtin_key(key, mods) {
                     return handled;
@@ -1241,6 +1643,10 @@ impl App {
 
     fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        if self.rename.is_some() {
+            self.rename_key(event);
             return;
         }
         // While a shortcut is being recorded, every key belongs to the recorder.
@@ -1279,6 +1685,64 @@ impl App {
         self.request_redraw();
     }
 
+    /// Edits the active session's name in the sidebar.
+    fn start_rename(&mut self) {
+        let Some(g) = self.active_group() else {
+            return;
+        };
+        if !self.sidebar_visible {
+            self.toggle_sidebar();
+        }
+        let title = self.group_title(g, &self.projects());
+        self.rename = Some(Rename {
+            group: g,
+            text: title.clone(),
+            original: title,
+        });
+        self.request_redraw();
+    }
+
+    /// Enter keeps the name, Escape drops it; an empty name goes back to
+    /// the automatic title.
+    fn rename_key(&mut self, event: &KeyEvent) {
+        let Some(rename) = &mut self.rename else {
+            return;
+        };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.rename = None,
+            Key::Named(NamedKey::Enter) => self.commit_rename(),
+            Key::Named(NamedKey::Backspace) => {
+                rename.text.pop();
+            }
+            _ if self.modifiers.control_key() || self.modifiers.alt_key() => return,
+            _ => {
+                let Some(text) = event
+                    .text
+                    .as_ref()
+                    .filter(|t| !t.chars().any(char::is_control))
+                else {
+                    return;
+                };
+                rename.text.push_str(text);
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(rename) = self.rename.take() else {
+            return;
+        };
+        let name = rename.text.trim();
+        if let Some(group) = self.groups.get_mut(rename.group)
+            && name != rename.original
+        {
+            group.name = (!name.is_empty()).then(|| name.to_owned());
+            self.save_state();
+        }
+        self.request_redraw();
+    }
+
     /// Fixed keys: Ctrl+C copies a selection (and is ^C without one), Ctrl+V
     /// pastes, Ctrl+= Ctrl+- Ctrl+0 zoom, Shift+PageUp and Shift+PageDown
     /// scroll. `None` when the key is none of them.
@@ -1303,6 +1767,35 @@ impl App {
             }
             Key::Character(c) if ctrl && c == "0" => {
                 self.set_zoom(0.0);
+                Some(true)
+            }
+            Key::Named(
+                named @ (NamedKey::ArrowLeft
+                | NamedKey::ArrowRight
+                | NamedKey::ArrowUp
+                | NamedKey::ArrowDown),
+            ) if mods == ModifiersState::ALT => {
+                let direction = match named {
+                    NamedKey::ArrowLeft => Direction::Left,
+                    NamedKey::ArrowRight => Direction::Right,
+                    NamedKey::ArrowUp => Direction::Up,
+                    _ => Direction::Down,
+                };
+                // With one pane the shell keeps Alt+Arrows.
+                let shown: Vec<(SessionId, Rect)> = self
+                    .shown_panes()
+                    .into_iter()
+                    .map(|(i, rect)| (self.sessions[i].id, rect))
+                    .collect();
+                if shown.len() < 2 {
+                    return None;
+                }
+                let from = self.sessions.get(self.active)?.id;
+                if let Some(index) =
+                    panes::neighbor(&shown, from, direction).and_then(|id| self.session_index(id))
+                {
+                    self.focus_pane(index);
+                }
                 Some(true)
             }
             Key::Named(NamedKey::ArrowUp) if ctrl => {
@@ -1494,27 +1987,33 @@ impl App {
         self.request_redraw();
     }
 
-    /// The terminal cell under (`x`, `y`): column and screen row, clamped to
-    /// the grid. `None` outside the terminal.
+    /// The focused pane's cell under (`x`, `y`): column and screen row,
+    /// clamped to the grid. `None` outside that pane.
     fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
-        let view = self.view.as_ref()?;
         if self.settings.is_some() {
             return None;
         }
-        let layout = self.layout(view);
-        let (left, top) = layout.origin;
-        let width = f64::from(view.window.inner_size().width);
-        if x < f64::from(layout.sidebar)
-            || y < f64::from(layout.header)
-            || x >= width - f64::from(layout.panel)
-        {
-            return None;
-        }
-        let session = self.sessions.get(self.active)?;
-        let grid = session.term.grid();
+        let view = self.view.as_ref()?;
+        let (_, rect) = self
+            .shown_panes()
+            .into_iter()
+            .find(|(i, rect)| *i == self.active && rect.contains(x, y))?;
+        let ((left, top), _, _) = self.grid_in(view, rect);
+        let grid = self.sessions.get(self.active)?.term.grid();
         let col = ((x - f64::from(left)).max(0.0) / f64::from(view.atlas.cell_width)) as usize;
         let row = ((y - f64::from(top)).max(0.0) / f64::from(view.atlas.cell_height)) as usize;
         Some((col.min(grid.cols() - 1), row.min(grid.rows() - 1)))
+    }
+
+    /// The pane on screen under (`x`, `y`).
+    fn pane_at(&self, x: f64, y: f64) -> Option<usize> {
+        if self.settings.is_some() {
+            return None;
+        }
+        self.shown_panes()
+            .into_iter()
+            .find(|(_, rect)| rect.contains(x, y))
+            .map(|(i, _)| i)
     }
 
     /// The history position of a screen cell, given the scroll.
@@ -1561,6 +2060,14 @@ impl App {
     fn mouse(&mut self, state: ElementState, button: MouseButton) {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let pressed = state == ElementState::Pressed;
+        if pressed {
+            self.commit_rename();
+            // A click in another pane only moves the keyboard there.
+            if let Some(index) = self.pane_at(x, y).filter(|&i| i != self.active) {
+                self.focus_pane(index);
+                return;
+            }
+        }
         let Some(cell) = self.cell_at(x, y) else {
             if pressed && button == MouseButton::Left {
                 self.click();
@@ -1595,9 +2102,9 @@ impl App {
 
     fn press_left(&mut self, cell: (usize, usize)) {
         if let Some(prompt) = self.hover_block
-            && let Some(area) = self.term_area()
+            && let Some(area) = self.active_term_area()
         {
-            let (marks, _) = self.visible_blocks();
+            let (marks, _) = self.visible_blocks(self.active);
             let (x, y) = (self.cursor.x, self.cursor.y);
             if let Some(mark) = marks.iter().find(|m| m.prompt == prompt)
                 && let Some(view) = self.view.as_mut()
@@ -1884,9 +2391,14 @@ impl App {
                     self.request_redraw();
                 }
             }
-            Some(Hit::Mute(i)) => {
-                if let Some(session) = self.sessions.get_mut(i) {
-                    session.muted = !session.muted;
+            Some(Hit::Mute(g)) => {
+                if let Some(group) = self.groups.get(g) {
+                    let muted = !self.lead(group).is_some_and(|s| s.muted);
+                    for id in group.tree.panes() {
+                        if let Some(i) = self.session_index(id) {
+                            self.sessions[i].muted = muted;
+                        }
+                    }
                 }
                 self.request_redraw();
             }
@@ -1933,7 +2445,7 @@ impl App {
             .cell_at(x, y)
             .and_then(|cell| self.point(cell))
             .and_then(|point| {
-                let (marks, _) = self.visible_blocks();
+                let (marks, _) = self.visible_blocks(self.active);
                 marks
                     .iter()
                     .find(|m| m.prompt == point.line)
@@ -2049,6 +2561,104 @@ impl App {
         self.request_redraw();
     }
 
+    /// Opens the first sessions: the last run's when this is the only
+    /// window and nothing was asked to run, plus one where Aeon was started
+    /// from if none of them is there.
+    fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let run = self.run.take();
+        let (saved, active) = self.restore.take().unwrap_or_default();
+        if run.is_none() && self.primary && self.config.window.restore {
+            for group in &saved {
+                self.restore_group(group);
+            }
+        }
+        if self.groups.is_empty() {
+            return self.open_session(None, run);
+        }
+        let here = start_dir().filter(|dir| Some(dir) != self.home.as_ref());
+        let found = here.as_ref().and_then(|dir| {
+            self.groups.iter().position(|g| {
+                g.tree.panes().into_iter().any(|id| {
+                    self.session_index(id)
+                        .is_some_and(|i| self.sessions[i].context.cwd.as_ref() == Some(dir))
+                })
+            })
+        });
+        match (here, found) {
+            (_, Some(g)) => self.select(g),
+            (Some(dir), None) => self.open_session(Some(dir), None)?,
+            (None, None) => self.select(active.min(self.groups.len() - 1)),
+        }
+        self.resize();
+        Ok(())
+    }
+
+    /// Opens a saved session's panes, each in the folder it was in.
+    fn restore_group(&mut self, saved: &state::Group) {
+        let Some(view) = self.view.as_ref() else {
+            return;
+        };
+        let Some(mut tree) = Tree::from_shape(&saved.shape, &mut (self.next_id..)) else {
+            return;
+        };
+        let ids = tree.panes();
+        if ids.len() != saved.panes.len() {
+            return;
+        }
+        let (mut rects, mut dividers) = (Vec::new(), Vec::new());
+        tree.layout(
+            self.layout(view).area,
+            divider(view),
+            &mut rects,
+            &mut dividers,
+        );
+        let sizes: Vec<(usize, usize)> = rects
+            .iter()
+            .map(|(_, rect)| {
+                let (_, rows, cols) = self.grid_in(view, *rect);
+                (rows, cols)
+            })
+            .collect();
+        self.next_id += ids.len() as u64;
+        for ((&id, cwd), size) in ids.iter().zip(&saved.panes).zip(sizes) {
+            let cwd = cwd.is_dir().then(|| cwd.clone());
+            if let Err(e) = self.spawn_pane(id, cwd, None, size) {
+                eprintln!("aeon: could not restore a session: {e}");
+                if !tree.remove(id) {
+                    return;
+                }
+            }
+        }
+        let focus = tree.panes()[0];
+        self.groups.push(Group {
+            tree,
+            focus,
+            zoomed: false,
+            name: saved.name.clone(),
+        });
+    }
+
+    /// The sessions as the state file keeps them.
+    fn saved_groups(&self) -> Vec<state::Group> {
+        self.groups
+            .iter()
+            .map(|g| state::Group {
+                name: g.name.clone(),
+                shape: g.tree.shape(),
+                panes: g
+                    .tree
+                    .panes()
+                    .into_iter()
+                    .map(|id| {
+                        self.session_index(id)
+                            .and_then(|i| self.sessions[i].context.cwd.clone())
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
     fn session_index(&self, id: SessionId) -> Option<usize> {
         self.sessions.iter().position(|s| s.id == id)
     }
@@ -2061,8 +2671,7 @@ impl ApplicationHandler<Event> for App {
         }
         let started = self.create_view(event_loop).and_then(|view| {
             self.view = Some(view);
-            let run = self.run.take();
-            self.open_session(None, run)
+            self.start()
         });
         if let Err(e) = started {
             eprintln!("aeon: failed to start: {e}");
@@ -2105,6 +2714,7 @@ impl ApplicationHandler<Event> for App {
                 let Some(index) = self.session_index(id) else {
                     return;
                 };
+                let shown = self.is_shown(index);
                 let session = &mut self.sessions[index];
                 session.term.advance(&bytes);
                 let scrolled = session.term.take_scrolled();
@@ -2116,7 +2726,7 @@ impl ApplicationHandler<Event> for App {
                 }
                 self.shell_events(index);
                 let session = &mut self.sessions[index];
-                let mut redraw = session.term.take_dirty() && index == self.active;
+                let mut redraw = session.term.take_dirty() && shown;
                 // The first report usually repeats the starting directory,
                 // which the bar already shows in full.
                 if session.term.take_cwd_changed()
@@ -2154,7 +2764,7 @@ impl ApplicationHandler<Event> for App {
             }
             Event::Exited(id) => {
                 if let Some(index) = self.session_index(id) {
-                    self.close_session(index, event_loop);
+                    self.close_pane(index, event_loop);
                 }
             }
         }
@@ -2162,7 +2772,12 @@ impl ApplicationHandler<Event> for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                let all: Vec<usize> = (0..self.sessions.len()).collect();
+                if self.confirm_close(&all) {
+                    self.quit(event_loop);
+                }
+            }
             WindowEvent::Resized(_) => self.resize(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(mut view) = self.view.take() {
@@ -2178,6 +2793,8 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
+                // The cursor turns hollow while the window is in the background.
+                self.request_redraw();
                 if focused {
                     self.refresh_update();
                     self.mark_seen();
@@ -2216,6 +2833,20 @@ mod state {
         pub sidebar: bool,
         pub panel: bool,
         pub pinned: Vec<PathBuf>,
+        /// The first window's sessions when it closed, to open again.
+        pub sessions: Vec<Group>,
+        /// Which of them was shown.
+        pub active: usize,
+    }
+
+    /// A saved session: its name, how its panes were split, and the folder
+    /// each pane was in.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Group {
+        pub name: Option<String>,
+        /// [`crate::panes::Tree::shape`].
+        pub shape: String,
+        pub panes: Vec<PathBuf>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -2234,12 +2865,30 @@ mod state {
             sidebar: true,
             panel: false,
             pinned: Vec::new(),
+            sessions: Vec::new(),
+            active: 0,
         };
         for line in text.lines() {
             match line.trim().split_once('=') {
                 Some(("sidebar", v)) => saved.sidebar = v != "hidden",
                 Some(("panel", v)) => saved.panel = v == "shown",
                 Some(("pinned", v)) if !v.is_empty() => saved.pinned.push(PathBuf::from(v)),
+                Some(("session", v)) => saved.sessions.push(Group {
+                    name: (!v.is_empty()).then(|| v.to_owned()),
+                    shape: ".".to_owned(),
+                    panes: Vec::new(),
+                }),
+                Some(("shape", v)) => {
+                    if let Some(group) = saved.sessions.last_mut() {
+                        group.shape = v.to_owned();
+                    }
+                }
+                Some(("pane", v)) => {
+                    if let Some(group) = saved.sessions.last_mut() {
+                        group.panes.push(PathBuf::from(v));
+                    }
+                }
+                Some(("active", v)) => saved.active = v.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -2256,15 +2905,37 @@ mod state {
         for path in &saved.pinned {
             text.push_str(&format!("pinned={}\n", path.display()));
         }
+        for group in &saved.sessions {
+            text.push_str(&format!(
+                "session={}\nshape={}\n",
+                group.name.as_deref().unwrap_or_default(),
+                group.shape
+            ));
+            for pane in &group.panes {
+                text.push_str(&format!("pane={}\n", pane.display()));
+            }
+        }
+        if !saved.sessions.is_empty() {
+            text.push_str(&format!("active={}\n", saved.active));
+        }
         text
     }
 
-    pub fn save(saved: &Saved) {
+    /// Writes `saved` with `sessions`, or with the sessions already in the
+    /// file when there are none to give.
+    pub fn save(mut saved: Saved, sessions: Option<(Vec<Group>, usize)>) {
         let Some(path) = path() else { return };
+        (saved.sessions, saved.active) = match sessions {
+            Some(sessions) => sessions,
+            None => {
+                let old = load();
+                (old.sessions, old.active)
+            }
+        };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let _ = std::fs::write(path, format(saved));
+        let _ = std::fs::write(path, format(&saved));
     }
 
     #[cfg(test)]
@@ -2277,13 +2948,29 @@ mod state {
                 sidebar: false,
                 panel: true,
                 pinned: vec![PathBuf::from(r"C:\code\api")],
+                sessions: vec![
+                    Group {
+                        name: Some("api server".into()),
+                        shape: "r..".into(),
+                        panes: vec![PathBuf::from(r"C:\code\api"), PathBuf::from(r"C:\code")],
+                    },
+                    Group {
+                        name: None,
+                        shape: ".".into(),
+                        panes: vec![PathBuf::from(r"C:\Users\me")],
+                    },
+                ],
+                active: 1,
             };
             let back = parse(&format(&saved));
             assert!(!back.sidebar && back.panel);
             assert_eq!(back.pinned, saved.pinned);
+            assert_eq!(back.sessions, saved.sessions);
+            assert_eq!(back.active, 1);
             // The file before this version held only the sidebar.
             let old = parse("sidebar=hidden\n");
             assert!(!old.sidebar && !old.panel && old.pinned.is_empty());
+            assert!(old.sessions.is_empty());
         }
     }
 }
@@ -2340,6 +3027,11 @@ fn window_theme(theme: &Theme) -> winit::window::Theme {
 
 pub(crate) fn points_to_px(points: f32, scale_factor: f64) -> f32 {
     (f64::from(points) * 96.0 / 72.0 * scale_factor) as f32
+}
+
+/// The width of the line between panes.
+fn divider(view: &View) -> u32 {
+    view.ui.px(1.0).max(1)
 }
 
 fn pty_size(rows: usize, cols: usize) -> PtySize {

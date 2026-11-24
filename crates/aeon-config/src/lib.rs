@@ -121,6 +121,10 @@ pub struct Keys {
     pub copy: String,
     pub paste: String,
     pub project_panel: String,
+    pub split_right: String,
+    pub split_down: String,
+    pub zoom_pane: String,
+    pub rename_session: String,
 }
 
 impl Default for Keys {
@@ -136,6 +140,10 @@ impl Default for Keys {
             copy: "Ctrl+Shift+C".to_owned(),
             paste: "Ctrl+Shift+V".to_owned(),
             project_panel: "Ctrl+Shift+P".to_owned(),
+            split_right: "Ctrl+Shift+D".to_owned(),
+            split_down: "Ctrl+Shift+E".to_owned(),
+            zoom_pane: "Ctrl+Shift+Z".to_owned(),
+            rename_session: "F2".to_owned(),
         }
     }
 }
@@ -208,6 +216,8 @@ pub struct Window {
     pub rows: u16,
     /// Inner padding in logical pixels.
     pub padding: u16,
+    /// Reopen the last window's sessions when Aeon starts with none open.
+    pub restore: bool,
 }
 
 impl Default for Window {
@@ -216,6 +226,7 @@ impl Default for Window {
             columns: 120,
             rows: 32,
             padding: 8,
+            restore: true,
         }
     }
 }
