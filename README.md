@@ -23,7 +23,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **Small.** One static `aeon.exe` under 1 MB. A window with a shell uses about 13 MB of private memory. Every release build reports both numbers, so regressions are caught before they ship.
 - **Native to Windows.** ConPTY, per-monitor DPI, x64 and arm64, and an MSI installer that puts `aeon` on your PATH.
 - **A launcher on Ctrl+Alt+Space.** From anywhere, open any app by name, run a command, search the web, switch Windows between light and dark, or do quick math. Your history comes with you.
-- **Projects, not tabs.** The sidebar groups your shells by the repository they run in, and each one shows the servers it started (`:5173`). A header above the terminal shows the project, the git branch and pending changes. No prompt framework needed.
+- **Every shell at a glance.** The sidebar lists your sessions by repository and shell (`aeon`, PowerShell; `WSL · kali-linux`), with what each is doing and the servers it started (`:5173`). A header above the terminal shows the shell, folder, git branch, and pending changes. No prompt framework needed.
 - **Full color.** 16, 256, and 24-bit color, with Aeon's own theme or yours.
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
@@ -55,11 +55,13 @@ Aeon reads `%APPDATA%\aeon\config.toml`. Every setting is optional, and an unkno
 
 ### Sessions
 
-One window holds as many shells as you want. The sidebar groups them by project: the git repository they run in, or their folder outside one, with your home folder under **Home**. Inside a project, a session is named after its shell, or after its folder when it is deeper in the repository; a session serving a port shows it (`:5173`). A new session starts in the folder of the one you are in, and Ctrl+Tab and Ctrl+1 to Ctrl+9 follow the sidebar's order.
+One window holds as many shells as you want, listed in the sidebar in the order you opened them. A session is named after the repository it is in, or after its shell outside one; under its name the sidebar says which shell it is (PowerShell, Windows PowerShell, Command Prompt, Git Bash, `WSL · kali-linux`, `SSH · host`), or its folder when the name already does. The header and the window title say the same, and the header adds its folder and branch. A session serving a port shows it (`:5173`). New sessions start in the folder of the one you are in.
+
+**New session** (or Ctrl+Shift+T) lists what it can start: your configured shell first (**Enter** opens it), then the other shells this PC has (PowerShell 7, Windows PowerShell, Command Prompt, Git Bash), each WSL distro, each host in `~/.ssh/config`, and Aeon as administrator in a separate window. Type to narrow the list.
 
 | Keys | Action |
 | --- | --- |
-| Ctrl+Shift+T | New session (or click **New session**) |
+| Ctrl+Shift+T | New session: pick a shell, distro, or host (or click **New session**) |
 | Ctrl+Shift+W | Close the pane, or the session when it has one |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous session |
 | Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
@@ -68,7 +70,6 @@ One window holds as many shells as you want. The sidebar groups them by project:
 | Ctrl+Shift+Z | Show only this pane, or all of them again |
 | F2 | Rename the session; Enter keeps the name, Escape drops it, and an empty name goes back to the automatic one |
 | Ctrl+Shift+K | The palette, over this window |
-| Ctrl+Shift+N | New session with another shell, a WSL distro, an SSH host, or as administrator (or the arrow on **New session**) |
 | Ctrl+Shift+B | Show or hide the sidebar |
 
 These are the defaults; change any of them except Alt+Arrows in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B.
@@ -94,19 +95,17 @@ Programs that use the mouse, such as vim or htop, get it; hold Shift to select t
 
 ### Projects
 
-Click a project in the sidebar to go to its first session. Hover it and click the pin to keep it in the sidebar even with no sessions open; clicking a pinned project with none opens one there.
-
 The project panel (**Ctrl+Shift+P**, or the button at the right of the header) shows what the active session's project can run and what it is running:
 
 - **Tasks** found in `package.json` (run with pnpm, yarn, bun, or npm, whichever the project uses), a `justfile`, a `Makefile`, or `Cargo.toml`. **Run** opens a session named after the task at the project's top; **Stop** sends it Ctrl+C, and the session keeps its output.
 - **Servers** the project's sessions started, with **Open** (in the browser) and **Stop**.
 - **Git**: the branch, how far ahead or behind it is, and the changed files.
 
-**Open in VS Code** in the header opens the project's folder when VS Code is installed. Which panels are open and the pinned projects are remembered in `%APPDATA%\aeon\state`.
+A session's project is its repository, or its folder outside one. **Open in VS Code** in the header opens it when VS Code is installed. Whether the panel is open is remembered in `%APPDATA%\aeon\state`.
 
 ### Commands and what they did
 
-In PowerShell, every command is a block: a line above it, and a chip at the end of its prompt line with how long it took and whether it passed (`3.4 s` with a check, or `exit 1` in red with the block tinted). Hover a finished command for **Copy output** and **Rerun**. **Ctrl+Up** and **Ctrl+Down** jump between commands. cmd marks its prompts but cannot say how a command ended.
+In every shell Aeon sets up, every command is a block: a line above it, and at the end of its prompt line how long it took (`3.4 s`), or `exit 1` in red for a failure, with a red bar down the block's left side and the block tinted. In PowerShell, a line of several statements (`npm run build; npm test`) becomes one block per statement, each run on its own after a quiet prompt line naming it, so each is formatted on its own; `&&` and `||` chains stay one block, and Ctrl+C stops the rest of the line. Hover a command for a copy button at its left, which copies the command, and **Copy output** and **Rerun** at its right. **Ctrl+Up** and **Ctrl+Down** jump between commands. cmd marks only its prompts, so there a block runs from Enter to the next prompt, and cmd cannot say how a command ended. When the window changes width, the shell redraws the screen rewrapped and the blocks follow their lines.
 
 The sidebar shows what each session is doing: a blue dot while a command runs, its port while it serves one, the progress a program reports (`64%`), and, for a session you are not looking at, `exit 1` in red, `done` in green, or `bell`, in bold until you open it. When a command that ran for 10 seconds or more ends in a session you are not looking at, Windows shows a notification and the taskbar button flashes. The bell at the end of a session row (on hover) mutes its notifications.
 
@@ -114,7 +113,7 @@ The sidebar shows what each session is doing: a blue dot while a command runs, i
 
 **Ctrl+Shift+K** in a window opens the same search as the launcher below, plus what that window has: its sessions (the empty box lists them; **Enter** goes to one), the active project's tasks, and new sessions. **Enter** on a command types it at the focused prompt, and **Ctrl+Enter** runs it in a new session.
 
-New sessions can start any shell this PC has (PowerShell 7, Windows PowerShell, Command Prompt, Git Bash), each WSL distro, each host in `~/.ssh/config`, or Aeon as administrator in a separate window. **Ctrl+Shift+N**, or the arrow on **New session**, lists only those; in the palette, type `new`, `wsl`, `ssh`, or a name. A split starts the same shell as the pane it splits.
+In the palette, type `new`, `wsl`, `ssh`, or a name to find what **New session** lists. A split starts the same shell as the pane it splits, and restoring a session restarts each pane's own shell.
 
 ### The launcher
 
@@ -139,20 +138,26 @@ Press **Ctrl+Alt+`** anywhere and a terminal drops down across the top of the sc
 
 ### Your shell inside Aeon
 
-Aeon starts PowerShell **without your profile**, with its own prompt and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. Prompt themes like Oh My Posh are not needed: the session header shows the same information, for every shell. cmd keeps its usual prompt and reports its directory to Aeon.
+PowerShell loads your profile (your PATH, modules such as Terminal-Icons, PSReadLine settings), then takes Aeon's prompt, colours for what you type (commands, parameters, strings, and variables, in bold, unless your profile sets PSReadLine's own), and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. A prompt theme such as Oh My Posh is replaced: the session header shows the same information, for every shell. Your profile can make a shell take a second or more to start; `profile = false` skips it. cmd reports its directory to Aeon too.
 
-Aeon sets `TERM_PROGRAM=aeon` and `COLORTERM=truecolor` for everything it runs. To start a shell exactly as you configured it, profile included, set `integration = false` or give it `args`.
+Characters your terminal font lacks, such as Nerd Font icons, are drawn from Segoe UI Symbol or an installed Nerd Font (FiraCode, Caskaydia, JetBrains Mono, Hack, Meslo, or Symbols Nerd Font).
+
+In WSL and Git Bash, Aeon starts your account's shell (bash or zsh) as a login would, with your own files (`.profile`, `.bashrc`, `.zshrc`), then gives it Aeon's prompt, command blocks, the folder in the header, and the same colours for what you type: zsh-syntax-highlighting takes them as you type, and otherwise the line takes them when you press Enter. Folders on Windows drives, which `ls` would paint with a background, show as plain folders. cmd gets Aeon's prompt too, but cannot colour what you type. Git shows for folders under `/mnt/c`; inside the Linux file system Windows' git cannot read the repository.
+
+Aeon sets `TERM_PROGRAM=aeon` and `COLORTERM=truecolor` for everything it runs. To start a shell exactly as you configured it, prompt included, set `integration = false` or give it `args`.
 
 ```toml
 [shell]
 program = "pwsh.exe"          # default: pwsh, then powershell, then cmd
 args = ["-NoLogo"]
 cwd = "C:\\code"              # default: where you launched Aeon, or your home folder
-integration = true            # no profile, Aeon's prompt and history; off when args are set
+integration = true            # Aeon's prompt, blocks, and history; off when args are set
+profile = true                # PowerShell loads your profile first
 
 [font]
 path = "C:\\Windows\\Fonts\\CascadiaMono.ttf"   # default: Cascadia Mono, then Consolas
 size = 11.0                   # points
+line_height = 1.2             # rows as a multiple of the font's line height
 
 [window]
 columns = 120
@@ -182,7 +187,6 @@ split_down = "Ctrl+Shift+E"
 zoom_pane = "Ctrl+Shift+Z"
 rename_session = "F2"
 palette = "Ctrl+Shift+K"
-new_session_menu = "Ctrl+Shift+N"
 
 [terminal]
 scrollback = 5000             # lines kept for scrolling back; 0 keeps none

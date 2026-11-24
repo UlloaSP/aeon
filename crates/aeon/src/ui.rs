@@ -17,7 +17,6 @@ pub struct Palette {
     pub fg: u32,
     pub muted: u32,
     pub label: u32,
-    pub faint: u32,
     pub border: u32,
     pub hover: u32,
     pub highlight: u32,
@@ -42,7 +41,6 @@ impl Palette {
             fg,
             muted: toward(170),
             label: toward(150),
-            faint: toward(96),
             border: toward(22),
             hover: toward(12),
             highlight: toward(24),
@@ -288,17 +286,12 @@ pub mod icon {
     pub const DOWNLOAD: char = '\u{E896}';
     pub const REFRESH: char = '\u{E72C}';
     pub const BELL: char = '\u{EA8F}';
-    pub const MUTED: char = '\u{E708}';
-    pub const CHECK: char = '\u{E73E}';
-    pub const CROSS: char = '\u{E711}';
-    pub const PIN: char = '\u{E718}';
-    pub const UNPIN: char = '\u{E77A}';
+    pub const MUTED: char = '\u{E7ED}';
     pub const PANEL: char = '\u{E8A0}';
     pub const CODE: char = '\u{E943}';
     pub const SEARCH: char = '\u{E721}';
     pub const CHEVRON_LEFT: char = '\u{E76B}';
     pub const CHEVRON_RIGHT: char = '\u{E76C}';
-    pub const CHEVRON_DOWN: char = '\u{E70D}';
     pub const CALCULATOR: char = '\u{E8EF}';
     pub const PLAY: char = '\u{E768}';
     pub const REMOTE: char = '\u{E8AF}';
@@ -307,6 +300,7 @@ pub mod icon {
     pub const COLOR: char = '\u{E790}';
     pub const HISTORY: char = '\u{E81C}';
     pub const GLOBE: char = '\u{E774}';
+    pub const COPY: char = '\u{E8C8}';
 }
 
 /// Blends a run's ClearType coverage into the frame, channel by channel.

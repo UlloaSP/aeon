@@ -1,0 +1,79 @@
+# Aeon: the account's own .zshrc, then Aeon's prompt marks. ZDOTDIR goes
+# back to theirs, so zsh reads their .zlogin and anything later from there.
+ZDOTDIR=$AEON_ZDOTDIR
+unset AEON_ZDOTDIR __aeon_zdotdir
+[[ -f $ZDOTDIR/.zshrc ]] && . $ZDOTDIR/.zshrc
+. $AEON_SHELL_DIR/aeon-paint.sh
+unset AEON_SHELL_DIR
+
+# On Windows drives every folder is writable by everyone, which dircolors
+# paints with a background: show them as the folders they are.
+[[ -n $LS_COLORS ]] && LS_COLORS="$LS_COLORS:ow=01;34:tw=01;34"
+
+# What you type, in the colours Aeon gives every shell, when
+# zsh-syntax-highlighting colours it as you type.
+if (( ${+ZSH_HIGHLIGHT_STYLES} )); then
+    ZSH_HIGHLIGHT_STYLES[default]='fg=15,bold'
+    for __aeon_kind in command builtin alias function precommand hashed-command suffix-alias; do
+        ZSH_HIGHLIGHT_STYLES[$__aeon_kind]='fg=11,bold'
+    done
+    for __aeon_kind in single-hyphen-option double-hyphen-option; do
+        ZSH_HIGHLIGHT_STYLES[$__aeon_kind]='fg=245,bold'
+    done
+    for __aeon_kind in single-quoted-argument double-quoted-argument dollar-quoted-argument; do
+        ZSH_HIGHLIGHT_STYLES[$__aeon_kind]='fg=13,bold'
+    done
+    ZSH_HIGHLIGHT_STYLES[commandseparator]='fg=245'
+    ZSH_HIGHLIGHT_STYLES[redirection]='fg=245'
+    ZSH_HIGHLIGHT_STYLES[path]='fg=15,bold'
+    ZSH_HIGHLIGHT_STYLES[reserved-word]='fg=12,bold'
+    unset __aeon_kind
+fi
+
+# OSC 133 marks each command for Aeon's command blocks: A where the prompt
+# starts, B where typing starts, C when the command runs, D;exit when it
+# ends. OSC 9;9 reports the folder, as a Windows path, for the header.
+typeset -gi __aeon_ran=0 __aeon_ok=1
+typeset -g __aeon_last=
+
+__aeon_status() {
+    local code=$?
+    if (( __aeon_ran )); then
+        printf '\033]133;D;%s\033\\' $code
+        __aeon_ran=0
+        # A blank line between a command's output and the next prompt, but
+        # not at the top of a cleared screen.
+        case $__aeon_last in clear | reset | tput) ;; *) print ;; esac
+    fi
+    (( __aeon_ok = code == 0 ))
+}
+
+__aeon_prompt() {
+    local p=$PWD dir rest
+    if [[ $p == /mnt/[a-z] || $p == /mnt/[a-z]/* ]]; then
+        rest=${p:6}
+        dir="${(U)p[6]}:${rest:-/}"
+    else
+        dir="//wsl.localhost/$WSL_DISTRO_NAME$p"
+    fi
+    printf '\033]9;9;"%s"\033\\' "${dir//\//\\}"
+    # The header shows where you are, so the prompt is just the mark: a
+    # bold chevron, green after success and red after a failure.
+    local color=red code=31
+    (( __aeon_ok )) && color=green code=32
+    __aeon_chevron=$'\e[1;'$code$'m❯\e[0m'
+    PROMPT=$'%{\e]133;A\e\\%}%B%F{'$color$'}❯%f%b %{\e]133;B\e\\%}'
+    RPROMPT=
+}
+
+__aeon_preexec() {
+    __aeon_ran=1
+    __aeon_last=${1%% *}
+    # The line as typed, recoloured in place.
+    __aeon_recolor "$1"
+    printf '\033]133;C\033\\'
+}
+
+# First, to see the command's own status; the prompt last, over any theme's.
+precmd_functions=(__aeon_status $precmd_functions __aeon_prompt)
+preexec_functions+=(__aeon_preexec)

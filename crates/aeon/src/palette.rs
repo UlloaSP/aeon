@@ -169,7 +169,7 @@ fn glyph(item: &Item, pal: &Palette) -> (char, u32) {
         Item::Session(_) => (icon::TERMINAL, pal.fg),
         Item::Task(_) => (icon::PLAY, pal.green),
         Item::NewSession(profile) => match profile.kind {
-            Kind::Shell | Kind::Wsl => (icon::TERMINAL, pal.accent),
+            Kind::Default | Kind::Shell | Kind::Wsl => (icon::TERMINAL, pal.accent),
             Kind::Ssh => (icon::REMOTE, pal.cyan),
             Kind::Admin => (icon::ADMIN, pal.yellow),
         },
@@ -189,6 +189,7 @@ fn detail(item: &Item) -> &str {
         Item::NewSession(profile) => match profile.kind {
             Kind::Shell => "New session",
             Kind::Admin => "New window",
+            Kind::Default => "Default shell",
             kind => kind.word(),
         },
         Item::App(_) => "App",

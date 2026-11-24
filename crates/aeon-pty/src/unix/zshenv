@@ -1,0 +1,8 @@
+# Aeon shell integration for zsh: ZDOTDIR points here, and each of these
+# files loads the account's own from AEON_ZDOTDIR before zsh moves on.
+__aeon_zdotdir=$ZDOTDIR
+ZDOTDIR=$AEON_ZDOTDIR
+[[ -f $ZDOTDIR/.zshenv ]] && . $ZDOTDIR/.zshenv
+# Their .zshenv may move ZDOTDIR; the later files come from there.
+AEON_ZDOTDIR=$ZDOTDIR
+ZDOTDIR=$__aeon_zdotdir

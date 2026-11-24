@@ -101,7 +101,8 @@ pub struct Overlay<'a> {
     pub current: Option<usize>,
     /// A link under the mouse with Ctrl held: line and columns.
     pub link: Option<(u64, usize, usize)>,
-    /// Line ranges drawn on a tinted background: commands that failed.
+    /// Spans drawn on a tinted background, commands that failed, in half
+    /// lines (`2 * line`): a span can end in the middle of a row.
     pub tints: &'a [(u64, u64)],
     pub tint: u32,
     /// The keyboard is elsewhere: the cursor is drawn as an outline.
@@ -136,19 +137,20 @@ pub fn draw(
         let y = top + row as u32 * ch;
         let number = first + row as u64;
         let cells = term.line(number).unwrap_or_default();
-        if overlay
-            .tints
-            .iter()
-            .any(|(a, b)| (*a..*b).contains(&number))
-        {
-            fill_rect(
-                frame,
-                left,
-                y,
-                (bounds.x + bounds.w).saturating_sub(left),
-                ch,
-                overlay.tint,
-            );
+        for &(a, b) in overlay.tints {
+            // The part of this row's two halves the span covers.
+            let (from, to) = (a.max(2 * number), b.min(2 * number + 2));
+            if from < to {
+                let half = |h: u64| y + (h - 2 * number) as u32 * ch / 2;
+                fill_rect(
+                    frame,
+                    bounds.x,
+                    half(from),
+                    bounds.w,
+                    half(to) - half(from),
+                    overlay.tint,
+                );
+            }
         }
         // Find results on this line; `matches` is ordered by line.
         let from = overlay.matches.partition_point(|m| m.start.line < number);

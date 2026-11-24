@@ -1,5 +1,5 @@
-//! The sidebar and the session header, laid out like T3 Code: projects own
-//! their sessions, and a session's state is a small dot beside its name.
+//! The sidebar and the session header, laid out like T3 Code: a list of
+//! sessions, each with its state as a small dot beside its name.
 
 use std::path::{Path, PathBuf};
 
@@ -9,7 +9,8 @@ use crate::render::{Frame, blend, fill_rect};
 use crate::sys::Face;
 use crate::ui::{self, Palette, REGULAR, SEMIBOLD, Ui, icon};
 
-/// Sessions that run in the same repository, or the same folder outside one.
+/// Sessions that run in the same repository, or the same folder outside one:
+/// what the project panel and notifications speak of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
@@ -17,13 +18,10 @@ pub struct Project {
     pub path: Option<PathBuf>,
     /// Indexes into the session list, in session order.
     pub sessions: Vec<usize>,
-    /// Kept in the sidebar with no sessions open.
-    pub pinned: bool,
 }
 
-/// Groups sessions into projects, ordered by each project's first session,
-/// then the pinned projects that have none.
-pub fn projects(contexts: &[&Context], home: Option<&Path>, pinned: &[PathBuf]) -> Vec<Project> {
+/// Groups sessions into projects, ordered by each project's first session.
+pub fn projects(contexts: &[&Context], home: Option<&Path>) -> Vec<Project> {
     let mut projects: Vec<Project> = Vec::new();
     for (index, context) in contexts.iter().enumerate() {
         let path = context
@@ -39,90 +37,34 @@ pub fn projects(contexts: &[&Context], home: Option<&Path>, pinned: &[PathBuf]) 
                     .as_deref()
                     .and_then(Path::file_name)
                     .map_or_else(|| "Home".to_owned(), |n| n.to_string_lossy().into_owned()),
-                pinned: path.as_ref().is_some_and(|p| pinned.contains(p)),
                 path,
                 sessions: vec![index],
             }),
         }
     }
-    for path in pinned {
-        if !projects.iter().any(|p| p.path.as_ref() == Some(path)) {
-            projects.push(Project {
-                name: path.file_name().map_or_else(
-                    || path.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                ),
-                path: Some(path.clone()),
-                sessions: Vec::new(),
-                pinned: true,
-            });
-        }
-    }
     projects
 }
 
-/// Sessions in the order the sidebar shows them; Ctrl+Tab and Ctrl+1-9
-/// follow it.
-pub fn display_order(projects: &[Project]) -> Vec<usize> {
-    projects
-        .iter()
-        .flat_map(|p| p.sessions.iter().copied())
-        .collect()
+/// What a session is called: its repository when it is in one, otherwise
+/// its shell, such as `pwsh` or the WSL distro.
+pub fn session_title(context: &Context, shell: &str) -> String {
+    context
+        .root
+        .as_deref()
+        .and_then(Path::file_name)
+        .map_or_else(|| shell.to_owned(), |n| n.to_string_lossy().into_owned())
 }
 
-/// Two letters for a project's tile: the first letters of its first and last
-/// words (`web-app` is WA), or its first two letters.
-pub fn monogram(name: &str) -> String {
-    let words: Vec<&str> = name
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .collect();
-    let letters: String = match words.as_slice() {
-        [] => "?".to_owned(),
-        [only] => only.chars().take(2).collect(),
-        [first, .., last] => first.chars().take(1).chain(last.chars().take(1)).collect(),
-    };
-    letters.to_uppercase()
-}
-
-/// A project's colour, stable for its name. Home stays neutral.
-pub fn project_color(project: &Project, pal: &Palette) -> u32 {
-    if project.path.is_none() {
-        return pal.muted;
-    }
-    let hues = [
-        pal.yellow,
-        pal.blue,
-        pal.green,
-        pal.magenta,
-        pal.cyan,
-        pal.red,
-    ];
-    let hash = project.name.bytes().fold(2166136261u32, |h, b| {
-        (h ^ u32::from(b)).wrapping_mul(16777619)
-    });
-    hues[hash as usize % hues.len()]
-}
-
-/// What a session is called: its shell at the project's top, otherwise the
-/// folder it is in, relative to the project.
-pub fn session_title(
-    context: &Context,
-    shell: &str,
-    project: &Project,
-    home: Option<&Path>,
-) -> String {
+/// Where a session is, for the header: its folder, with the home folder as
+/// `~`.
+pub fn place(context: &Context, home: Option<&Path>) -> String {
     let Some(cwd) = context.cwd.as_deref() else {
-        return shell.to_owned();
+        return String::new();
     };
-    let base = project.path.as_deref().or(home);
-    match base.and_then(|b| cwd.strip_prefix(b).ok()) {
-        Some(rest) if rest.as_os_str().is_empty() => shell.to_owned(),
-        Some(rest) => rest.display().to_string(),
-        None => cwd.file_name().map_or_else(
-            || cwd.display().to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        ),
+    match home.and_then(|h| cwd.strip_prefix(h).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~\\{}", rest.display()),
+        None => cwd.display().to_string(),
     }
 }
 
@@ -150,16 +92,11 @@ impl Rect {
 /// Something in the sidebar a click acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
+    /// New session: the menu of shells, distros, and hosts.
     NewSession,
-    /// The chevron on New session: every shell, distro, and host.
-    NewSessionMenu,
     Session(usize),
     /// The bell on a session row: mutes or unmutes its notifications.
     Mute(usize),
-    /// A project row: its first session, or a new one there.
-    Project(usize),
-    /// The pin on a project row.
-    Pin(usize),
     Settings,
     Update,
 }
@@ -167,7 +104,6 @@ pub enum Hit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
     NewSession,
-    Project(usize),
     Session(usize),
 }
 
@@ -206,13 +142,7 @@ pub struct Sidebar {
 }
 
 impl Sidebar {
-    pub fn new(
-        ui: &mut Ui,
-        width: u32,
-        height: u32,
-        projects: &[Project],
-        pill: Option<&Pill>,
-    ) -> Self {
+    pub fn new(ui: &mut Ui, width: u32, height: u32, sessions: usize, pill: Option<&Pill>) -> Self {
         let inset = ui.px(8.0);
         let inner = width.saturating_sub(2 * inset);
         let footer_top = height.saturating_sub(ui.px(50.0));
@@ -234,14 +164,8 @@ impl Sidebar {
         };
         push(&mut y, ui.px(32.0), Row::NewSession);
         y += ui.px(6.0);
-        for (i, project) in projects.iter().enumerate() {
-            if i > 0 {
-                y += ui.px(6.0);
-            }
-            push(&mut y, ui.px(32.0), Row::Project(i));
-            for &session in &project.sessions {
-                push(&mut y, ui.px(36.0), Row::Session(session));
-            }
+        for session in 0..sessions {
+            push(&mut y, ui.px(50.0), Row::Session(session));
         }
         let button = ui.px(32.0);
         let row_y = footer_top + ui.px(9.0);
@@ -282,12 +206,9 @@ impl Sidebar {
             .map(|(rect, row)| {
                 let end = x >= f64::from(rect.x + rect.w - self.mute);
                 match row {
-                    Row::NewSession if end => Hit::NewSessionMenu,
                     Row::NewSession => Hit::NewSession,
                     Row::Session(i) if end => Hit::Mute(*i),
                     Row::Session(i) => Hit::Session(*i),
-                    Row::Project(i) if end => Hit::Pin(*i),
-                    Row::Project(i) => Hit::Project(*i),
                 }
             })
     }
@@ -307,6 +228,9 @@ fn pill_width(ui: &mut Ui, pill: &Pill) -> u32 {
 /// One session as the sidebar shows it.
 pub struct SessionRow {
     pub title: String,
+    /// Its shell ("PowerShell", "WSL · kali-linux"), or its folder when the
+    /// title is the shell.
+    pub detail: String,
     pub state: RowState,
     /// It finished, failed, or rang while you were elsewhere: drawn bold
     /// until you look at it.
@@ -316,6 +240,8 @@ pub struct SessionRow {
     pub panes: usize,
     /// The title is being renamed: drawn as a field with a caret.
     pub editing: bool,
+    /// The whole title is selected while renaming: typing replaces it.
+    pub selected: bool,
 }
 
 /// What a session is doing, as its dot and the text at the row's end show.
@@ -331,7 +257,6 @@ pub enum RowState {
 }
 
 pub struct SidebarState<'a> {
-    pub projects: &'a [Project],
     pub sessions: &'a [SessionRow],
     pub active: usize,
     pub settings_open: bool,
@@ -396,7 +321,7 @@ pub fn draw_sidebar(
         let mid = rect.mid();
         match *row {
             Row::NewSession => {
-                let hovered = matches!(state.hover, Some(Hit::NewSession | Hit::NewSessionMenu));
+                let hovered = state.hover == Some(Hit::NewSession);
                 if hovered {
                     ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, radius, pal.hover);
                 }
@@ -412,76 +337,7 @@ pub fn draw_sidebar(
                     rect.w,
                 );
                 let right = rect.x + rect.w - ui.px(10.0);
-                if hovered {
-                    // The row's own menu replaces its shortcut while hovered.
-                    let on_menu = state.hover == Some(Hit::NewSessionMenu);
-                    ui.icon(
-                        frame,
-                        right.saturating_sub(ui.px(6.0)),
-                        mid,
-                        icon::CHEVRON_DOWN,
-                        11.0,
-                        if on_menu { pal.fg } else { pal.muted },
-                    );
-                } else {
-                    ui.text_right(frame, right, mid, state.new_keys, small, pal.label);
-                }
-            }
-            Row::Project(i) => {
-                let project = &state.projects[i];
-                let color = project_color(project, pal);
-                monogram_tile(
-                    frame,
-                    ui,
-                    pal,
-                    rect.x + ui.px(10.0),
-                    mid,
-                    &project.name,
-                    color,
-                );
-                let name_color = blend(pal.canvas, pal.fg, 230);
-                let hovered = matches!(state.hover, Some(Hit::Project(h) | Hit::Pin(h)) if h == i);
-                if hovered {
-                    ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, ui.px(8.0), pal.hover);
-                }
-                let right = rect.x + rect.w - ui.px(10.0);
-                let count_x = if hovered {
-                    let on_pin = state.hover == Some(Hit::Pin(i));
-                    let glyph = if project.pinned {
-                        icon::UNPIN
-                    } else {
-                        icon::PIN
-                    };
-                    let cx = right.saturating_sub(ui.px(6.0));
-                    ui.icon(
-                        frame,
-                        cx,
-                        mid,
-                        glyph,
-                        12.0,
-                        if on_pin { pal.fg } else { pal.muted },
-                    );
-                    cx.saturating_sub(ui.px(10.0))
-                } else {
-                    let count = project.sessions.len().to_string();
-                    let mut end = ui.text_right(frame, right, mid, &count, small, pal.label);
-                    if project.pinned {
-                        let cx = end.saturating_sub(ui.px(10.0));
-                        ui.icon(frame, cx, mid, icon::PIN, 10.0, pal.label);
-                        end = cx.saturating_sub(ui.px(8.0));
-                    }
-                    end
-                };
-                let x = rect.x + ui.px(36.0);
-                ui.text_mid(
-                    frame,
-                    x,
-                    mid,
-                    &project.name,
-                    strong,
-                    name_color,
-                    count_x.saturating_sub(x + ui.px(8.0)),
-                );
+                ui.text_right(frame, right, mid, state.new_keys, small, pal.label);
             }
             Row::Session(i) => {
                 let Some(session) = state.sessions.get(i) else {
@@ -507,7 +363,10 @@ pub fn draw_sidebar(
                 } else if hovered {
                     ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, radius, pal.hover);
                 }
-                let slot = rect.x + ui.px(43.0);
+                // Two lines: the title, and under it the shell or folder.
+                let line = mid.saturating_sub(ui.px(8.0));
+                let below = mid + ui.px(10.0);
+                let slot = rect.x + ui.px(18.0);
                 let (dot, meta, meta_color) = match session.state {
                     RowState::Idle if session.panes > 1 => {
                         (None, format!("{} panes", session.panes), pal.label)
@@ -521,13 +380,13 @@ pub fn draw_sidebar(
                     RowState::Bell => (Some(pal.yellow), "bell".to_owned(), pal.yellow),
                 };
                 match dot {
-                    Some(color) => ui::dot(frame, slot, mid, ui.px(9.0), color),
+                    Some(color) => ui::dot(frame, slot, line, ui.px(9.0), color),
                     None => {
                         let strength = if selected || hovered { 215 } else { 102 };
                         ui.icon(
                             frame,
                             slot,
-                            mid,
+                            line,
                             icon::TERMINAL,
                             12.0,
                             blend(pal.canvas, pal.fg, strength),
@@ -545,34 +404,56 @@ pub fn draw_sidebar(
                     };
                     let color = if on_bell { pal.fg } else { pal.muted };
                     let cx = right.saturating_sub(ui.px(6.0));
-                    ui.icon(frame, cx, mid, glyph, 12.0, color);
+                    ui.icon(frame, cx, line, glyph, 12.0, color);
                     cx.saturating_sub(ui.px(10.0))
                 } else {
                     let mut end = right;
                     if !meta.is_empty() {
-                        end = ui.text_right(frame, end, mid, &meta, small, meta_color);
+                        end = ui.text_right(frame, end, line, &meta, small, meta_color);
                     }
                     if session.muted {
                         let cx = end.saturating_sub(ui.px(10.0));
-                        ui.icon(frame, cx, mid, icon::MUTED, 10.0, pal.label);
+                        ui.icon(frame, cx, line, icon::MUTED, 10.0, pal.label);
                         end = cx.saturating_sub(ui.px(8.0));
                     }
                     end
                 };
-                let x = rect.x + ui.px(60.0);
+                let x = rect.x + ui.px(36.0);
                 let font = if selected || session.unseen {
                     strong
                 } else {
                     body
                 };
                 let room = meta_x.saturating_sub(x + ui.px(8.0));
-                let width = ui.text_mid(frame, x, mid, &session.title, font, pal.fg, room);
+                if session.editing && session.selected && !session.title.is_empty() {
+                    let w = ui.measure(&session.title, font).min(room);
+                    let h = ui.px(20.0);
+                    fill_rect(
+                        frame,
+                        x.saturating_sub(ui.px(2.0)),
+                        line.saturating_sub(h / 2),
+                        w + ui.px(4.0),
+                        h,
+                        blend(pal.raised, pal.accent, 90),
+                    );
+                }
+                let width = ui.text_mid(frame, x, line, &session.title, font, pal.fg, room);
+                let detail_room = (rect.x + rect.w).saturating_sub(x + ui.px(10.0));
+                ui.text_mid(
+                    frame,
+                    x,
+                    below,
+                    &session.detail,
+                    small,
+                    pal.label,
+                    detail_room,
+                );
                 if session.editing {
                     let caret = ui.px(16.0);
                     fill_rect(
                         frame,
                         x + width.min(room) + 1,
-                        mid.saturating_sub(caret / 2),
+                        line.saturating_sub(caret / 2),
                         ui.px(1.0).max(1),
                         caret,
                         pal.accent,
@@ -674,47 +555,10 @@ fn draw_pill(
     ui.text_mid(frame, x, mid, &pill.label(), font, fg, r.w);
 }
 
-/// A project's two-letter tile, 16 logical pixels square.
-pub fn monogram_tile(
-    frame: &mut Frame<'_>,
-    ui: &mut Ui,
-    pal: &Palette,
-    x: u32,
-    mid: u32,
-    name: &str,
-    color: u32,
-) {
-    let size = ui.px(16.0);
-    ui::round_rect(
-        frame,
-        x,
-        mid - size / 2,
-        size,
-        size,
-        ui.px(4.0),
-        blend(pal.canvas, color, 41),
-    );
-    let font = ui.font(Face::Code, 8.5, SEMIBOLD);
-    let letters = monogram(name);
-    let w = ui.measure(&letters, font);
-    ui.text_mid(
-        frame,
-        x + size.saturating_sub(w) / 2,
-        mid,
-        &letters,
-        font,
-        color,
-        size,
-    );
-}
-
 pub fn header_height(ui: &Ui) -> u32 {
     ui.px(44.0)
 }
 
-/// The session's breadcrumb across the top of the terminal: project, session,
-/// branch and changes, and the servers it started.
-#[allow(clippy::too_many_arguments)]
 /// What a button in the session header does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderHit {
@@ -723,8 +567,14 @@ pub enum HeaderHit {
 }
 
 /// The header's buttons, from the right: the project panel toggle, then
-/// "Open in VS Code" when VS Code is installed.
-pub fn header_buttons(ui: &mut Ui, frame_width: u32, editor: bool) -> Vec<(Rect, HeaderHit)> {
+/// "Open in VS Code" when VS Code is installed; just its icon when the header
+/// starting at `left` is narrow, so the session's title keeps its room.
+pub fn header_buttons(
+    ui: &mut Ui,
+    left: u32,
+    frame_width: u32,
+    editor: bool,
+) -> Vec<(Rect, HeaderHit)> {
     let height = header_height(ui);
     let h = ui.px(28.0);
     let y = (height - h) / 2;
@@ -735,14 +585,18 @@ pub fn header_buttons(ui: &mut Ui, frame_width: u32, editor: bool) -> Vec<(Rect,
     out.push((Rect { x, y, w, h }, HeaderHit::TogglePanel));
     if editor {
         let font = ui.font(Face::Ui, 13.0, REGULAR);
-        let w = ui.measure("Open in VS Code", font) + ui.px(36.0);
+        let w = if frame_width.saturating_sub(left) < ui.px(720.0) {
+            ui.px(32.0)
+        } else {
+            ui.measure("Open in VS Code", font) + ui.px(36.0)
+        };
         x = x.saturating_sub(w + ui.px(4.0));
         out.push((Rect { x, y, w, h }, HeaderHit::OpenEditor));
     }
     out
 }
 
-/// The session's breadcrumb across the top of the terminal: project, session,
+/// The session across the top of the terminal: its title, where it is, its
 /// branch and changes, and the servers it started; its buttons at the right.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_header(
@@ -750,8 +604,9 @@ pub fn draw_header(
     ui: &mut Ui,
     pal: &Palette,
     left: u32,
-    project: &Project,
     title: &str,
+    shell: Option<&str>,
+    place: &str,
     context: &Context,
     buttons: &[(Rect, HeaderHit)],
     hover: Option<HeaderHit>,
@@ -787,6 +642,9 @@ pub fn draw_header(
             HeaderHit::TogglePanel => {
                 ui.icon(frame, r.x + r.w / 2, r.mid(), icon::PANEL, 14.0, color)
             }
+            HeaderHit::OpenEditor if r.w <= ui.px(32.0) => {
+                ui.icon(frame, r.x + r.w / 2, r.mid(), icon::CODE, 13.0, color)
+            }
             HeaderHit::OpenEditor => {
                 ui.icon(frame, r.x + ui.px(14.0), r.mid(), icon::CODE, 13.0, color);
                 let font = ui.font(Face::Ui, 13.0, REGULAR);
@@ -804,18 +662,6 @@ pub fn draw_header(
     }
 
     let mut x = left + ui.px(16.0);
-    monogram_tile(
-        frame,
-        ui,
-        pal,
-        x,
-        mid,
-        &project.name,
-        project_color(project, pal),
-    );
-    x += ui.px(16.0) + gap;
-    x += ui.text_mid(frame, x, mid, &project.name, body, pal.muted, room(x)) + gap;
-    x += ui.text_mid(frame, x, mid, "/", body, pal.faint, room(x)) + gap;
     x += ui.text_mid(
         frame,
         x,
@@ -825,6 +671,34 @@ pub fn draw_header(
         pal.fg,
         room(x).min(ui.px(360.0)),
     );
+    if let Some(shell) = shell
+        && room(x) > ui.px(80.0)
+    {
+        x += gap + ui.px(4.0);
+        ui.icon(frame, x + ui.px(6.0), mid, icon::TERMINAL, 12.0, pal.label);
+        x += ui.px(18.0);
+        x += ui.text_mid(
+            frame,
+            x,
+            mid,
+            shell,
+            body,
+            pal.muted,
+            room(x).min(ui.px(240.0)),
+        );
+    }
+    if !place.is_empty() {
+        x += gap + ui.px(4.0);
+        x += ui.text_mid(
+            frame,
+            x,
+            mid,
+            place,
+            body,
+            pal.muted,
+            room(x).min(ui.px(420.0)),
+        );
+    }
 
     if let Some(git) = &context.git {
         x += ui.px(16.0);
@@ -881,11 +755,12 @@ pub fn draw_find(
     ui: &mut Ui,
     pal: &Palette,
     top: u32,
+    right: u32,
     query: &str,
     count: &str,
 ) {
     let (w, h) = (ui.px(380.0), ui.px(36.0));
-    let x = frame.width.saturating_sub(w + ui.px(16.0));
+    let x = right.saturating_sub(w + ui.px(8.0));
     let y = top + ui.px(8.0);
     ui::card(
         frame,
@@ -936,23 +811,114 @@ pub enum BlockStatus {
     Running,
     Passed(Option<std::time::Duration>),
     Failed(i32, Option<std::time::Duration>),
-    /// The shell did not say how it ended (cmd).
-    Ended,
 }
 
 /// A command block's prompt row on screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BlockMark {
     pub row: u32,
+    /// Rows the block covers on screen, from its prompt row; at least 1.
+    pub span: u32,
+    /// An empty row above the prompt and below the output: the block's edges
+    /// run through their middles, for room inside it.
+    pub gap_above: bool,
+    pub gap_below: bool,
     /// The line of its prompt, which identifies it.
     pub prompt: u64,
     pub status: BlockStatus,
     pub hovered: bool,
 }
 
+/// The margin left of the terminal's text, for a block's bar and its copy
+/// button, in logical pixels.
+pub const GUTTER: f64 = 22.0;
+
+/// The command blocks on screen: a mark for each prompt in view, and the
+/// failed ones' tinted spans in half lines (`2 * line`), so a tint can stop
+/// in the middle of an empty row as the block's edge does.
+pub fn block_marks(
+    term: &aeon_term::Terminal,
+    scroll: usize,
+    took: &dyn Fn(u64) -> Option<std::time::Duration>,
+    hovered: Option<u64>,
+) -> (Vec<BlockMark>, Vec<(u64, u64)>) {
+    if term.modes().alt_screen {
+        return (Vec::new(), Vec::new());
+    }
+    let first = term.screen_line().saturating_sub(scroll as u64);
+    let rows = term.grid().rows() as u64;
+    let blank = |line: u64| {
+        term.line(line)
+            .is_some_and(|cells| cells.iter().all(|c| c.ch == ' '))
+    };
+    let mut marks = Vec::new();
+    let mut tints = Vec::new();
+    for block in term.blocks() {
+        if block.command.is_empty() || block.output.is_none() {
+            continue;
+        }
+        let gap_above = block.prompt > 0 && blank(block.prompt - 1);
+        let gap_below = block.end.is_some_and(blank);
+        let status = match (block.end, block.exit) {
+            (None, _) => BlockStatus::Running,
+            // cmd cannot say how a command ended: it shows as passed.
+            (Some(_), Some(0) | None) => BlockStatus::Passed(took(block.id)),
+            (Some(end), Some(code)) => {
+                tints.push((
+                    2 * block.prompt - u64::from(gap_above),
+                    2 * end + u64::from(gap_below),
+                ));
+                BlockStatus::Failed(code, took(block.id))
+            }
+        };
+        if (first..first + rows).contains(&block.prompt) {
+            let end = block.end.unwrap_or(first + rows).min(first + rows);
+            marks.push(BlockMark {
+                row: (block.prompt - first) as u32,
+                span: end.saturating_sub(block.prompt).max(1) as u32,
+                gap_above,
+                gap_below: gap_below && end < first + rows,
+                prompt: block.prompt,
+                status,
+                hovered: hovered == Some(block.prompt),
+            });
+        }
+    }
+    (marks, tints)
+}
+
+/// Where a block starts and ends on screen: the middles of the empty rows
+/// around it, or its first and last rows' edges.
+fn block_edges(area: &TermArea, mark: &BlockMark) -> (u32, u32) {
+    let half = area.cell_height / 2;
+    let top = area.top + mark.row * area.cell_height;
+    let bottom = top + mark.span * area.cell_height;
+    (
+        top.saturating_sub(if mark.gap_above { half } else { 0 })
+            .max(area.top),
+        bottom + if mark.gap_below { half } else { 0 },
+    )
+}
+
+/// The copy-command button in the margin left of a hovered block's prompt.
+fn copy_button(ui: &mut Ui, area: &TermArea, mark: &BlockMark) -> Option<Rect> {
+    if !mark.hovered {
+        return None;
+    }
+    let size = ui.px(20.0).min(area.cell_height.max(ui.px(16.0)));
+    let mid = area.top + mark.row * area.cell_height + area.cell_height / 2;
+    Some(Rect {
+        x: area.left + ui.px(GUTTER) / 2 + ui.px(2.0) - size / 2,
+        y: mid - size / 2,
+        w: size,
+        h: size,
+    })
+}
+
 /// What the buttons on a hovered block do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockAction {
+    CopyCommand,
     CopyOutput,
     Rerun,
 }
@@ -967,43 +933,33 @@ pub fn format_duration(d: std::time::Duration) -> String {
     }
 }
 
-fn mark_label(status: BlockStatus) -> (String, Option<char>) {
+fn mark_label(status: BlockStatus) -> String {
     match status {
-        BlockStatus::Running => ("running".to_owned(), None),
-        BlockStatus::Passed(d) => (
-            d.map(format_duration).unwrap_or_default(),
-            Some(icon::CHECK),
-        ),
-        BlockStatus::Failed(code, d) => (
-            match d {
-                Some(d) => format!("exit {code} \u{b7} {}", format_duration(d)),
-                None => format!("exit {code}"),
-            },
-            Some(icon::CROSS),
-        ),
-        BlockStatus::Ended => (String::new(), None),
+        BlockStatus::Running => "running".to_owned(),
+        BlockStatus::Passed(d) => d.map(format_duration).unwrap_or_default(),
+        BlockStatus::Failed(code, Some(d)) => format!("exit {code} \u{b7} {}", format_duration(d)),
+        BlockStatus::Failed(code, None) => format!("exit {code}"),
     }
 }
 
-/// The chip at the right end of a prompt row: its rectangle, or `None` when
-/// there is nothing to say.
-fn mark_chip(ui: &mut Ui, area: &TermArea, mark: &BlockMark) -> Option<Rect> {
-    let (label, glyph) = mark_label(mark.status);
-    if label.is_empty() && glyph.is_none() {
+/// Where a block's result is written at the right end of its prompt row,
+/// or `None` when there is nothing to say.
+fn mark_text(ui: &mut Ui, area: &TermArea, mark: &BlockMark) -> Option<Rect> {
+    let label = mark_label(mark.status);
+    if label.is_empty() {
         return None;
     }
     let small = ui.font(Face::Ui, 12.0, REGULAR);
-    let lead = match (mark.status, glyph) {
-        (BlockStatus::Running, _) => ui.px(14.0),
-        (_, Some(_)) => ui.px(16.0),
-        _ => 0,
+    let lead = if mark.status == BlockStatus::Running {
+        ui.px(12.0)
+    } else {
+        0
     };
-    let w = ui.measure(&label, small) + lead + ui.px(16.0);
-    let h = ui.px(20.0).min(area.cell_height.max(ui.px(16.0)));
-    let y = area.top + mark.row * area.cell_height + area.cell_height / 2 - h / 2;
+    let w = ui.measure(&label, small) + lead;
+    let h = area.cell_height;
     Some(Rect {
         x: area.right.saturating_sub(w),
-        y,
+        y: area.top + mark.row * area.cell_height,
         w,
         h,
     })
@@ -1019,7 +975,7 @@ fn mark_buttons(
         return None;
     }
     let small = ui.font(Face::Ui, 12.0, REGULAR);
-    let mut x = mark_chip(ui, area, mark).map_or(area.right, |c| c.x);
+    let mut x = mark_text(ui, area, mark).map_or(area.right, |t| t.x.saturating_sub(ui.px(6.0)));
     let h = ui.px(20.0).min(area.cell_height.max(ui.px(16.0)));
     let y = area.top + mark.row * area.cell_height + area.cell_height / 2 - h / 2;
     let mut rects = Vec::new();
@@ -1027,8 +983,8 @@ fn mark_buttons(
         ("Rerun", BlockAction::Rerun),
         ("Copy output", BlockAction::CopyOutput),
     ] {
-        let w = ui.measure(text, small) + ui.px(16.0);
-        x = x.saturating_sub(w + ui.px(6.0));
+        let w = ui.measure(text, small) + ui.px(14.0);
+        x = x.saturating_sub(w + ui.px(4.0));
         rects.push((Rect { x, y, w, h }, action));
     }
     Some([rects[1], rects[0]])
@@ -1042,14 +998,19 @@ pub fn block_action_at(
     x: f64,
     y: f64,
 ) -> Option<BlockAction> {
+    if copy_button(ui, area, mark).is_some_and(|r| r.contains(x, y)) {
+        return Some(BlockAction::CopyCommand);
+    }
     mark_buttons(ui, area, mark)?
         .into_iter()
         .find(|(r, _)| r.contains(x, y))
         .map(|(_, a)| a)
 }
 
-/// A hairline above each command, and its result as a chip at the right end
-/// of its prompt row, drawn over any text that reaches that far.
+/// A hairline above each command, through the empty row before its prompt;
+/// its result as quiet text at the right end of its prompt row; down the
+/// left of a failed one, a red bar; and on the one under the mouse, buttons to
+/// copy its command (left) and its output or run it again (right).
 pub fn draw_blocks(
     frame: &mut Frame<'_>,
     ui: &mut Ui,
@@ -1058,57 +1019,61 @@ pub fn draw_blocks(
     marks: &[BlockMark],
 ) {
     let small = ui.font(Face::Ui, 12.0, REGULAR);
-    let edge = blend(pal.canvas, pal.fg, 34);
     for mark in marks {
-        let y = area.top + mark.row * area.cell_height;
-        if mark.row > 0 {
+        let (top, bottom) = block_edges(area, mark);
+        if top > area.top {
             fill_rect(
                 frame,
                 area.left,
-                y,
+                top,
                 area.right.saturating_sub(area.left),
                 1,
                 pal.border,
             );
         }
-        if let Some(chip) = mark_chip(ui, area, mark) {
-            ui::card(
+        let failed = matches!(mark.status, BlockStatus::Failed(..));
+        if failed {
+            fill_rect(
                 frame,
-                chip.x,
-                chip.y,
-                chip.w,
-                chip.h,
-                chip.h / 2,
-                pal.raised,
-                edge,
+                area.left + ui.px(4.0),
+                top + 1,
+                ui.px(3.0).max(2),
+                bottom.saturating_sub(top + 1),
+                pal.red,
             );
-            let (label, glyph) = mark_label(mark.status);
-            let mid = chip.mid();
-            let mut x = chip.x + ui.px(8.0);
-            let failed = matches!(mark.status, BlockStatus::Failed(..));
-            match (mark.status, glyph) {
-                (BlockStatus::Running, _) => {
-                    ui::dot(frame, x + ui.px(3.0), mid, ui.px(6.0), pal.blue);
-                    x += ui.px(14.0);
-                }
-                (_, Some(glyph)) => {
-                    let color = if failed { pal.red } else { pal.green };
-                    ui.icon(frame, x + ui.px(5.0), mid, glyph, 9.0, color);
-                    x += ui.px(16.0);
-                }
-                _ => {}
+        }
+        if let Some(r) = copy_button(ui, area, mark) {
+            ui.icon(
+                frame,
+                r.x + r.w / 2,
+                r.y + r.h / 2,
+                icon::COPY,
+                12.0,
+                pal.muted,
+            );
+        }
+        if let Some(t) = mark_text(ui, area, mark) {
+            let mid = t.y + t.h / 2;
+            let mut x = t.x;
+            if mark.status == BlockStatus::Running {
+                ui::dot(frame, x + ui.px(3.0), mid, ui.px(6.0), pal.blue);
+                x += ui.px(12.0);
             }
-            let color = if failed { pal.red } else { pal.label };
-            ui.text_mid(frame, x, mid, &label, small, color, chip.w);
+            let color = match mark.status {
+                BlockStatus::Failed(..) => pal.red,
+                BlockStatus::Running => pal.blue,
+                _ => pal.label,
+            };
+            ui.text_mid(frame, x, mid, &mark_label(mark.status), small, color, t.w);
         }
         if let Some(buttons) = mark_buttons(ui, area, mark) {
             for (r, action) in buttons {
-                ui::card(frame, r.x, r.y, r.w, r.h, r.h / 2, pal.raised, edge);
+                ui::round_rect(frame, r.x, r.y, r.w, r.h, ui.px(5.0), pal.highlight);
                 let text = match action {
                     BlockAction::CopyOutput => "Copy output",
-                    BlockAction::Rerun => "Rerun",
+                    BlockAction::Rerun | BlockAction::CopyCommand => "Rerun",
                 };
-                ui.text_mid(frame, r.x + ui.px(8.0), r.mid(), text, small, pal.fg, r.w);
+                ui.text_mid(frame, r.x + ui.px(7.0), r.mid(), text, small, pal.fg, r.w);
             }
         }
     }
@@ -1514,82 +1479,51 @@ mod tests {
         let c = ctx(r"C:\code\aeon\crates\aeon", Some(r"C:\code\aeon"));
         let d = ctx(r"C:\tmp", None);
         let e = Context::default();
-        let projects = projects(
-            &[&a, &b, &c, &d, &e],
-            Some(home),
-            &[PathBuf::from(r"C:\code\api")],
-        );
-        let summary: Vec<(&str, &[usize])> = projects
-            .iter()
-            .map(|p| (p.name.as_str(), p.sessions.as_slice()))
+        let summary: Vec<(String, Vec<usize>)> = projects(&[&a, &b, &c, &d, &e], Some(home))
+            .into_iter()
+            .map(|p| (p.name, p.sessions))
             .collect();
         assert_eq!(
             summary,
             [
-                ("aeon", &[0, 2][..]),
-                ("Home", &[1, 4][..]),
-                ("tmp", &[3][..]),
-                ("api", &[][..])
+                ("aeon".to_owned(), vec![0, 2]),
+                ("Home".to_owned(), vec![1, 4]),
+                ("tmp".to_owned(), vec![3]),
             ]
         );
-        assert!(projects[3].pinned && !projects[0].pinned);
-        assert_eq!(display_order(&projects), [0, 2, 1, 4, 3]);
     }
 
     #[test]
-    fn monograms_take_word_initials() {
-        assert_eq!(monogram("web-app"), "WA");
-        assert_eq!(monogram("aeon"), "AE");
-        assert_eq!(monogram("my_cool project"), "MP");
-        assert_eq!(monogram("x"), "X");
-        assert_eq!(monogram("--"), "?");
-    }
-
-    #[test]
-    fn titles_say_where_the_session_is_in_its_project() {
-        let home = Path::new(r"C:\Users\me");
-        let project = Project {
-            name: "aeon".into(),
-            path: Some(PathBuf::from(r"C:\code\aeon")),
-            sessions: vec![0],
-            pinned: false,
-        };
-        let top = ctx(r"C:\code\aeon", Some(r"C:\code\aeon"));
+    fn a_session_is_named_after_its_repository_or_its_shell() {
         let deep = ctx(r"C:\code\aeon\crates\aeon", Some(r"C:\code\aeon"));
-        assert_eq!(session_title(&top, "pwsh", &project, Some(home)), "pwsh");
+        assert_eq!(session_title(&deep, "pwsh"), "aeon");
         assert_eq!(
-            session_title(&deep, "pwsh", &project, Some(home)),
-            r"crates\aeon"
+            session_title(&ctx(r"C:\tmp", None), "kali-linux"),
+            "kali-linux"
         );
-        let homeless = Project {
-            name: "Home".into(),
-            path: None,
-            sessions: vec![0],
-            pinned: false,
-        };
-        assert_eq!(
-            session_title(&ctx(r"C:\Users\me", None), "cmd", &homeless, Some(home)),
-            "cmd"
-        );
+        assert_eq!(session_title(&Context::default(), "cmd"), "cmd");
+    }
+
+    #[test]
+    fn the_header_shows_home_as_a_tilde() {
+        let home = Some(Path::new(r"C:\Users\me"));
+        assert_eq!(place(&ctx(r"C:\Users\me", None), home), "~");
+        assert_eq!(place(&ctx(r"C:\Users\me\code", None), home), r"~\code");
+        assert_eq!(place(&ctx(r"D:\work", None), home), r"D:\work");
+        assert_eq!(place(&Context::default(), home), "");
     }
 
     #[test]
     fn the_sidebar_hit_tests_what_it_draws() {
         let mut ui = Ui::new(1.0);
-        let projects = vec![Project {
-            name: "aeon".into(),
-            path: Some(PathBuf::from(r"C:\code\aeon")),
-            sessions: vec![0, 1],
-            pinned: false,
-        }];
-        let sb = Sidebar::new(&mut ui, 256, 800, &projects, Some(&Pill::Available));
+        let sb = Sidebar::new(&mut ui, 256, 800, 2, Some(&Pill::Available));
         assert_eq!(sb.hit(100.0, 50.0), Some(Hit::NewSession));
-        assert_eq!(sb.hit(240.0, 50.0), Some(Hit::NewSessionMenu));
-        // New session 40..72, gap to 78, project 78..110, sessions 110..146..182.
-        assert_eq!(sb.hit(100.0, 90.0), Some(Hit::Project(0)));
-        assert_eq!(sb.hit(240.0, 90.0), Some(Hit::Pin(0)));
-        assert_eq!(sb.hit(100.0, 120.0), Some(Hit::Session(0)));
-        assert_eq!(sb.hit(100.0, 160.0), Some(Hit::Session(1)));
+        assert_eq!(sb.hit(240.0, 50.0), Some(Hit::NewSession));
+        // New session 40..72, a gap to 78, then sessions 78..128..178.
+        assert_eq!(sb.hit(100.0, 90.0), Some(Hit::Session(0)));
+        assert_eq!(sb.hit(240.0, 90.0), Some(Hit::Mute(0)));
+        assert_eq!(sb.hit(100.0, 135.0), Some(Hit::Session(1)));
+        assert_eq!(sb.hit(100.0, 185.0), None);
         assert_eq!(sb.hit(20.0, 770.0), Some(Hit::Settings));
         assert_eq!(sb.hit(240.0, 770.0), Some(Hit::Update));
     }

@@ -11,8 +11,8 @@ use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS,
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH,
     DIB_RGB_COLORS, DeleteDC, DeleteObject, GdiFlush, GetTextExtentExPointW, GetTextExtentPoint32W,
-    HBITMAP, HDC, HFONT, OUT_TT_PRECIS, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
-    TextOutW,
+    GetTextMetricsW, HBITMAP, HDC, HFONT, OUT_TT_PRECIS, SelectObject, SetBkMode, SetTextColor,
+    TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 
 /// Which family a run is set in.
@@ -24,7 +24,24 @@ pub enum Face {
     Code,
     /// Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets before it.
     Icons,
+    /// The terminal's fallbacks for glyphs its font lacks, by index into
+    /// [`FALLBACK_FACES`].
+    Fallback(u8),
 }
+
+/// Where the terminal looks for a glyph its font lacks, in order: symbols,
+/// the Nerd Fonts prompt themes and Terminal-Icons draw from (when
+/// installed), then emoji, as Windows draws them in one colour.
+pub const FALLBACK_FACES: &[&str] = &[
+    "Segoe UI Symbol",
+    "Symbols Nerd Font Mono",
+    "CaskaydiaCove Nerd Font Mono",
+    "FiraCode Nerd Font Mono",
+    "JetBrainsMono Nerd Font Mono",
+    "Hack Nerd Font Mono",
+    "MesloLGS NF",
+    "Segoe UI Emoji",
+];
 
 /// A rendered line of text: per-channel ClearType coverage, so it can be
 /// blended in any colour over any background.
@@ -92,10 +109,17 @@ impl TextRenderer {
     fn select(&mut self, face: Face, px: u32, weight: u16) {
         let font = *self.fonts.entry((face, px, weight)).or_insert_with(|| {
             let code = wide("Cascadia Mono");
+            let fallback = match face {
+                Face::Fallback(i) => {
+                    wide(FALLBACK_FACES.get(usize::from(i)).copied().unwrap_or(""))
+                }
+                _ => Vec::new(),
+            };
             let name = match face {
                 Face::Ui => &self.ui_face,
                 Face::Code => &code,
                 Face::Icons => &self.icon_face,
+                Face::Fallback(_) => &fallback,
             };
             // SAFETY: `name` is NUL-terminated and outlives the call. A negative
             // height asks for the em size rather than the cell height.
@@ -121,6 +145,16 @@ impl TextRenderer {
         // SAFETY: both handles are valid; the previous font needs no restoring
         // because every font this DC sees is owned by `fonts`.
         unsafe { SelectObject(self.dc, font) };
+    }
+
+    /// How far the baseline is below the top of what `render` draws.
+    pub fn ascent(&mut self, face: Face, px: u32, weight: u16) -> u32 {
+        self.select(face, px, weight);
+        // SAFETY: TEXTMETRICW is plain data that GetTextMetricsW fills.
+        let mut metrics: TEXTMETRICW = unsafe { std::mem::zeroed() };
+        // SAFETY: `metrics` is valid for writes; the DC has a font selected.
+        unsafe { GetTextMetricsW(self.dc, &mut metrics) };
+        metrics.tmAscent.max(0) as u32
     }
 
     /// Width and line height of `text`.

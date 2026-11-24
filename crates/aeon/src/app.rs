@@ -28,8 +28,8 @@ use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 use crate::chrome::{
-    self, BlockAction, BlockMark, BlockStatus, HeaderHit, Hit, Panel, PanelData, PanelHit,
-    PanelServer, Pill, Project, Rect, RowState, SessionRow, Sidebar, SidebarState, TermArea,
+    self, BlockAction, BlockMark, HeaderHit, Hit, Panel, PanelData, PanelHit, PanelServer, Pill,
+    Project, Rect, RowState, SessionRow, Sidebar, SidebarState, TermArea,
 };
 use crate::font::{self, Atlas};
 use crate::input::{self, Button, MouseAction};
@@ -57,13 +57,15 @@ pub enum Event {
     /// What the palette searches beyond the window, loaded the first time it
     /// opens.
     Catalog(Catalog),
+    /// The shells, distros, and hosts a new session can start, looked up
+    /// once at start.
+    Profiles(Vec<Profile>),
 }
 
-/// Installed apps, programs on PATH, and new-session profiles.
+/// Installed apps and programs on PATH.
 pub struct Catalog {
     apps: Vec<aeon_launcher::App>,
     commands: HashSet<String>,
-    profiles: Vec<Profile>,
 }
 
 /// How this window was started.
@@ -81,7 +83,7 @@ pub struct Launch {
 }
 
 /// A shell other than the configured one, chosen from a profile.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub program: String,
     pub args: Vec<String>,
@@ -112,6 +114,7 @@ pub struct App {
     finder_error: Option<String>,
     catalog: Option<Catalog>,
     catalog_requested: Option<Instant>,
+    profiles: Vec<Profile>,
     view: Option<View>,
     /// Every shell, in every pane of every session.
     sessions: Vec<Session>,
@@ -158,8 +161,6 @@ pub struct App {
     focused: bool,
     /// The prompt line of the command block under the mouse.
     hover_block: Option<u64>,
-    /// Projects kept in the sidebar with no sessions open.
-    pinned: Vec<PathBuf>,
     /// The project panel at the right of the terminal.
     panel_visible: bool,
     /// VS Code's `code.cmd`, when it is installed.
@@ -178,7 +179,7 @@ enum Attention {
 
 /// Commands shorter than this never notify: you were probably watching.
 const NOTIFY_AFTER: Duration = Duration::from_secs(10);
-/// Command timings kept per session, by prompt line.
+/// Command timings kept per session, by block.
 const TIMINGS_KEPT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +279,8 @@ struct Rename {
     /// The title when editing began: committing it unchanged keeps the
     /// title automatic.
     original: String,
+    /// All of `text` is selected, as when editing begins: typing replaces it.
+    selected: bool,
 }
 
 /// Where everything goes in a window of a given size.
@@ -314,12 +317,14 @@ impl App {
                 "Local\\AeonWindows"
             });
         let dropdown = launch.dropdown;
-        // Finding VS Code means walking PATH; keep that off the UI thread.
-        let editor_proxy = proxy.clone();
+        // Finding VS Code and the shells means walking PATH and reading the
+        // registry; keep that off the UI thread.
+        let lookup = proxy.clone();
         let _ = std::thread::Builder::new()
-            .name("editor".into())
+            .name("lookup".into())
             .spawn(move || {
-                let _ = editor_proxy.send_event(Event::Editor(find_on_path("code.cmd")));
+                let _ = lookup.send_event(Event::Editor(find_on_path("code.cmd")));
+                let _ = lookup.send_event(Event::Profiles(aeon_launcher::profiles::detect()));
             });
         Self {
             proxy,
@@ -335,6 +340,7 @@ impl App {
             finder_error: None,
             catalog: None,
             catalog_requested: None,
+            profiles: Vec::new(),
             view: None,
             sessions: Vec::new(),
             groups: Vec::new(),
@@ -344,7 +350,6 @@ impl App {
             restore: Some((saved.sessions, saved.active)),
             rename: None,
             sidebar_visible: saved.sidebar,
-            pinned: saved.pinned,
             panel_visible: saved.panel,
             editor: None,
             header_hover: None,
@@ -375,7 +380,11 @@ impl App {
         let font = font::load(self.config.font.path.as_deref())?;
         // The window starts at the default scale and is resized on the first
         // ScaleFactorChanged, so size it from 96-DPI metrics.
-        let atlas = Atlas::new(Rc::new(font), points_to_px(self.config.font.size, 1.0));
+        let atlas = Atlas::new(
+            Rc::new(font),
+            points_to_px(self.config.font.size, 1.0),
+            self.config.font.line_height,
+        );
         let header = if self.config.bar.enabled {
             HEADER_HEIGHT as u32
         } else {
@@ -476,13 +485,7 @@ impl App {
         program: Option<Program>,
         (rows, cols): (usize, usize),
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let shell = self.shell_command(cwd, run.as_deref(), program.as_ref());
-        let shell_name = std::path::Path::new(&shell.program)
-            .file_stem()
-            .map_or_else(
-                || "shell".to_owned(),
-                |n| n.to_string_lossy().to_lowercase(),
-            );
+        let (shell, shell_name) = self.shell_command(cwd, run.as_deref(), program.as_ref());
         let mut pty = Pty::spawn(&shell, pty_size(rows, cols))?;
         let output = pty.take_reader().ok_or("pty reader already taken")?;
         let input = pty.take_writer().ok_or("pty writer already taken")?;
@@ -587,32 +590,26 @@ impl App {
         cwd: Option<PathBuf>,
         run: Option<&str>,
         program: Option<&Program>,
-    ) -> aeon_pty::Command {
+    ) -> (aeon_pty::Command, String) {
         let shell = &self.config.shell;
         let mut command = match (program, &shell.program) {
             (Some(p), _) => aeon_pty::Command::new(&p.program).args(&p.args),
             (None, Some(program)) => aeon_pty::Command::new(program).args(&shell.args),
             (None, None) => aeon_pty::default_shell(),
         };
+        let name = aeon_pty::describe(&command);
         if shell.integration {
             command = aeon_pty::integrate(command, run);
+            if !shell.profile {
+                command = command.env("AEON_NO_PROFILE", "1");
+            }
         }
         command.cwd = cwd.or_else(|| shell.cwd.clone()).or_else(start_dir);
-        command
+        let command = command
             .env("TERM_PROGRAM", "aeon")
             .env("TERM_PROGRAM_VERSION", crate::VERSION)
-            .env("COLORTERM", "truecolor")
-    }
-
-    /// A new session starts where the active one is.
-    fn new_session(&mut self) {
-        let cwd = self
-            .sessions
-            .get(self.active)
-            .and_then(|s| s.context.cwd.clone());
-        if let Err(e) = self.open_session(cwd, None) {
-            eprintln!("aeon: could not open a session: {e}");
-        }
+            .env("COLORTERM", "truecolor");
+        (command, name)
     }
 
     /// Closes pane `index`. Its sibling takes its space; a session's last
@@ -788,10 +785,12 @@ impl App {
     fn grid_in(&self, view: &View, rect: Rect) -> ((u32, u32), usize, usize) {
         let scale = view.window.scale_factor();
         let pad = (f64::from(self.config.window.padding) * scale).round() as u32;
-        let w = rect.w.saturating_sub(2 * pad);
+        // The margin left of the text holds a block's bar and copy button.
+        let gutter = view.ui.px(chrome::GUTTER);
+        let w = rect.w.saturating_sub(2 * pad + gutter);
         let h = rect.h.saturating_sub(2 * pad);
         (
-            (rect.x + pad, rect.y + pad),
+            (rect.x + pad + gutter, rect.y + pad),
             (h / view.atlas.cell_height).max(1) as usize,
             (w / view.atlas.cell_width).max(1) as usize,
         )
@@ -833,7 +832,7 @@ impl App {
         for event in session.term.take_events() {
             match event {
                 TermEvent::CommandStarted { command } if !command.is_empty() => {
-                    let prompt = session.term.blocks().last().map_or(0, |b| b.prompt);
+                    let prompt = session.term.blocks().last().map_or(0, |b| b.id);
                     session.running = Some((Instant::now(), prompt));
                     session.progress = None;
                 }
@@ -928,43 +927,16 @@ impl App {
         let Some(session) = self.sessions.get(index) else {
             return (Vec::new(), Vec::new());
         };
-        let term = &session.term;
-        if term.modes().alt_screen {
-            return (Vec::new(), Vec::new());
-        }
-        let first = term.screen_line().saturating_sub(session.scroll as u64);
-        let rows = term.grid().rows() as u64;
-        let mut marks = Vec::new();
-        let mut tints = Vec::new();
-        for block in term.blocks() {
-            if block.command.is_empty() || block.output.is_none() {
-                continue;
-            }
-            let took = session
+        let took = |id: u64| {
+            session
                 .timings
                 .iter()
                 .rev()
-                .find(|(p, _)| *p == block.prompt)
-                .map(|(_, d)| *d);
-            let status = match (block.end, block.exit) {
-                (None, _) => BlockStatus::Running,
-                (Some(_), Some(0)) => BlockStatus::Passed(took),
-                (Some(end), Some(code)) => {
-                    tints.push((block.prompt, end));
-                    BlockStatus::Failed(code, took)
-                }
-                (Some(_), None) => BlockStatus::Ended,
-            };
-            if (first..first + rows).contains(&block.prompt) {
-                marks.push(BlockMark {
-                    row: (block.prompt - first) as u32,
-                    prompt: block.prompt,
-                    status,
-                    hovered: index == self.active && self.hover_block == Some(block.prompt),
-                });
-            }
-        }
-        (marks, tints)
+                .find(|(t, _)| *t == id)
+                .map(|(_, d)| *d)
+        };
+        let hovered = self.hover_block.filter(|_| index == self.active);
+        chrome::block_marks(&session.term, session.scroll, &took, hovered)
     }
 
     fn term_area(&self, index: usize, rect: Rect) -> Option<TermArea> {
@@ -998,6 +970,10 @@ impl App {
             return;
         };
         match action {
+            BlockAction::CopyCommand => {
+                let owner = self.view.as_ref().map_or(0, |v| hwnd(&v.window));
+                sys::set_clipboard(owner, block.command.trim());
+            }
             BlockAction::CopyOutput => {
                 let (Some(output), Some(end)) = (block.output, block.end) else {
                     return;
@@ -1074,7 +1050,6 @@ impl App {
             state::Saved {
                 sidebar: self.sidebar_visible,
                 panel: self.panel_visible,
-                pinned: self.pinned.clone(),
                 sessions: Vec::new(),
                 active: 0,
             },
@@ -1132,7 +1107,6 @@ impl App {
                 })
             })
             .collect();
-        let home = self.home.as_deref();
         let servers = panes
             .iter()
             .flat_map(|&i| {
@@ -1140,7 +1114,7 @@ impl App {
                 let title = s
                     .task
                     .clone()
-                    .unwrap_or_else(|| chrome::session_title(&s.context, &s.shell, &project, home));
+                    .unwrap_or_else(|| chrome::session_title(&s.context, &s.shell));
                 s.context.servers.iter().map(move |server| PanelServer {
                     name: server.name.clone(),
                     port: server.port,
@@ -1276,7 +1250,7 @@ impl App {
                 return (None, None);
             };
             let width = view.window.inner_size().width;
-            let hit = chrome::header_buttons(&mut view.ui, width, editor)
+            let hit = chrome::header_buttons(&mut view.ui, layout.sidebar, width, editor)
                 .into_iter()
                 .find(|(r, _)| r.contains(x, y))
                 .map(|(_, h)| h);
@@ -1300,15 +1274,12 @@ impl App {
         let (Some(view), Some(session)) = (&self.view, self.sessions.get(self.active)) else {
             return;
         };
-        let place = session
-            .context
-            .cwd
-            .as_deref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned());
-        let mut title = match place {
-            Some(place) => format!("{place} \u{2014} Aeon"),
-            None => format!("Aeon {}", crate::VERSION),
+        let name = self.active_group().map(|g| self.group_title(g));
+        let mut title = match name {
+            Some(name) if name != session.shell => {
+                format!("{name} \u{b7} {} \u{2014} Aeon", session.shell)
+            }
+            _ => format!("{} \u{2014} Aeon", session.shell),
         };
         if let Some(error) = &self.config_error {
             title.push_str(&format!(" (config ignored: {error})"));
@@ -1324,8 +1295,9 @@ impl App {
 
     fn layout(&self, view: &View) -> Layout {
         let size = view.window.inner_size();
-        let sidebar = if self.sidebar_visible {
-            view.ui.px(SIDEBAR_WIDTH).min(size.width / 2)
+        // A window too narrow for both gives the terminal all of it.
+        let sidebar = if self.sidebar_visible && size.width >= view.ui.px(SIDEBAR_WIDTH * 2.4) {
+            view.ui.px(SIDEBAR_WIDTH)
         } else {
             0
         };
@@ -1357,8 +1329,8 @@ impl App {
         }
     }
 
-    /// Sessions grouped into projects, as the sidebar shows them. A
-    /// session belongs where its focused pane is.
+    /// Sessions grouped into projects, for the project panel and
+    /// notifications. A session belongs where its focused pane is.
     fn projects(&self) -> Vec<Project> {
         let contexts: Vec<&Context> = self
             .groups
@@ -1370,20 +1342,15 @@ impl App {
                     .context
             })
             .collect();
-        chrome::projects(&contexts, self.home.as_deref(), &self.pinned)
+        chrome::projects(&contexts, self.home.as_deref())
     }
 
-    /// Moves `step` sessions along the sidebar's order, wrapping around.
+    /// Moves `step` sessions along the sidebar, wrapping around.
     fn step(&mut self, step: isize) {
-        let order = chrome::display_order(&self.projects());
-        let Some(g) = self.active_group() else {
-            return;
-        };
-        let Some(at) = order.iter().position(|&i| i == g) else {
-            return;
-        };
-        let n = order.len() as isize;
-        self.select(order[(at as isize + step).rem_euclid(n) as usize]);
+        let n = self.groups.len() as isize;
+        if let Some(g) = self.active_group() {
+            self.select((g as isize + step).rem_euclid(n) as usize);
+        }
     }
 
     /// What the sidebar has under (`x`, `y`), if anything.
@@ -1392,7 +1359,7 @@ impl App {
         if x >= f64::from(layout.sidebar) {
             return None;
         }
-        let projects = self.projects();
+        let sessions = self.groups.len();
         let pill = self.pill();
         let view = self.view.as_mut()?;
         let height = view.window.inner_size().height;
@@ -1400,7 +1367,7 @@ impl App {
             &mut view.ui,
             layout.sidebar,
             height,
-            &projects,
+            sessions,
             pill.as_ref(),
         )
         .hit(x, y)
@@ -1430,8 +1397,8 @@ impl App {
         self.request_redraw();
     }
 
-    /// Session `g`'s title: its name, its task, or where its focused pane is.
-    fn group_title(&self, g: usize, projects: &[Project]) -> String {
+    /// Session `g`'s title: its name, its task, or its repository or shell.
+    fn group_title(&self, g: usize) -> String {
         let group = &self.groups[g];
         if let Some(name) = &group.name {
             return name.clone();
@@ -1442,13 +1409,20 @@ impl App {
         if let Some(task) = &s.task {
             return task.clone();
         }
-        projects
-            .iter()
-            .find(|p| p.sessions.contains(&g))
-            .map_or_else(
-                || s.shell.clone(),
-                |p| chrome::session_title(&s.context, &s.shell, p, self.home.as_deref()),
-            )
+        chrome::session_title(&s.context, &s.shell)
+    }
+
+    /// What the sidebar shows under session `g`'s title: its shell, or
+    /// where it is when the title already names the shell.
+    fn group_detail(&self, g: usize, title: &str) -> String {
+        let Some(s) = self.lead(&self.groups[g]) else {
+            return String::new();
+        };
+        if title == s.shell {
+            chrome::place(&s.context, self.home.as_deref())
+        } else {
+            s.shell.clone()
+        }
     }
 
     fn redraw(&mut self) {
@@ -1457,7 +1431,6 @@ impl App {
         };
         let layout = self.layout(view);
         let scale = view.window.scale_factor();
-        let projects = self.projects();
         let pill = self.pill();
         let active_group = self.active_group();
         let dividers = active_group.map_or_else(Vec::new, |g| self.pane_rects(view, g).1);
@@ -1482,7 +1455,7 @@ impl App {
         let panel = self.panel_layout(&panel_data);
         let editor = self.editor.is_some();
         let finder_rect = self.finder_rect();
-        let header_title = active_group.map(|g| self.group_title(g, &projects));
+        let header_title = active_group.map(|g| self.group_title(g));
         let rows: Vec<SessionRow> = if layout.sidebar > 0 {
             self.groups
                 .iter()
@@ -1490,14 +1463,16 @@ impl App {
                 .map(|(g, group)| {
                     let (state, unseen) = self.group_state(group);
                     let editing = self.rename.as_ref().filter(|r| r.group == g);
+                    let title = self.group_title(g);
                     SessionRow {
-                        title: editing
-                            .map_or_else(|| self.group_title(g, &projects), |r| r.text.clone()),
+                        detail: self.group_detail(g, &title),
+                        title: editing.map_or(title, |r| r.text.clone()),
                         state,
                         unseen,
                         muted: self.lead(group).is_some_and(|s| s.muted),
                         panes: group.tree.panes().len(),
                         editing: editing.is_some(),
+                        selected: editing.is_some_and(|r| r.selected),
                     }
                 })
                 .collect()
@@ -1527,7 +1502,7 @@ impl App {
         };
         if let Some(panel) = &self.settings {
             frame.pixels.fill(self.palette.canvas);
-            let geo = settings::Geometry::new(layout.sidebar, frame.width, scale);
+            let geo = settings::Geometry::new(layout.sidebar, frame.width, frame.height, scale);
             panel.draw(&mut frame, &mut view.ui, &self.palette, &geo);
         } else {
             let tint = render::blend(self.theme.bg, self.theme.ansi[1], 22);
@@ -1587,17 +1562,20 @@ impl App {
                 );
             }
             if layout.header > 0
-                && let (Some(g), Some(title)) = (active_group, &header_title)
-                && let Some(project) = projects.iter().find(|p| p.sessions.contains(&g))
+                && let Some(title) = &header_title
             {
-                let buttons = chrome::header_buttons(&mut view.ui, frame.width, editor);
+                let place = chrome::place(&session.context, self.home.as_deref());
+                let shell = (*title != session.shell).then_some(session.shell.as_str());
+                let buttons =
+                    chrome::header_buttons(&mut view.ui, layout.sidebar, frame.width, editor);
                 chrome::draw_header(
                     &mut frame,
                     &mut view.ui,
                     &self.palette,
                     layout.sidebar,
-                    project,
                     title,
+                    shell,
+                    &place,
                     &session.context,
                     &buttons,
                     self.header_hover,
@@ -1626,6 +1604,7 @@ impl App {
                     &mut view.ui,
                     &self.palette,
                     layout.header,
+                    layout.area.x + layout.area.w,
                     &find.query,
                     &count,
                 );
@@ -1636,7 +1615,7 @@ impl App {
                 &mut view.ui,
                 layout.sidebar,
                 frame.height,
-                &projects,
+                rows.len(),
                 pill.as_ref(),
             );
             chrome::draw_sidebar(
@@ -1645,7 +1624,6 @@ impl App {
                 &self.palette,
                 &sidebar,
                 &SidebarState {
-                    projects: &projects,
                     sessions: &rows,
                     active: active_group.unwrap_or(0),
                     settings_open: self.settings.is_some(),
@@ -1656,6 +1634,10 @@ impl App {
             );
         }
         if let (Some(rect), Some(launcher)) = (finder_rect, &self.finder) {
+            // The window steps back while the palette is up.
+            for pixel in frame.pixels.iter_mut() {
+                *pixel = render::blend(*pixel, 0, 72);
+            }
             finder::draw(
                 &mut frame,
                 &mut view.ui,
@@ -1692,7 +1674,6 @@ impl App {
             Zoom,
             Rename,
             Finder,
-            NewSessionMenu,
         }
         let (key, mods) = (&event.logical_key, self.modifiers);
         let keys = &self.config.keys;
@@ -1712,13 +1693,12 @@ impl App {
             (&keys.zoom_pane, Action::Zoom),
             (&keys.rename_session, Action::Rename),
             (&keys.palette, Action::Finder),
-            (&keys.new_session_menu, Action::NewSessionMenu),
         ]
         .into_iter()
         .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
         .map(|(_, action)| action);
         match action {
-            Some(Action::New) => self.new_session(),
+            Some(Action::New) => self.open_finder(true),
             Some(Action::Close) => self.close_focused(event_loop),
             Some(Action::Next) => self.step(1),
             Some(Action::Previous) => self.step(-1),
@@ -1735,7 +1715,6 @@ impl App {
             Some(Action::Zoom) => self.toggle_zoom(),
             Some(Action::Rename) => self.start_rename(),
             Some(Action::Finder) => self.open_finder(false),
-            Some(Action::NewSessionMenu) => self.open_finder(true),
             None => {
                 if let Some(handled) = self.builtin_key(key, mods) {
                     return handled;
@@ -1745,12 +1724,7 @@ impl App {
                     _ => None,
                 };
                 match digit {
-                    Some(d @ 1..=9) => {
-                        let order = chrome::display_order(&self.projects());
-                        if let Some(&i) = order.get(d - 1) {
-                            self.select(i);
-                        }
-                    }
+                    Some(d @ 1..=9) => self.select(d - 1),
                     _ => return false,
                 }
             }
@@ -1803,6 +1777,10 @@ impl App {
         // ConPTY drains its input pipe continuously; a keystroke-sized write
         // does not block the UI thread in practice.
         let _ = session.input.write_all(&bytes);
+        if event.logical_key == Key::Named(NamedKey::Enter) && mods.is_empty() {
+            session.term.command_entered();
+            self.shell_events(self.active);
+        }
         self.request_redraw();
     }
 
@@ -1814,11 +1792,12 @@ impl App {
         if !self.sidebar_visible {
             self.toggle_sidebar();
         }
-        let title = self.group_title(g, &self.projects());
+        let title = self.group_title(g);
         self.rename = Some(Rename {
             group: g,
             text: title.clone(),
             original: title,
+            selected: true,
         });
         self.request_redraw();
     }
@@ -1832,8 +1811,20 @@ impl App {
         match &event.logical_key {
             Key::Named(NamedKey::Escape) => self.rename = None,
             Key::Named(NamedKey::Enter) => self.commit_rename(),
+            Key::Named(NamedKey::Backspace | NamedKey::Delete)
+                if rename.selected || self.modifiers.control_key() =>
+            {
+                rename.text.clear();
+                rename.selected = false;
+            }
             Key::Named(NamedKey::Backspace) => {
                 rename.text.pop();
+            }
+            Key::Named(
+                NamedKey::ArrowLeft | NamedKey::ArrowRight | NamedKey::Home | NamedKey::End,
+            ) => rename.selected = false,
+            Key::Character(c) if self.modifiers.control_key() && c.eq_ignore_ascii_case("a") => {
+                rename.selected = true;
             }
             _ if self.modifiers.control_key() || self.modifiers.alt_key() => return,
             _ => {
@@ -1844,6 +1835,10 @@ impl App {
                 else {
                     return;
                 };
+                if rename.selected {
+                    rename.text.clear();
+                    rename.selected = false;
+                }
                 rename.text.push_str(text);
             }
         }
@@ -1860,6 +1855,7 @@ impl App {
         {
             group.name = (!name.is_empty()).then(|| name.to_owned());
             self.save_state();
+            self.update_title();
         }
         self.request_redraw();
     }
@@ -2464,7 +2460,7 @@ impl App {
         let layout = self.layout(view);
         if x >= f64::from(layout.sidebar) {
             if let Some(panel) = &mut self.settings {
-                let geo = settings::Geometry::new(layout.sidebar, size.width, scale);
+                let geo = settings::Geometry::new(layout.sidebar, size.width, size.height, scale);
                 let outcome = panel.click(x, y, &geo, &self.config);
                 self.settings_outcome(outcome);
                 return;
@@ -2490,35 +2486,7 @@ impl App {
                     self.update_command(command);
                 }
             }
-            Some(Hit::NewSession) => self.new_session(),
-            Some(Hit::NewSessionMenu) => self.open_finder(true),
-            Some(Hit::Project(i)) => {
-                let projects = self.projects();
-                let Some(project) = projects.get(i) else {
-                    return;
-                };
-                self.settings = None;
-                match project.sessions.first() {
-                    Some(&first) => self.select(first),
-                    None => {
-                        if let Err(e) = self.open_session(project.path.clone(), None) {
-                            eprintln!("aeon: could not open a session: {e}");
-                        }
-                    }
-                }
-                self.request_redraw();
-            }
-            Some(Hit::Pin(i)) => {
-                if let Some(path) = self.projects().get(i).and_then(|p| p.path.clone()) {
-                    if let Some(at) = self.pinned.iter().position(|p| *p == path) {
-                        self.pinned.remove(at);
-                    } else {
-                        self.pinned.push(path);
-                    }
-                    self.save_state();
-                    self.request_redraw();
-                }
-            }
+            Some(Hit::NewSession) => self.open_finder(true),
             Some(Hit::Mute(g)) => {
                 if let Some(group) = self.groups.get(g) {
                     let muted = !self.lead(group).is_some_and(|s| s.muted);
@@ -2564,7 +2532,8 @@ impl App {
         let clickable = hover
             || (x >= f64::from(layout.sidebar)
                 && self.settings.as_ref().is_some_and(|panel| {
-                    let geo = settings::Geometry::new(layout.sidebar, size.width, scale);
+                    let geo =
+                        settings::Geometry::new(layout.sidebar, size.width, size.height, scale);
                     panel.is_clickable(x, y, &geo)
                 }));
         let in_terminal = self.cell_at(x, y).is_some();
@@ -2576,7 +2545,7 @@ impl App {
                 let (marks, _) = self.visible_blocks(self.active);
                 marks
                     .iter()
-                    .find(|m| m.prompt == point.line)
+                    .find(|m| (m.prompt..m.prompt + u64::from(m.span)).contains(&point.line))
                     .map(|m| m.prompt)
             });
         if block != self.hover_block {
@@ -2636,7 +2605,7 @@ impl App {
         if font_changed && let Some(view) = &mut self.view {
             let font = font::load(config.font.path.as_deref())?;
             let px = points_to_px(config.font.size + self.zoom, view.window.scale_factor());
-            view.atlas = Atlas::new(Rc::new(font), px);
+            view.atlas = Atlas::new(Rc::new(font), px, config.font.line_height);
         }
         self.theme = Theme::new(&config.colors);
         self.palette = Palette::new(&self.theme);
@@ -2750,9 +2719,9 @@ impl App {
             })
             .collect();
         self.next_id += ids.len() as u64;
-        for ((&id, cwd), size) in ids.iter().zip(&saved.panes).zip(sizes) {
-            let cwd = cwd.is_dir().then(|| cwd.clone());
-            if let Err(e) = self.spawn_pane(id, cwd, None, None, size) {
+        for ((&id, pane), size) in ids.iter().zip(&saved.panes).zip(sizes) {
+            let cwd = pane.cwd.is_dir().then(|| pane.cwd.clone());
+            if let Err(e) = self.spawn_pane(id, cwd, None, pane.program.clone(), size) {
                 eprintln!("aeon: could not restore a session: {e}");
                 if !tree.remove(id) {
                     return;
@@ -2779,10 +2748,10 @@ impl App {
                     .tree
                     .panes()
                     .into_iter()
-                    .map(|id| {
-                        self.session_index(id)
-                            .and_then(|i| self.sessions[i].context.cwd.clone())
-                            .unwrap_or_default()
+                    .filter_map(|id| self.session_index(id))
+                    .map(|i| state::Pane {
+                        cwd: self.sessions[i].context.cwd.clone().unwrap_or_default(),
+                        program: self.sessions[i].program.clone(),
                     })
                     .collect(),
             })
@@ -2795,11 +2764,10 @@ impl App {
     fn open_finder(&mut self, menu: bool) {
         self.rename = None;
         let projects = self.projects();
-        let sessions = chrome::display_order(&projects)
-            .into_iter()
+        let sessions = (0..self.groups.len())
             .map(|g| Entry {
                 id: g,
-                title: self.group_title(g, &projects),
+                title: self.group_title(g),
                 detail: projects
                     .iter()
                     .find(|p| p.sessions.contains(&g))
@@ -2840,7 +2808,7 @@ impl App {
             search_url: self.config.launcher.search_url.clone(),
             sessions,
             tasks,
-            profiles: catalog.map(|c| c.profiles.clone()).unwrap_or_default(),
+            profiles: crate::launcher::with_default(&self.config, self.profiles.clone()),
         };
         self.finder = Some(if menu {
             Launcher::menu(sources)
@@ -2860,7 +2828,6 @@ impl App {
                     let _ = proxy.send_event(Event::Catalog(Catalog {
                         apps: apps::load(),
                         commands: apps::path_commands(),
-                        profiles: aeon_launcher::profiles::detect(),
                     }));
                 });
         }
@@ -3000,6 +2967,9 @@ impl App {
                 self.run_task(*i);
                 Ok(())
             }
+            Action::NewSession(profile) if profile.kind == Kind::Default => self
+                .open_session(Some(cwd.clone()), None)
+                .map_err(|e| e.to_string()),
             Action::NewSession(profile) if profile.kind == Kind::Admin => {
                 crate::launcher::open_profile(profile, &cwd).map_err(|e| e.to_string())
             }
@@ -3132,6 +3102,9 @@ impl ApplicationHandler<Event> for App {
                 // left; never let it overwrite a newer one.
                 if context.cwd == session.context.cwd {
                     session.context = context;
+                    if index == self.active {
+                        self.update_title();
+                    }
                     self.request_redraw();
                 }
             }
@@ -3145,11 +3118,20 @@ impl ApplicationHandler<Event> for App {
                     apps::count_uses(&mut catalog.apps, &history::app_uses(&dir));
                 }
                 if let Some(finder) = &mut self.finder {
-                    finder.set_profiles(catalog.profiles.clone());
                     finder.set_catalog(catalog.apps.clone(), catalog.commands.clone());
                     self.request_redraw();
                 }
                 self.catalog = Some(catalog);
+            }
+            Event::Profiles(profiles) => {
+                if let Some(finder) = &mut self.finder {
+                    finder.set_profiles(crate::launcher::with_default(
+                        &self.config,
+                        profiles.clone(),
+                    ));
+                    self.request_redraw();
+                }
+                self.profiles = profiles;
             }
         }
     }
@@ -3224,21 +3206,28 @@ mod state {
     pub struct Saved {
         pub sidebar: bool,
         pub panel: bool,
-        pub pinned: Vec<PathBuf>,
         /// The first window's sessions when it closed, to open again.
         pub sessions: Vec<Group>,
         /// Which of them was shown.
         pub active: usize,
     }
 
-    /// A saved session: its name, how its panes were split, and the folder
-    /// each pane was in.
+    /// A saved session: its name, how its panes were split, and where each
+    /// pane was and what it ran.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct Group {
         pub name: Option<String>,
         /// [`crate::panes::Tree::shape`].
         pub shape: String,
-        pub panes: Vec<PathBuf>,
+        pub panes: Vec<Pane>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Pane {
+        pub cwd: PathBuf,
+        /// A shell from a profile, such as a WSL distro; `None` for the
+        /// configured one.
+        pub program: Option<super::Program>,
     }
 
     fn path() -> Option<PathBuf> {
@@ -3256,7 +3245,6 @@ mod state {
         let mut saved = Saved {
             sidebar: true,
             panel: false,
-            pinned: Vec::new(),
             sessions: Vec::new(),
             active: 0,
         };
@@ -3264,7 +3252,6 @@ mod state {
             match line.trim().split_once('=') {
                 Some(("sidebar", v)) => saved.sidebar = v != "hidden",
                 Some(("panel", v)) => saved.panel = v == "shown",
-                Some(("pinned", v)) if !v.is_empty() => saved.pinned.push(PathBuf::from(v)),
                 Some(("session", v)) => saved.sessions.push(Group {
                     name: (!v.is_empty()).then(|| v.to_owned()),
                     shape: ".".to_owned(),
@@ -3277,7 +3264,28 @@ mod state {
                 }
                 Some(("pane", v)) => {
                     if let Some(group) = saved.sessions.last_mut() {
-                        group.panes.push(PathBuf::from(v));
+                        group.panes.push(Pane {
+                            cwd: PathBuf::from(v),
+                            program: None,
+                        });
+                    }
+                }
+                Some(("shell", v)) => {
+                    if let Some(pane) = saved.sessions.last_mut().and_then(|g| g.panes.last_mut()) {
+                        pane.program = Some(super::Program {
+                            program: v.to_owned(),
+                            args: Vec::new(),
+                        });
+                    }
+                }
+                Some(("arg", v)) => {
+                    if let Some(program) = saved
+                        .sessions
+                        .last_mut()
+                        .and_then(|g| g.panes.last_mut())
+                        .and_then(|p| p.program.as_mut())
+                    {
+                        program.args.push(v.to_owned());
                     }
                 }
                 Some(("active", v)) => saved.active = v.parse().unwrap_or(0),
@@ -3294,9 +3302,6 @@ mod state {
             shown(saved.sidebar),
             shown(saved.panel)
         );
-        for path in &saved.pinned {
-            text.push_str(&format!("pinned={}\n", path.display()));
-        }
         for group in &saved.sessions {
             text.push_str(&format!(
                 "session={}\nshape={}\n",
@@ -3304,7 +3309,13 @@ mod state {
                 group.shape
             ));
             for pane in &group.panes {
-                text.push_str(&format!("pane={}\n", pane.display()));
+                text.push_str(&format!("pane={}\n", pane.cwd.display()));
+                if let Some(program) = &pane.program {
+                    text.push_str(&format!("shell={}\n", program.program));
+                    for arg in &program.args {
+                        text.push_str(&format!("arg={arg}\n"));
+                    }
+                }
             }
         }
         if !saved.sessions.is_empty() {
@@ -3334,34 +3345,45 @@ mod state {
     mod tests {
         use super::*;
 
+        fn pane(cwd: &str, program: Option<super::super::Program>) -> Pane {
+            Pane {
+                cwd: PathBuf::from(cwd),
+                program,
+            }
+        }
+
         #[test]
         fn state_round_trips_and_reads_old_files() {
             let saved = Saved {
                 sidebar: false,
                 panel: true,
-                pinned: vec![PathBuf::from(r"C:\code\api")],
                 sessions: vec![
                     Group {
                         name: Some("api server".into()),
                         shape: "r..".into(),
-                        panes: vec![PathBuf::from(r"C:\code\api"), PathBuf::from(r"C:\code")],
+                        panes: vec![pane(r"C:\code\api", None), pane(r"C:\code", None)],
                     },
                     Group {
                         name: None,
                         shape: ".".into(),
-                        panes: vec![PathBuf::from(r"C:\Users\me")],
+                        panes: vec![pane(
+                            r"C:\Users\me",
+                            Some(super::super::Program {
+                                program: "wsl.exe".into(),
+                                args: vec!["-d".into(), "kali-linux".into()],
+                            }),
+                        )],
                     },
                 ],
                 active: 1,
             };
             let back = parse(&format(&saved));
             assert!(!back.sidebar && back.panel);
-            assert_eq!(back.pinned, saved.pinned);
             assert_eq!(back.sessions, saved.sessions);
             assert_eq!(back.active, 1);
-            // The file before this version held only the sidebar.
-            let old = parse("sidebar=hidden\n");
-            assert!(!old.sidebar && !old.panel && old.pinned.is_empty());
+            // Older files held only the sidebar, or pinned projects too.
+            let old = parse("sidebar=hidden\npinned=C:\\code\\api\n");
+            assert!(!old.sidebar && !old.panel);
             assert!(old.sessions.is_empty());
         }
     }

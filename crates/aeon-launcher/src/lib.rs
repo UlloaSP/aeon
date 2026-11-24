@@ -110,7 +110,7 @@ impl Builtin {
 }
 
 /// `theme`, `theme dark`, `theme light`, and their Spanish names, matched by
-/// prefix so `th` already offers them.
+/// prefix so `the` already offers them; `te` is still too many other words.
 fn builtins(query: &str) -> Vec<Builtin> {
     let lower = query.to_lowercase();
     let mut words = lower.split_whitespace();
@@ -118,7 +118,7 @@ fn builtins(query: &str) -> Vec<Builtin> {
         return Vec::new();
     };
     let prefix_of = |word: &str, names: &[&str]| names.iter().any(|n| n.starts_with(word));
-    if first.chars().count() < 2 || !prefix_of(first, &["theme", "tema"]) {
+    if first.chars().count() < 3 || !prefix_of(first, &["theme", "tema"]) {
         return Vec::new();
     }
     match (words.next(), words.next()) {
@@ -699,7 +699,7 @@ mod tests {
     #[test]
     fn theme_offers_toggle_dark_and_light() {
         let mut l = launcher(&[]);
-        l.insert("th");
+        l.insert("the");
         assert_eq!(
             l.items()[..3],
             [

@@ -16,6 +16,9 @@ pub struct Profile {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
+    /// The configured shell, first in the menu; its program is the window's
+    /// own setting, so `program` is empty.
+    Default,
     Shell,
     Wsl,
     Ssh,
@@ -26,6 +29,7 @@ impl Kind {
     /// The word the list shows beside a profile, and that a query matches.
     pub fn word(self) -> &'static str {
         match self {
+            Kind::Default => "Default",
             Kind::Shell => "Shell",
             Kind::Wsl => "WSL",
             Kind::Ssh => "SSH",
@@ -35,7 +39,7 @@ impl Kind {
 }
 
 impl Profile {
-    fn new(label: &str, kind: Kind, program: &str, args: &[&str]) -> Self {
+    pub fn new(label: &str, kind: Kind, program: &str, args: &[&str]) -> Self {
         Self {
             label: label.to_owned(),
             kind,

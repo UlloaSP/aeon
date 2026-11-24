@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 mod conpty;
 mod shell;
 
-pub use shell::integrate;
+pub use shell::{describe, integrate};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PtySize {

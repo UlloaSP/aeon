@@ -219,7 +219,7 @@ impl Resident {
             apps: self.apps.clone(),
             commands: self.commands.clone(),
             search_url: self.config.launcher.search_url.clone(),
-            profiles: self.profiles.clone(),
+            profiles: with_default(&self.config, self.profiles.clone()),
             ..Sources::default()
         });
         self.load_apps_if_stale();
@@ -584,11 +584,42 @@ pub(crate) fn open_profile(profile: &Profile, dir: &Path) -> std::io::Result<()>
         };
     }
     let mut command = std::process::Command::new(exe);
-    command.arg("--shell").arg(&profile.program);
-    for arg in &profile.args {
-        command.arg("--arg").arg(arg);
+    if profile.kind != Kind::Default {
+        command.arg("--shell").arg(&profile.program);
+        for arg in &profile.args {
+            command.arg("--arg").arg(arg);
+        }
     }
     command.current_dir(dir).spawn().map(drop)
+}
+
+/// The configured shell as a profile, first, and the detected profiles
+/// without the one it already is.
+pub(crate) fn with_default(config: &Config, mut profiles: Vec<Profile>) -> Vec<Profile> {
+    let program = config.shell.program.clone().unwrap_or_else(|| {
+        aeon_pty::default_shell()
+            .program
+            .to_string_lossy()
+            .into_owned()
+    });
+    let stem = |program: &str| {
+        Path::new(program)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    };
+    let default = stem(&program);
+    profiles.retain(|p| !(p.kind == Kind::Shell && stem(&p.program) == default));
+    let label = match default.as_str() {
+        "pwsh" => "PowerShell 7",
+        "powershell" => "Windows PowerShell",
+        "cmd" => "Command Prompt",
+        "wsl" => "WSL",
+        "bash" => "Git Bash",
+        other => other,
+    };
+    profiles.insert(0, Profile::new(label, Kind::Default, "", &[]));
+    profiles
 }
 
 /// The drop-down terminal's height, as a share of its monitor's.
@@ -723,7 +754,8 @@ impl ApplicationHandler<Event> for Resident {
                 }
                 self.apps = list;
                 if self.view.as_ref().and_then(|v| v.window.is_visible()) == Some(true) {
-                    self.launcher.set_profiles(self.profiles.clone());
+                    self.launcher
+                        .set_profiles(with_default(&self.config, self.profiles.clone()));
                     self.launcher
                         .set_catalog(self.apps.clone(), self.commands.clone());
                     self.resize();
