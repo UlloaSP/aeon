@@ -44,6 +44,8 @@ const WIDTH: f64 = 640.0;
 
 pub enum Event {
     Hotkey,
+    /// The drop-down terminal's hotkey.
+    Dropdown,
     /// The installed apps, from a background load.
     Catalog {
         apps: Vec<App>,
@@ -87,6 +89,7 @@ struct Resident {
     tray: Option<sys::Tray>,
     /// Holds the global hotkey; replaced when settings change it.
     hotkey_listener: Option<sys::HotkeyListener>,
+    dropdown_listener: Option<sys::HotkeyListener>,
     config: Config,
     colors: Palette,
     hotkey: Result<Hotkey, String>,
@@ -151,6 +154,7 @@ impl Resident {
             proxy,
             tray: None,
             hotkey_listener: None,
+            dropdown_listener: None,
             colors: Palette::new(&Theme::new(&config.colors)),
             config,
             hotkey,
@@ -247,6 +251,57 @@ impl Resident {
                 self.show();
             }
         }
+        self.register_dropdown();
+    }
+
+    /// (Re)registers the drop-down terminal's hotkey, unless it is off. A
+    /// failure is said the next time the launcher opens.
+    fn register_dropdown(&mut self) {
+        self.dropdown_listener = None;
+        let keys = self.config.launcher.dropdown.trim();
+        if keys.is_empty() {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        let registered = keys
+            .parse::<Hotkey>()
+            .map_err(|e| format!("Invalid [launcher] dropdown: {e}"))
+            .and_then(|hotkey| {
+                sys::listen(hotkey, move || {
+                    let _ = proxy.send_event(Event::Dropdown);
+                })
+            });
+        match registered {
+            Ok(listener) => self.dropdown_listener = Some(listener),
+            Err(e) => self.error = Some(format!("Drop-down terminal: {e}")),
+        }
+    }
+
+    /// Shows the drop-down terminal across the top of the monitor under the
+    /// mouse, or hides it; starts one when none runs.
+    fn toggle_dropdown(&mut self) {
+        let Some(view) = &self.view else { return };
+        let Some(monitor) = cursor_monitor(&view.window) else {
+            return;
+        };
+        let (p, s) = (monitor.position(), monitor.size());
+        let rect = (
+            p.x,
+            p.y,
+            s.width as i32,
+            (s.height as f64 * DROPDOWN_HEIGHT) as i32,
+        );
+        if sys::toggle_window(aeon_launcher::DROPDOWN_CLASS, rect) {
+            return;
+        }
+        sys::allow_foreground();
+        let _ = std::env::current_exe().and_then(|exe| {
+            std::process::Command::new(exe)
+                .arg("--dropdown")
+                .current_dir(home_dir())
+                .spawn()
+                .map(drop)
+        });
     }
 
     /// A terminal saved settings: take the ones the launcher uses.
@@ -265,10 +320,13 @@ impl Resident {
             automatic: config.updates.check,
         });
         let hotkey_changed = hotkey != self.hotkey;
+        let dropdown_changed = config.launcher.dropdown != self.config.launcher.dropdown;
         self.config = config;
         self.hotkey = hotkey;
         if hotkey_changed {
             self.register_hotkey();
+        } else if dropdown_changed {
+            self.register_dropdown();
         }
         if let Some(view) = &self.view {
             view.window.request_redraw();
@@ -300,18 +358,7 @@ impl Resident {
         self.resize();
         let Some(view) = &self.view else { return };
         // Open on the monitor under the mouse, a quarter of the way down.
-        let cursor = sys::cursor_position();
-        let monitor = view
-            .window
-            .available_monitors()
-            .find(|m| {
-                let (p, s) = (m.position(), m.size());
-                cursor.is_some_and(|(x, y)| {
-                    x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
-                })
-            })
-            .or_else(|| view.window.primary_monitor());
-        if let Some(monitor) = monitor {
+        if let Some(monitor) = cursor_monitor(&view.window) {
             let (p, s) = (monitor.position(), monitor.size());
             let width = (WIDTH * monitor.scale_factor()) as i32;
             view.window.set_outer_position(PhysicalPosition::new(
@@ -544,6 +591,23 @@ pub(crate) fn open_profile(profile: &Profile, dir: &Path) -> std::io::Result<()>
     command.current_dir(dir).spawn().map(drop)
 }
 
+/// The drop-down terminal's height, as a share of its monitor's.
+pub(crate) const DROPDOWN_HEIGHT: f64 = 0.45;
+
+/// The monitor under the mouse, or the primary one.
+pub(crate) fn cursor_monitor(window: &Window) -> Option<winit::monitor::MonitorHandle> {
+    let cursor = sys::cursor_position();
+    window
+        .available_monitors()
+        .find(|m| {
+            let (p, s) = (m.position(), m.size());
+            cursor.is_some_and(|(x, y)| {
+                x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+            })
+        })
+        .or_else(|| window.primary_monitor())
+}
+
 fn home_dir() -> PathBuf {
     std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from)
 }
@@ -604,6 +668,7 @@ impl ApplicationHandler<Event> for Resident {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
         match event {
             Event::Hotkey => self.toggle(),
+            Event::Dropdown => self.toggle_dropdown(),
             Event::Tray(TrayCommand::OpenLauncher) => {
                 if self.view.as_ref().and_then(|v| v.window.is_visible()) != Some(true) {
                     self.toggle();

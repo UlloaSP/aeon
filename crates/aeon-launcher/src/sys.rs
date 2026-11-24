@@ -38,8 +38,10 @@ use windows_sys::Win32::UI::Shell::{
     SIIGBF_ICONONLY, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetCursorPos, GetMessageW, HWND_BROADCAST, MSG, PostMessageW, PostThreadMessageW,
-    RegisterWindowMessageW, SMTO_ABORTIFHUNG, SW_SHOWNORMAL, SendMessageTimeoutW, WM_HOTKEY,
+    ASFW_ANY, AllowSetForegroundWindow, FindWindowW, GetCursorPos, GetForegroundWindow,
+    GetMessageW, HWND_BROADCAST, HWND_TOPMOST, IsWindowVisible, MSG, PostMessageW,
+    PostThreadMessageW, RegisterWindowMessageW, SMTO_ABORTIFHUNG, SW_HIDE, SW_SHOWNORMAL,
+    SWP_SHOWWINDOW, SendMessageTimeoutW, SetForegroundWindow, SetWindowPos, ShowWindow, WM_HOTKEY,
     WM_QUIT, WM_SETTINGCHANGE,
 };
 use windows_sys::core::{GUID, HRESULT};
@@ -163,6 +165,35 @@ pub fn wsl_distros() -> Vec<String> {
     // SAFETY: `key` was opened above and is closed once.
     unsafe { RegCloseKey(key) };
     names
+}
+
+/// Hides the window of class `class` when it is in front; otherwise moves it
+/// to `rect` (x, y, width, height), shows it, and brings it forward. False
+/// when there is no such window.
+pub fn toggle_window(class: &str, (x, y, w, h): (i32, i32, i32, i32)) -> bool {
+    let class = wide(class);
+    // SAFETY: `class` is NUL-terminated; every call takes the window handle
+    // FindWindowW returned, which a stale handle only makes fail.
+    unsafe {
+        let hwnd = FindWindowW(class.as_ptr(), null());
+        if hwnd.is_null() {
+            return false;
+        }
+        if IsWindowVisible(hwnd) != 0 && GetForegroundWindow() == hwnd {
+            ShowWindow(hwnd, SW_HIDE);
+        } else {
+            SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_SHOWWINDOW);
+            SetForegroundWindow(hwnd);
+        }
+    }
+    true
+}
+
+/// Lets a process this one starts take the foreground, as a hotkey press
+/// lets this one.
+pub fn allow_foreground() {
+    // SAFETY: no preconditions.
+    unsafe { AllowSetForegroundWindow(ASFW_ANY) };
 }
 
 /// Prepares the calling thread for [`app_icon`]. Call once per thread.

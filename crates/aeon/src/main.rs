@@ -28,7 +28,8 @@ pub const VERSION: &str = match option_env!("AEON_VERSION") {
 /// `aeon` opens a terminal. `aeon --command <cmd>` opens one that runs `cmd`
 /// first; `--shell <program>` with any number of `--arg <arg>` runs that
 /// shell, and `--cwd <dir>` starts there (the palette's new-session profiles
-/// use these). `aeon --background` is the resident launcher; the installer's
+/// use these). `aeon --dropdown` is the drop-down terminal, which the resident
+/// starts and shows. `aeon --background` is the resident launcher; the installer's
 /// startup entry adds `--at-sign-in`, so the resident can honor the
 /// "Start with Windows" setting, and a terminal that asks for an update check
 /// while no resident runs starts one with `--check-updates`.
@@ -65,6 +66,7 @@ fn mode() -> Mode {
         run: value("--command"),
         program,
         cwd: value("--cwd").map(std::path::PathBuf::from),
+        dropdown: args.iter().any(|a| a == "--dropdown"),
     })
 }
 
@@ -75,6 +77,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             check_updates,
         } => launcher::run(at_sign_in, check_updates),
         Mode::Terminal(launch) => {
+            // One drop-down terminal: the resident finds it by its class.
+            if launch.dropdown
+                && !aeon_launcher::sys::single_instance(&format!(
+                    "Local\\{}",
+                    aeon_launcher::DROPDOWN_CLASS
+                ))
+            {
+                return Ok(());
+            }
             let event_loop = EventLoop::<app::Event>::with_user_event().build()?;
             let mut app = app::App::new(event_loop.create_proxy(), launch);
             event_loop.run_app(&mut app)?;
