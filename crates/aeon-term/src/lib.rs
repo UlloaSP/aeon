@@ -80,6 +80,9 @@ pub struct Match {
 /// it with OSC 133 (`A` prompt, `B` input, `C` output, `D;exit` done).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {
+    /// Unique for the terminal's life, unlike `prompt`: a cleared screen puts
+    /// new prompts on lines old ones had.
+    pub id: u64,
     /// The line the prompt started on.
     pub prompt: u64,
     /// Where typing started, after the prompt.
@@ -92,6 +95,11 @@ pub struct Block {
     pub exit: Option<i32>,
     /// What was typed, read off the screen when it ran.
     pub command: String,
+    /// The prompt's whole line when it ran, to find it again after ConPTY
+    /// redraws the screen at a new width.
+    head: String,
+    /// Lines between where it ended and the next prompt.
+    gap: u64,
 }
 
 /// Things that happened in the shell, for the window to react to.
@@ -205,6 +213,14 @@ struct State {
     cwd: Option<String>,
     cwd_changed: bool,
     blocks: VecDeque<Block>,
+    next_block: u64,
+    /// The width changed: ConPTY redraws the screen rewrapped, without
+    /// marks, so the blocks on it are found again by their lines. Ends at
+    /// the shell's next mark.
+    reanchor: bool,
+    /// The shell marks when commands run (OSC 133 C); cmd only marks its
+    /// prompts.
+    marks_commands: bool,
     events: Vec<Event>,
 }
 
@@ -238,6 +254,9 @@ impl Terminal {
                 cwd: None,
                 cwd_changed: false,
                 blocks: VecDeque::new(),
+                next_block: 0,
+                reanchor: false,
+                marks_commands: false,
                 events: Vec::new(),
             },
         }
@@ -246,6 +265,9 @@ impl Terminal {
     /// Feeds raw PTY output.
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.state, bytes);
+        if self.state.reanchor && !self.state.modes.alt_screen {
+            self.state.reanchor_blocks();
+        }
     }
 
     pub fn resize(&mut self, rows: usize, cols: usize) {
@@ -264,6 +286,9 @@ impl Terminal {
             let height = s.screen().rows();
             s.screen_mut().scroll_up(0, height, n, blank);
             s.cursor.row -= n;
+        }
+        if cols != s.grid.cols() && !s.blocks.is_empty() {
+            s.reanchor = true;
         }
         s.grid.resize(rows, cols);
         s.alt.resize(rows, cols);
@@ -301,6 +326,35 @@ impl Terminal {
     /// Returns whether the reported working directory changed, and clears the flag.
     pub fn take_cwd_changed(&mut self) -> bool {
         std::mem::take(&mut self.state.cwd_changed)
+    }
+
+    /// The user pressed Enter. A shell that marks its prompts but not its
+    /// commands (cmd) never says one started: this says it for it, with
+    /// what was typed. The next prompt then ends it, with no exit status.
+    pub fn command_entered(&mut self) {
+        let s = &mut self.state;
+        if s.marks_commands || s.modes.alt_screen {
+            return;
+        }
+        let Some(input) = s
+            .blocks
+            .back()
+            .filter(|b| b.output.is_none())
+            .and_then(|b| b.input)
+        else {
+            return;
+        };
+        let command = s.typed_since(input);
+        if command.is_empty() {
+            return;
+        }
+        let head = s.input_head();
+        let output = s.cursor_line() + 1;
+        let block = s.blocks.back_mut().expect("checked above");
+        block.output = Some(output);
+        block.command = command.clone();
+        block.head = head;
+        s.events.push(Event::CommandStarted { command });
     }
 
     /// Commands the shell marked, oldest first, while their prompt is still
@@ -480,18 +534,53 @@ impl State {
             line: self.cursor_line(),
             col: self.cursor.col,
         };
+        if matches!(kind, b"A" | b"C") {
+            self.reanchor = false;
+        }
+        if kind == b"C" {
+            self.marks_commands = true;
+        }
         match kind {
             b"A" => {
+                // A prompt at or above an earlier one means the screen was
+                // cleared or redrawn (ConPTY clears line by line, so there
+                // is no erase-display to go by): those blocks are gone.
+                while self.blocks.back().is_some_and(|b| b.prompt >= here.line) {
+                    self.blocks.pop_back();
+                }
+                // Without command marks, a prompt ends the command before it
+                // on the blank line cmd leaves.
+                if !self.marks_commands
+                    && let Some(last) = self.blocks.back_mut()
+                    && let Some(output) = last.output
+                    && last.end.is_none()
+                {
+                    last.end = Some(here.line.saturating_sub(1).max(output));
+                    self.events.push(Event::CommandFinished {
+                        command: last.command.clone(),
+                        exit: None,
+                    });
+                }
+                if let Some(last) = self.blocks.back_mut()
+                    && let Some(end) = last.end
+                {
+                    last.end = Some(end.min(here.line));
+                    last.gap = here.line.saturating_sub(end);
+                }
                 if self.blocks.len() >= BLOCK_LIMIT {
                     self.blocks.pop_front();
                 }
+                self.next_block += 1;
                 self.blocks.push_back(Block {
+                    id: self.next_block,
                     prompt: here.line,
                     input: None,
                     output: None,
                     end: None,
                     exit: None,
                     command: String::new(),
+                    head: String::new(),
+                    gap: 0,
                 });
             }
             b"B" => {
@@ -500,15 +589,25 @@ impl State {
                 }
             }
             b"C" => {
-                let command = self
-                    .blocks
-                    .back()
-                    .and_then(|b| b.input)
-                    .map(|start| self.typed_since(start))
+                // The shell may say what runs (`cmdline_url=`, as kitty's
+                // integration does): one statement of a line it split.
+                // Otherwise it is what was typed.
+                let command = rest
+                    .iter()
+                    .find_map(|p| p.strip_prefix(b"cmdline_url="))
+                    .map(|url| percent_decode(&String::from_utf8_lossy(url)))
+                    .or_else(|| {
+                        self.blocks
+                            .back()
+                            .and_then(|b| b.input)
+                            .map(|start| self.typed_since(start))
+                    })
                     .unwrap_or_default();
+                let head = self.input_head();
                 if let Some(block) = self.blocks.back_mut() {
                     block.output = Some(here.line);
                     block.command = command.clone();
+                    block.head = head;
                 }
                 self.events.push(Event::CommandStarted { command });
             }
@@ -531,6 +630,121 @@ impl State {
             }
             _ => {}
         }
+    }
+
+    /// The whole line the last prompt's input is on.
+    fn input_head(&self) -> String {
+        self.blocks
+            .back()
+            .and_then(|b| b.input)
+            .and_then(|start| start.line.checked_sub(self.screen_top()))
+            .and_then(|row| self.logical_line(row as usize))
+            .map(|(text, _)| text)
+            .unwrap_or_default()
+    }
+
+    /// The history line of the screen's first row.
+    fn screen_top(&self) -> u64 {
+        self.dropped + self.scrollback.len() as u64
+    }
+
+    /// The text of the line starting at screen `row`, joined across the
+    /// rows it wrapped onto, and how many rows it takes.
+    fn logical_line(&self, row: usize) -> Option<(String, usize)> {
+        let rows = self.grid.rows();
+        if row >= rows {
+            return None;
+        }
+        let mut text = String::new();
+        let mut end = row;
+        loop {
+            text.extend(self.grid.row(end).iter().map(|c| c.ch));
+            if !self.grid.wrapped(end) || end + 1 >= rows {
+                break;
+            }
+            end += 1;
+        }
+        Some((text.trim_end().to_owned(), end + 1 - row))
+    }
+
+    /// Moves the blocks on screen to where their prompt lines are now, after
+    /// ConPTY redrew the screen at a new width. Every line of a block moves
+    /// with its prompt; its output starts after the prompt's rewrapped line,
+    /// and it ends as far above the next prompt as it did. A block the
+    /// redraw passed without its line is gone from the screen.
+    fn reanchor_blocks(&mut self) {
+        let top = self.screen_top();
+        let rows = self.grid.rows();
+        let mut lines: Vec<Option<(String, usize)>> = vec![None; rows];
+        let mut row = 0;
+        while row < rows {
+            let line = self.logical_line(row).expect("row is on screen");
+            let next = row + line.1;
+            lines[row] = Some(line);
+            row = next;
+        }
+        // The line being typed at starts where the cursor's row does,
+        // above any rows the typing wrapped onto.
+        let mut typing = self.cursor.row;
+        while typing > 0 && self.grid.wrapped(typing - 1) {
+            typing -= 1;
+        }
+        let first = self.blocks.partition_point(|b| b.prompt < top);
+        let last = self.blocks.len().saturating_sub(1);
+        let mut from = 0;
+        let mut found: Vec<Option<usize>> = Vec::new();
+        for (i, b) in self.blocks.iter().enumerate().skip(first) {
+            let row = if b.output.is_none() {
+                (i == last).then_some(typing)
+            } else {
+                let row =
+                    (from..rows).find(|&r| lines[r].as_ref().is_some_and(|(t, _)| *t == b.head));
+                if let Some(r) = row {
+                    from = r + 1;
+                }
+                row
+            };
+            found.push(row);
+        }
+        // Rows are redrawn top down: a block whose line is missing above one
+        // that was found again is no longer on the screen.
+        let last_matched = (first..=last)
+            .zip(&found)
+            .filter(|(i, row)| row.is_some() && self.blocks[*i].output.is_some())
+            .map(|(i, _)| i)
+            .last();
+        let mut gone = Vec::new();
+        for (i, row) in (first..).zip(found) {
+            let Some(row) = row else {
+                if last_matched.is_some_and(|l| i < l) {
+                    gone.push(i);
+                }
+                continue;
+            };
+            let b = &mut self.blocks[i];
+            let new_input = top + row as u64;
+            let old_input = b.input.map_or(b.prompt, |p| p.line);
+            b.prompt = (b.prompt + new_input).saturating_sub(old_input);
+            if let Some(input) = &mut b.input {
+                input.line = new_input;
+            }
+            if b.output.is_some() {
+                let head_rows = lines[row].as_ref().map_or(1, |(_, n)| *n as u64);
+                b.output = Some(new_input + head_rows);
+            }
+        }
+        for i in gone.into_iter().rev() {
+            self.blocks.remove(i);
+        }
+        for i in first..self.blocks.len().saturating_sub(1) {
+            let next = self.blocks[i + 1].prompt;
+            let b = &mut self.blocks[i];
+            if b.end.is_some() {
+                let floor = b.output.unwrap_or(b.prompt);
+                b.end = Some(next.saturating_sub(b.gap).max(floor));
+            }
+        }
+        self.dirty = true;
     }
 
     /// The text typed after the prompt, up to the cursor.
@@ -1331,6 +1545,190 @@ mod tests {
         assert_eq!(line[2].ch, 'd');
         assert_eq!(line[4].fg, Color::Default);
         assert_eq!(line_text(&t, t.first_line()), "red plain");
+    }
+
+    /// What PowerShell sent through ConPTY, with Aeon's integration, for
+    /// `echo one`, `cmd /c exit 3`, `echo two`, `clear`, `echo three`, and
+    /// `cmd /c exit 4` on a 12 by 60 screen.
+    const PWSH_CLEAR: &[u8] = include_bytes!("../tests/pwsh-clear.bin");
+
+    #[test]
+    fn clearing_the_screen_drops_the_blocks_it_erased() {
+        let mut t = Terminal::new(12, 60);
+        t.advance(PWSH_CLEAR);
+        let blocks: Vec<(String, Option<i32>, u64)> = t
+            .blocks()
+            .map(|b| (b.command.clone(), b.exit, b.prompt))
+            .collect();
+        assert_eq!(
+            blocks,
+            [
+                ("echo three".to_owned(), Some(0), 0),
+                ("cmd /c exit 4".to_owned(), Some(4), 2),
+                (String::new(), None, 3),
+            ]
+        );
+        let ids: Vec<u64> = t.blocks().map(|b| b.id).collect();
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "{ids:?}");
+        // Every command still reported how it ended, `clear` included.
+        let finished: Vec<Option<i32>> = t
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::CommandFinished { exit, .. } => Some(exit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            finished,
+            [Some(0), Some(3), Some(0), Some(0), Some(0), Some(4)]
+        );
+    }
+
+    /// Exit codes of the finished commands, in order.
+    fn finished(t: &mut Terminal) -> Vec<Option<i32>> {
+        t.take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::CommandFinished { exit, .. } => Some(exit),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Git Bash and WSL bash with Aeon's integration, through ConPTY:
+    /// `echo one`, `false`, a `cd`, `clear`, and `echo two`. Kali's prompt
+    /// is redrawn as you type, its profile prints a line before each prompt
+    /// and systemd's OSC 3008 marks, and WSL had an empty Enter in between.
+    #[test]
+    fn bash_marks_blocks_in_git_bash_and_wsl() {
+        for (bytes, name) in [
+            (&include_bytes!("../tests/git-bash.bin")[..], "git bash"),
+            (&include_bytes!("../tests/wsl-kali.bin")[..], "wsl"),
+        ] {
+            let mut t = Terminal::new(12, 60);
+            t.advance(bytes);
+            let blocks: Vec<(String, Option<i32>)> =
+                t.blocks().map(|b| (b.command.clone(), b.exit)).collect();
+            assert_eq!(
+                blocks,
+                [("echo two".to_owned(), Some(0)), (String::new(), None)],
+                "{name}"
+            );
+            assert_eq!(
+                finished(&mut t),
+                [Some(0), Some(1), Some(0), Some(0), Some(0)],
+                "{name}"
+            );
+            assert_eq!(t.cwd(), Some(r"C:\Windows"), "{name}");
+        }
+    }
+
+    /// ConPTY redraws the screen rewrapped when the width changes, without
+    /// marks; this is what it sent for two commands narrowed to 60 columns.
+    #[test]
+    fn blocks_follow_their_lines_when_the_width_changes() {
+        let a = "a".repeat(90);
+        let prompt = "\x1b]133;A\x1b\\\u{276f} \x1b]133;B\x1b\\";
+        let mut t = term(
+            24,
+            100,
+            &format!(
+                "{prompt}echo {a}\r\n\x1b]133;C\x1b\\{a}\r\n\x1b]133;D;0\x1b\\\r\n\
+                 {prompt}echo short\r\n\x1b]133;C\x1b\\short\r\n\x1b]133;D;0\x1b\\\r\n{prompt}"
+            ),
+        );
+        let lines = |t: &Terminal| -> Vec<(u64, Option<u64>, Option<u64>)> {
+            t.blocks().map(|b| (b.prompt, b.output, b.end)).collect()
+        };
+        assert_eq!(
+            lines(&t),
+            [
+                (0, Some(1), Some(2)),
+                (3, Some(4), Some(5)),
+                (6, None, None)
+            ]
+        );
+        t.resize(24, 60);
+        // The redraw can arrive in pieces.
+        t.advance(
+            format!(
+                "\x1b[H\u{276f} echo {a}\x1b[K\r\n{a}\x1b[K\r\n\x1b[K\r\n\u{276f} echo short\x1b[K\r\n"
+            )
+            .as_bytes(),
+        );
+        t.advance(
+            format!(
+                "short\x1b[K\r\n\x1b[K\r\n\u{276f}\x1b[K{}\x1b[9;3H",
+                "\r\n\x1b[K".repeat(3)
+            )
+            .as_bytes(),
+        );
+        assert_eq!(
+            lines(&t),
+            [
+                (0, Some(2), Some(4)),
+                (5, Some(6), Some(7)),
+                (8, None, None)
+            ]
+        );
+        // Typing at the prompt afterwards moves nothing.
+        t.advance(b"ls");
+        assert_eq!(lines(&t)[2], (8, None, None));
+    }
+
+    /// cmd marks its prompts but not its commands: Enter starts one and
+    /// the next prompt ends it, without an exit status.
+    #[test]
+    fn enter_starts_a_command_in_a_shell_that_only_marks_prompts() {
+        let prompt = "\x1b]133;A\x1b\\\u{276f} \x1b]133;B\x1b\\";
+        let mut t = term(10, 40, &format!("{prompt}dir /b"));
+        t.command_entered();
+        t.advance(format!("\r\naeon\r\naeon-term\r\n\r\n{prompt}").as_bytes());
+        // An empty Enter is no command.
+        t.command_entered();
+        let blocks: Vec<_> = t
+            .blocks()
+            .map(|b| (b.command.as_str(), b.prompt, b.output, b.end, b.exit))
+            .collect();
+        assert_eq!(
+            blocks,
+            [
+                ("dir /b", 0, Some(1), Some(3), None),
+                ("", 4, None, None, None)
+            ]
+        );
+        assert_eq!(
+            t.take_events(),
+            [
+                Event::CommandStarted {
+                    command: "dir /b".into()
+                },
+                Event::CommandFinished {
+                    command: "dir /b".into(),
+                    exit: None
+                },
+            ]
+        );
+        // A shell that marks its commands is left to do so.
+        let mut t = term(
+            10,
+            40,
+            &format!("{prompt}ls\r\n\x1b]133;C\x1b\\\x1b]133;D;0\x1b\\{prompt}ls"),
+        );
+        t.take_events();
+        t.command_entered();
+        assert_eq!(t.take_events(), []);
+    }
+
+    #[test]
+    fn the_shell_can_name_the_command_a_block_runs() {
+        let mut t = term(5, 40, "\x1b]133;A\x1b\\> \x1b]133;B\x1b\\echo a; echo b");
+        t.advance(b"\r\n\x1b]133;C;cmdline_url=echo%20a\x1b\\a\r\n\x1b]133;D;0\x1b\\");
+        t.advance(b"\x1b]133;A\x1b\\> \x1b]133;B\x1b\\echo b\r\n");
+        t.advance(b"\x1b]133;C;cmdline_url=echo%20b%20%E2%9C%93\x1b\\b\r\n\x1b]133;D;0\x1b\\");
+        let commands: Vec<&str> = t.blocks().map(|b| b.command.as_str()).collect();
+        assert_eq!(commands, ["echo a", "echo b \u{2713}"]);
     }
 
     #[test]

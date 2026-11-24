@@ -51,9 +51,12 @@ pub struct Shell {
     /// Starting directory. `None` keeps the directory Aeon was launched from,
     /// or the home directory when launched from the Start menu.
     pub cwd: Option<PathBuf>,
-    /// Lets Aeon set up PowerShell and cmd: no user profile, Aeon's own
-    /// history and prompt, and working-directory reporting for the bar.
+    /// Lets Aeon set up the shell: its prompt, command blocks, history, and
+    /// working-directory reporting for the header.
     pub integration: bool,
+    /// With integration, PowerShell still loads the user's profiles first.
+    /// Off starts faster, without their modules and PATH changes.
+    pub profile: bool,
 }
 
 impl Default for Shell {
@@ -63,6 +66,7 @@ impl Default for Shell {
             args: Vec::new(),
             cwd: None,
             integration: true,
+            profile: true,
         }
     }
 }
@@ -129,7 +133,6 @@ pub struct Keys {
     pub zoom_pane: String,
     pub rename_session: String,
     pub palette: String,
-    pub new_session_menu: String,
 }
 
 impl Default for Keys {
@@ -150,7 +153,6 @@ impl Default for Keys {
             zoom_pane: "Ctrl+Shift+Z".to_owned(),
             rename_session: "F2".to_owned(),
             palette: "Ctrl+Shift+K".to_owned(),
-            new_session_menu: "Ctrl+Shift+N".to_owned(),
         }
     }
 }
@@ -205,6 +207,8 @@ pub struct Font {
     pub path: Option<PathBuf>,
     /// Size in points at 100% display scale.
     pub size: f32,
+    /// Row height as a multiple of the font's own line height.
+    pub line_height: f32,
 }
 
 impl Default for Font {
@@ -212,6 +216,7 @@ impl Default for Font {
         Self {
             path: None,
             size: 11.0,
+            line_height: 1.2,
         }
     }
 }

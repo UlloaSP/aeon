@@ -3,6 +3,7 @@
 //! `aeon_config::edit`). It takes the place of the terminal while open.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use aeon_config::edit::{Change, Value};
@@ -110,6 +111,9 @@ pub struct Settings {
     pub update: Status,
     /// Shown under the rows: why the last save failed.
     pub error: Option<String>,
+    /// The first row on screen when a section is taller than the window.
+    /// Drawing moves it to keep the selected row in view; clicks use it.
+    first: Cell<usize>,
 }
 
 impl Settings {
@@ -123,6 +127,7 @@ impl Settings {
             fonts: detect_fonts(),
             update,
             error: None,
+            first: Cell::new(0),
         };
         settings.rebuild(config);
         settings
@@ -143,6 +148,7 @@ impl Settings {
     fn select_section(&mut self, section: usize, config: &Config) {
         self.section = section % SECTIONS.len();
         self.selected = 0;
+        self.first.set(0);
         self.recording = false;
         self.rebuild(config);
     }
@@ -206,8 +212,11 @@ impl Settings {
                 integer,
                 ..
             } => {
-                let next = (value + step * f64::from(delta)).clamp(*min, *max);
-                if (next - value).abs() < f64::EPSILON {
+                // Rounded to the step's precision: the f32 config values would
+                // otherwise be written back as 1.2000000476837158.
+                let next =
+                    ((value + step * f64::from(delta)).clamp(*min, *max) * 100.0).round() / 100.0;
+                if (next - value).abs() < 1e-6 {
                     return Outcome::None;
                 }
                 let v = if *integer {
@@ -308,7 +317,16 @@ impl Settings {
         if x < f64::from(geo.left + geo.nav) {
             return geo.nav_item_at(y).is_some_and(|i| i < SECTIONS.len());
         }
-        geo.row_at(y, self.rows.len()).is_some()
+        self.row_at(y, geo).is_some()
+    }
+
+    /// The row under `y`, among those on screen.
+    fn row_at(&self, y: f64, geo: &Geometry) -> Option<usize> {
+        let first = self.first.get();
+        let shown = geo
+            .visible(self.rows.len())
+            .min(self.rows.len() - first.min(self.rows.len()));
+        geo.row_at(y, shown).map(|i| i + first)
     }
 
     pub fn click(&mut self, x: f64, y: f64, geo: &Geometry, config: &Config) -> Outcome {
@@ -325,7 +343,7 @@ impl Settings {
             }
             return Outcome::None;
         }
-        let Some(i) = geo.row_at(y, self.rows.len()) else {
+        let Some(i) = self.row_at(y, geo) else {
             return Outcome::None;
         };
         self.selected = i;
@@ -410,7 +428,20 @@ impl Settings {
             width.saturating_sub(hx + tw + ui.px(28.0)),
         );
 
-        let rows = self.rows.len() as u32;
+        // Keep the selected row on screen, moving as little as possible.
+        let visible = geo.visible(self.rows.len());
+        let mut first = self
+            .first
+            .get()
+            .min(self.rows.len().saturating_sub(visible));
+        if self.selected < first {
+            first = self.selected;
+        } else if self.selected >= first + visible {
+            first = self.selected + 1 - visible;
+        }
+        self.first.set(first);
+        let shown = &self.rows[first..(first + visible).min(self.rows.len())];
+        let rows = shown.len() as u32;
         let card_h = rows * geo.row;
         if rows > 0 {
             let fill = blend(pal.canvas, pal.raised, 120);
@@ -427,12 +458,10 @@ impl Settings {
         }
         let text_x = geo.card_x + geo.pad;
         let text_w = geo.control_x.saturating_sub(text_x + geo.pad);
-        for (i, row) in self.rows.iter().enumerate() {
-            let top = geo.card_y + i as u32 * geo.row;
-            if top + geo.row > frame.height {
-                break;
-            }
-            if i > 0 {
+        for (n, row) in shown.iter().enumerate() {
+            let i = first + n;
+            let top = geo.card_y + n as u32 * geo.row;
+            if n > 0 {
                 fill_rect(
                     frame,
                     geo.card_x + 1,
@@ -479,6 +508,8 @@ impl Settings {
 
         let hint = if self.recording {
             "Press the new shortcut \u{b7} Esc cancels"
+        } else if shown.len() < self.rows.len() {
+            "\u{2191}\u{2193} move and scroll \u{b7} \u{2190}\u{2192} change \u{b7} Enter toggles \u{b7} Tab next section \u{b7} Esc closes"
         } else {
             "\u{2191}\u{2193} move \u{b7} \u{2190}\u{2192} change \u{b7} Enter toggles \u{b7} Tab next section \u{b7} Esc closes"
         };
@@ -670,10 +701,12 @@ pub struct Geometry {
     row: u32,
     control_x: u32,
     control_w: u32,
+    /// Where rows must end, leaving room for the hints below them.
+    bottom: u32,
 }
 
 impl Geometry {
-    pub fn new(left: u32, width: u32, scale: f64) -> Self {
+    pub fn new(left: u32, width: u32, height: u32, scale: f64) -> Self {
         let px = |logical: f64| (logical * scale).round() as u32;
         let nav = px(240.0).min(width.saturating_sub(left) / 3);
         let content = left + nav;
@@ -696,7 +729,14 @@ impl Geometry {
             row: px(60.0),
             control_x: (card_x + card_w).saturating_sub(pad + control_w),
             control_w,
+            bottom: height.saturating_sub(px(64.0)),
         }
+    }
+
+    /// How many of `rows` rows fit on screen; at least one.
+    fn visible(&self, rows: usize) -> usize {
+        let room = self.bottom.saturating_sub(self.card_y) / self.row.max(1);
+        (room as usize).clamp(1, rows.max(1))
     }
 
     fn nav_item_at(&self, y: f64) -> Option<usize> {
@@ -738,7 +778,8 @@ fn rows(
             },
             Row {
                 title: "Shell integration",
-                description: "Aeon's prompt and history. Off loads your PowerShell profile.".into(),
+                description:
+                    "Aeon's prompt and command blocks in every shell. Off: your own prompt.".into(),
                 control: Control::Toggle {
                     on: config.shell.integration,
                     table: "shell",
@@ -746,8 +787,17 @@ fn rows(
                 },
             },
             Row {
+                title: "PowerShell profile",
+                description: "Your modules, PATH, and settings. Off starts faster.".into(),
+                control: Control::Toggle {
+                    on: config.shell.profile,
+                    table: "shell",
+                    key: "profile",
+                },
+            },
+            Row {
                 title: "Session header",
-                description: "Project, branch, changes, and servers above the terminal.".into(),
+                description: "Folder, branch, changes, and servers above the terminal.".into(),
                 control: Control::Toggle {
                     on: config.bar.enabled,
                     table: "bar",
@@ -840,6 +890,20 @@ fn rows(
                 },
             },
             Row {
+                title: "Line height",
+                description: "Room between lines of terminal text.".into(),
+                control: Control::Number {
+                    value: f64::from(config.font.line_height),
+                    step: 0.1,
+                    min: 1.0,
+                    max: 2.0,
+                    unit: "\u{d7}",
+                    table: "font",
+                    key: "line_height",
+                    integer: false,
+                },
+            },
+            Row {
                 title: "Padding",
                 description: "Space around the terminal text.".into(),
                 control: Control::Number {
@@ -867,7 +931,7 @@ fn rows(
             let keys = &config.keys;
             vec![
                 key_row("New session", "new_session", &keys.new_session),
-                key_row("Close session", "close_session", &keys.close_session),
+                key_row("Close pane", "close_session", &keys.close_session),
                 key_row("Next session", "next_session", &keys.next_session),
                 key_row(
                     "Previous session",
@@ -889,11 +953,6 @@ fn rows(
                 key_row("Zoom the pane", "zoom_pane", &keys.zoom_pane),
                 key_row("Rename session", "rename_session", &keys.rename_session),
                 key_row("Palette", "palette", &keys.palette),
-                key_row(
-                    "New session with\u{2026}",
-                    "new_session_menu",
-                    &keys.new_session_menu,
-                ),
                 Row {
                     title: "Move between panes",
                     description: "Fixed: in a split session.".into(),
@@ -1070,7 +1129,6 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("zoom_pane", k.zoom_pane.clone()),
         ("rename_session", k.rename_session.clone()),
         ("palette", k.palette.clone()),
-        ("new_session_menu", k.new_session_menu.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
         ("dropdown", config.launcher.dropdown.clone()),
     ]
@@ -1139,14 +1197,17 @@ fn detect_shells() -> Vec<Choice> {
             .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
     };
     let mut shells = vec![Choice {
-        label: "Automatic".into(),
+        label: format!(
+            "Automatic ({})",
+            aeon_pty::describe(&aeon_pty::default_shell())
+        ),
         changes: vec![
             change("shell", "program", None),
             change("shell", "args", None),
         ],
     }];
     for (label, exe) in [
-        ("PowerShell 7", "pwsh.exe"),
+        ("PowerShell", "pwsh.exe"),
         ("Windows PowerShell", "powershell.exe"),
         ("Command Prompt", "cmd.exe"),
         ("WSL", "wsl.exe"),
@@ -1255,6 +1316,7 @@ mod tests {
             section: 0,
             selected: 0,
             recording: false,
+            first: Cell::new(0),
             rows: Vec::new(),
             shells: vec![
                 Choice {
@@ -1280,6 +1342,39 @@ mod tests {
 
     fn named(key: NamedKey) -> Key {
         Key::Named(key)
+    }
+
+    #[test]
+    fn a_long_section_scrolls_to_the_selected_row_and_clicks_follow() {
+        let config = Config::default();
+        let mut s = settings();
+        s.select_section(2, &config); // Keyboard: more rows than fit below.
+        for _ in 0..s.rows.len() {
+            s.key(
+                &named(NamedKey::ArrowDown),
+                ModifiersState::empty(),
+                &config,
+            );
+        }
+        let last = s.rows.len() - 1;
+        assert_eq!(s.selected, last);
+        let (w, h) = (1280, 600);
+        let geo = Geometry::new(0, w, h, 1.0);
+        let visible = geo.visible(s.rows.len());
+        assert!(visible < s.rows.len());
+        let mut pixels = vec![0; (w * h) as usize];
+        let mut frame = Frame {
+            pixels: &mut pixels,
+            width: w,
+            height: h,
+        };
+        let pal = Palette::new(&crate::render::Theme::new(&config.colors));
+        s.draw(&mut frame, &mut Ui::new(1.0), &pal, &geo);
+        assert_eq!(s.first.get(), last + 1 - visible);
+        // The top row on screen is the first one shown, not the section's.
+        let top = f64::from(geo.card_y + geo.row / 2);
+        s.click(f64::from(geo.card_x + 20), top, &geo, &config);
+        assert_eq!(s.selected, last + 1 - visible);
     }
 
     #[test]
@@ -1351,6 +1446,19 @@ mod tests {
                 &config
             ),
             Outcome::Save(vec![change("font", "size", Some(Value::Float(11.5)))])
+        );
+        s.key(
+            &named(NamedKey::ArrowDown),
+            ModifiersState::empty(),
+            &config,
+        ); // Line height: 1.2 is no exact f32, yet 1.1 is written.
+        assert_eq!(
+            s.key(
+                &named(NamedKey::ArrowLeft),
+                ModifiersState::empty(),
+                &config
+            ),
+            Outcome::Save(vec![change("font", "line_height", Some(Value::Float(1.1)))])
         );
         s.key(
             &named(NamedKey::ArrowDown),

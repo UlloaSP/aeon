@@ -1,0 +1,33 @@
+[?9001h[?1004h[?25l[2J[m[H┏━([36m[1mMessage from Kali developers[m)
+┃
+]0;C:\WINDOWS\SYSTEM32\wsl.exe[?25h]3008;start=0;type=shell\]9;9;"C:\software"\[?2004h┃ This is a minimal installation of Kali Linux, you likely
+┃ want to install supplementary tools. Learn how:
+┃ ⇒ https://www.kali.org/docs/troubleshooting/common-minimum-setup/
+┃
+┗━([37m[2mRun: “touch ~/.hushlogin” to hide this message[m)
+]133;A\[32m[1m❯[m ]133;B\]133;A\[32m[1m❯[m ]133;B\[?2004lecho one
+]3008;start=0;type=shell\]133;C\one
+]133;D;0\]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\software"\[?2004h
+]133;A\[32m[1m❯[m ]133;B\]133;A\[32m[1m❯[m ]133;B\false[?2004l
+]3008;start=0;type=shell\]133;C\]133;D;1\]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\software"\[?2004h
+]133;A\[31m[1m❯[m ]133;B\]133;A\[31m[1m❯[m ]133;B\[?2004l
+]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\software"\[?2004h
+]133;A\[31m[1m❯[m ]133;B\]133;A\[31m[1m❯[m ]133;B\cd /mnt/c/Windows[?2004l]3008;start=0;type=shell\
+]133;C\]133;D;0\]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\Windows"\[?2004h
+]133;A\[32m[1m❯[m ]133;B\]133;A\[32m[1m❯[m ]133;B\clear[?2004l
+]3008;start=0;type=shell\]133;C\[?25l[H[?25h[2J[3J[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h]133;D;0\]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\Windows"\[?2004h
+]133;A\[32m[1m❯[m ]133;B\]133;A\[32m[1m❯[m ]133;B\echo two[?2004l]3008;start=0;type=shell\
+]133;C\two
+]133;D;0\]3008;start=0;type=shell\]3008;start=0;type=shell\]9;9;"C:\Windows"\[?2004h
+]133;A\[32m[1m❯[m ]133;B\]133;A\[32m[1m❯[m ]133;B\

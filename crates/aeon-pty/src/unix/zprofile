@@ -1,0 +1,4 @@
+# Aeon: the account's own .zprofile (see .zshenv here).
+ZDOTDIR=$AEON_ZDOTDIR
+[[ -f $ZDOTDIR/.zprofile ]] && . $ZDOTDIR/.zprofile
+ZDOTDIR=$__aeon_zdotdir

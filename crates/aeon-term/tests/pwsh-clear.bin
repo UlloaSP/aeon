@@ -1,0 +1,32 @@
+[?9001h[?1004h[?25l[2J[m[H]0;C:\Program Files\PowerShell\7\pwsh.exe[?25h]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mecho [37mone
+[?25h]133;C\[mone
+]133;D;0\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mcmd [37m/c exit [97m3
+[?25h]133;C\[m]133;D;3\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mecho [37mtwo
+[?25h]133;C\[mtwo
+]133;D;0\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mclear        
+[?25h[m]133;C\[?25l[H[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h[3J[?25l[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K
+[K[H[?25h]133;D;0\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mecho [37mthree
+[?25h]133;C\[mthree
+]133;D;0\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\[?25l[93mcmd [37m/c exit [97m4
+[?25h]133;C\[m]133;D;4\]133;A\]9;9;"C:\software\aeon.worktrees\fix-feedback-round\crates\aeon-pty"\❯ ]133;B\

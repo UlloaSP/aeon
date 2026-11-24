@@ -4,5 +4,7 @@
 *.cmd text eol=crlf
 *.bat text eol=crlf
 *.ico binary
+# Captured terminal output: its CRLFs are what the parser is tested on.
+*.bin binary
 *.msi binary
 Cargo.lock linguist-generated
