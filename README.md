@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. One palette for everything, a drop-down terminal, and a new-session menu are on the way.
+> Aeon is early. A drop-down terminal and its own title bar are on the way.
 
 ## Install
 
@@ -67,6 +67,8 @@ One window holds as many shells as you want. The sidebar groups them by project:
 | Alt+Arrows | Move to the pane in that direction (or click it) |
 | Ctrl+Shift+Z | Show only this pane, or all of them again |
 | F2 | Rename the session; Enter keeps the name, Escape drops it, and an empty name goes back to the automatic one |
+| Ctrl+Shift+K | The palette, over this window |
+| Ctrl+Shift+N | New session with another shell, a WSL distro, an SSH host, or as administrator (or the arrow on **New session**) |
 | Ctrl+Shift+B | Show or hide the sidebar |
 
 These are the defaults; change any of them except Alt+Arrows in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B.
@@ -108,14 +110,21 @@ In PowerShell, every command is a block: a line above it, and a chip at the end 
 
 The sidebar shows what each session is doing: a blue dot while a command runs, its port while it serves one, the progress a program reports (`64%`), and, for a session you are not looking at, `exit 1` in red, `done` in green, or `bell`, in bold until you open it. When a command that ran for 10 seconds or more ends in a session you are not looking at, Windows shows a notification and the taskbar button flashes. The bell at the end of a session row (on hover) mutes its notifications.
 
+### The palette
+
+**Ctrl+Shift+K** in a window opens the same search as the launcher below, plus what that window has: its sessions (the empty box lists them; **Enter** goes to one), the active project's tasks, and new sessions. **Enter** on a command types it at the focused prompt, and **Ctrl+Enter** runs it in a new session.
+
+New sessions can start any shell this PC has (PowerShell 7, Windows PowerShell, Command Prompt, Git Bash), each WSL distro, each host in `~/.ssh/config`, or Aeon as administrator in a separate window. **Ctrl+Shift+N**, or the arrow on **New session**, lists only those; in the palette, type `new`, `wsl`, `ssh`, or a name. A split starts the same shell as the pane it splits.
+
 ### The launcher
 
-Aeon starts with Windows and waits in the background, using about 8 MB. Press **Ctrl+Alt+Space** anywhere to open the launcher:
+Aeon starts with Windows and waits in the background, using about 8 MB. Press **Ctrl+Alt+Space** anywhere to open the launcher, the palette without a window:
 
 - Type a command, such as `code C:\code\app`, and press **Enter**. It starts in the background, the way Win+R would, and the launcher closes.
 - **Ctrl+Enter** opens it in an Aeon terminal instead, so you can watch the output.
 - Type part of an app's name, such as `disc` for Discord or `vsc` for Visual Studio Code, and press **Enter** to open it. Every app in the Start menu is there, Store apps included, and the ones you open most rise to the top.
 - Type anything that is not a command or an app, and the first result searches the web for it in your default browser. Start with `?` to always search.
+- Type `new`, `wsl`, or `ssh` to open a terminal with another shell, distro, or host.
 - Type `theme` to switch Windows between light and dark, or `theme dark` and `theme light` to pick one (`tema oscuro` and `tema claro` work too).
 - Type math, such as `5*3-2` or `sqrt(2)`, and the result appears as you type. **Enter** copies it.
 - The list shows what you ran from the launcher, then your PowerShell history in Aeon, filtered as you type. **Up** and **Down** pick one, and **Tab** puts it in the box to edit.
@@ -167,6 +176,8 @@ split_right = "Ctrl+Shift+D"
 split_down = "Ctrl+Shift+E"
 zoom_pane = "Ctrl+Shift+Z"
 rename_session = "F2"
+palette = "Ctrl+Shift+K"
+new_session_menu = "Ctrl+Shift+N"
 
 [terminal]
 scrollback = 5000             # lines kept for scrolling back; 0 keeps none

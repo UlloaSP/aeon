@@ -151,6 +151,8 @@ impl Rect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     NewSession,
+    /// The chevron on New session: every shell, distro, and host.
+    NewSessionMenu,
     Session(usize),
     /// The bell on a session row: mutes or unmutes its notifications.
     Mute(usize),
@@ -280,6 +282,7 @@ impl Sidebar {
             .map(|(rect, row)| {
                 let end = x >= f64::from(rect.x + rect.w - self.mute);
                 match row {
+                    Row::NewSession if end => Hit::NewSessionMenu,
                     Row::NewSession => Hit::NewSession,
                     Row::Session(i) if end => Hit::Mute(*i),
                     Row::Session(i) => Hit::Session(*i),
@@ -393,7 +396,7 @@ pub fn draw_sidebar(
         let mid = rect.mid();
         match *row {
             Row::NewSession => {
-                let hovered = state.hover == Some(Hit::NewSession);
+                let hovered = matches!(state.hover, Some(Hit::NewSession | Hit::NewSessionMenu));
                 if hovered {
                     ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, radius, pal.hover);
                 }
@@ -408,14 +411,21 @@ pub fn draw_sidebar(
                     color,
                     rect.w,
                 );
-                ui.text_right(
-                    frame,
-                    rect.x + rect.w - ui.px(10.0),
-                    mid,
-                    state.new_keys,
-                    small,
-                    pal.label,
-                );
+                let right = rect.x + rect.w - ui.px(10.0);
+                if hovered {
+                    // The row's own menu replaces its shortcut while hovered.
+                    let on_menu = state.hover == Some(Hit::NewSessionMenu);
+                    ui.icon(
+                        frame,
+                        right.saturating_sub(ui.px(6.0)),
+                        mid,
+                        icon::CHEVRON_DOWN,
+                        11.0,
+                        if on_menu { pal.fg } else { pal.muted },
+                    );
+                } else {
+                    ui.text_right(frame, right, mid, state.new_keys, small, pal.label);
+                }
             }
             Row::Project(i) => {
                 let project = &state.projects[i];
@@ -1574,6 +1584,7 @@ mod tests {
         }];
         let sb = Sidebar::new(&mut ui, 256, 800, &projects, Some(&Pill::Available));
         assert_eq!(sb.hit(100.0, 50.0), Some(Hit::NewSession));
+        assert_eq!(sb.hit(240.0, 50.0), Some(Hit::NewSessionMenu));
         // New session 40..72, gap to 78, project 78..110, sessions 110..146..182.
         assert_eq!(sb.hit(100.0, 90.0), Some(Hit::Project(0)));
         assert_eq!(sb.hit(240.0, 90.0), Some(Hit::Pin(0)));

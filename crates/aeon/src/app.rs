@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -7,9 +8,11 @@ use std::time::{Duration, Instant};
 
 use aeon_config::Config;
 use aeon_context::{Context, Watcher};
-use aeon_launcher::ResidentCommand;
+use aeon_launcher::profiles::Kind;
 use aeon_launcher::update::Status;
-use aeon_launcher::{sys, updater};
+use aeon_launcher::{
+    Action, Entry, Launcher, Profile, ResidentCommand, Sources, apps, history, sys, updater,
+};
 use aeon_pty::{Pty, PtySize};
 use aeon_term::{Event as TermEvent, Match, MouseMode, Point, Terminal};
 use winit::application::ApplicationHandler;
@@ -32,6 +35,7 @@ use crate::font::{self, Atlas};
 use crate::input::{self, Button, MouseAction};
 use crate::keys::Combo;
 use crate::links::{self, Target};
+use crate::palette::{self as finder, Content};
 use crate::panes::{self, Direction, Split, Tree};
 use crate::render::{self, Frame, Overlay, Theme};
 use crate::settings::{self, Outcome, Settings};
@@ -50,7 +54,41 @@ pub enum Event {
     Exited(SessionId),
     /// New context bar contents, from a session's watcher thread.
     Context(SessionId, Context),
+    /// What the palette searches beyond the window, loaded the first time it
+    /// opens.
+    Catalog(Catalog),
 }
+
+/// Installed apps, programs on PATH, and new-session profiles.
+pub struct Catalog {
+    apps: Vec<aeon_launcher::App>,
+    commands: HashSet<String>,
+    profiles: Vec<Profile>,
+}
+
+/// How this window was started.
+#[derive(Debug, Default)]
+pub struct Launch {
+    /// `--command`: a first command for the first shell (the launcher's
+    /// Ctrl+Enter).
+    pub run: Option<String>,
+    /// `--shell` and `--arg`: the first session's shell, from a profile.
+    pub program: Option<Program>,
+    /// `--cwd`: where the first session starts.
+    pub cwd: Option<PathBuf>,
+}
+
+/// A shell other than the configured one, chosen from a profile.
+#[derive(Debug, Clone)]
+pub struct Program {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+/// The apps list is reloaded when the palette opens and it is older than this.
+const CATALOG_MAX_AGE: Duration = Duration::from_secs(10 * 60);
+/// The palette's width over a window, in logical pixels.
+const FINDER_WIDTH: f64 = 576.0;
 
 pub struct App {
     proxy: EventLoopProxy<Event>,
@@ -62,9 +100,14 @@ pub struct App {
     home: Option<PathBuf>,
     /// What the mouse is over in the sidebar, drawn highlighted.
     hover: Option<Hit>,
-    /// A first command for the first shell, from `--command` (the launcher's
-    /// Ctrl+Enter).
-    run: Option<String>,
+    /// How the window was started, until its first session opens.
+    launch: Option<Launch>,
+    /// The palette over the window, while open.
+    finder: Option<Launcher>,
+    /// Why the palette's last choice failed.
+    finder_error: Option<String>,
+    catalog: Option<Catalog>,
+    catalog_requested: Option<Instant>,
     view: Option<View>,
     /// Every shell, in every pane of every session.
     sessions: Vec<Session>,
@@ -210,6 +253,8 @@ struct Session {
     attention: Option<Attention>,
     /// No notifications from this session.
     muted: bool,
+    /// The shell when it is not the configured one; splits start it too.
+    program: Option<Program>,
 }
 
 /// A session as the sidebar lists it: one shell, or several in panes.
@@ -249,7 +294,7 @@ const SIDEBAR_WIDTH: f64 = 256.0;
 const HEADER_HEIGHT: f64 = 44.0;
 
 impl App {
-    pub fn new(proxy: EventLoopProxy<Event>, run: Option<String>) -> Self {
+    pub fn new(proxy: EventLoopProxy<Event>, launch: Launch) -> Self {
         let (config, config_error) = match Config::default_path().map(|p| Config::load(&p)) {
             Some(Ok(config)) => (config, None),
             Some(Err(e)) => (Config::default(), Some(e.to_string())),
@@ -277,7 +322,11 @@ impl App {
             hover: None,
             config,
             config_error,
-            run,
+            launch: Some(launch),
+            finder: None,
+            finder_error: None,
+            catalog: None,
+            catalog_requested: None,
             view: None,
             sessions: Vec::new(),
             groups: Vec::new(),
@@ -364,11 +413,21 @@ impl App {
         cwd: Option<PathBuf>,
         run: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.open_with(cwd, run, None)
+    }
+
+    /// Like `open_session`, with `program` in place of the configured shell.
+    fn open_with(
+        &mut self,
+        cwd: Option<PathBuf>,
+        run: Option<String>,
+        program: Option<Program>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let view = self.view.as_ref().ok_or("no window")?;
         let (_, rows, cols) = self.grid_in(view, self.layout(view).area);
         let id = self.next_id;
         self.next_id += 1;
-        self.spawn_pane(id, cwd, run, (rows, cols))?;
+        self.spawn_pane(id, cwd, run, program, (rows, cols))?;
         self.groups.push(Group {
             tree: Tree::Pane(id),
             focus: id,
@@ -385,9 +444,10 @@ impl App {
         id: SessionId,
         cwd: Option<PathBuf>,
         run: Option<String>,
+        program: Option<Program>,
         (rows, cols): (usize, usize),
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let shell = self.shell_command(cwd, run.as_deref());
+        let shell = self.shell_command(cwd, run.as_deref(), program.as_ref());
         let shell_name = std::path::Path::new(&shell.program)
             .file_stem()
             .map_or_else(
@@ -437,6 +497,7 @@ impl App {
             progress: None,
             attention: None,
             muted: false,
+            program,
         });
         Ok(())
     }
@@ -461,12 +522,12 @@ impl App {
             return;
         };
         let (_, rows, cols) = self.grid_in(view, rect);
-        let (cwd, muted) = self
-            .sessions
-            .get(self.active)
-            .map_or((None, false), |s| (s.context.cwd.clone(), s.muted));
+        let (cwd, muted, program) = self.sessions.get(self.active).map_or_else(
+            || (None, false, None),
+            |s| (s.context.cwd.clone(), s.muted, s.program.clone()),
+        );
         self.next_id += 1;
-        if let Err(e) = self.spawn_pane(id, cwd, None, (rows, cols)) {
+        if let Err(e) = self.spawn_pane(id, cwd, None, program, (rows, cols)) {
             eprintln!("aeon: could not split: {e}");
             return;
         }
@@ -492,11 +553,17 @@ impl App {
         }
     }
 
-    fn shell_command(&self, cwd: Option<PathBuf>, run: Option<&str>) -> aeon_pty::Command {
+    fn shell_command(
+        &self,
+        cwd: Option<PathBuf>,
+        run: Option<&str>,
+        program: Option<&Program>,
+    ) -> aeon_pty::Command {
         let shell = &self.config.shell;
-        let mut command = match &shell.program {
-            Some(program) => aeon_pty::Command::new(program).args(&shell.args),
-            None => aeon_pty::default_shell(),
+        let mut command = match (program, &shell.program) {
+            (Some(p), _) => aeon_pty::Command::new(&p.program).args(&p.args),
+            (None, Some(program)) => aeon_pty::Command::new(program).args(&shell.args),
+            (None, None) => aeon_pty::default_shell(),
         };
         if shell.integration {
             command = aeon_pty::integrate(command, run);
@@ -1385,6 +1452,7 @@ impl App {
         };
         let panel = self.panel_layout(&panel_data);
         let editor = self.editor.is_some();
+        let finder_rect = self.finder_rect();
         let header_title = active_group.map(|g| self.group_title(g, &projects));
         let rows: Vec<SessionRow> = if layout.sidebar > 0 {
             self.groups
@@ -1558,6 +1626,20 @@ impl App {
                 },
             );
         }
+        if let (Some(rect), Some(launcher)) = (finder_rect, &self.finder) {
+            finder::draw(
+                &mut frame,
+                &mut view.ui,
+                &self.palette,
+                rect,
+                &Content {
+                    launcher,
+                    error: self.finder_error.as_deref(),
+                    icons: None,
+                    in_window: true,
+                },
+            );
+        }
         let _ = buffer.present();
     }
 
@@ -1580,6 +1662,8 @@ impl App {
             SplitDown,
             Zoom,
             Rename,
+            Finder,
+            NewSessionMenu,
         }
         let (key, mods) = (&event.logical_key, self.modifiers);
         let keys = &self.config.keys;
@@ -1598,6 +1682,8 @@ impl App {
             (&keys.split_down, Action::SplitDown),
             (&keys.zoom_pane, Action::Zoom),
             (&keys.rename_session, Action::Rename),
+            (&keys.palette, Action::Finder),
+            (&keys.new_session_menu, Action::NewSessionMenu),
         ]
         .into_iter()
         .find(|(text, _)| text.parse::<Combo>().is_ok_and(|c| c.matches(key, mods)))
@@ -1619,6 +1705,8 @@ impl App {
             Some(Action::SplitDown) => self.split(Split::Down),
             Some(Action::Zoom) => self.toggle_zoom(),
             Some(Action::Rename) => self.start_rename(),
+            Some(Action::Finder) => self.open_finder(false),
+            Some(Action::NewSessionMenu) => self.open_finder(true),
             None => {
                 if let Some(handled) = self.builtin_key(key, mods) {
                     return handled;
@@ -1643,6 +1731,10 @@ impl App {
 
     fn key(&mut self, event: &KeyEvent, event_loop: &ActiveEventLoop) {
         if event.state != ElementState::Pressed {
+            return;
+        }
+        if self.finder.is_some() {
+            self.finder_key(event);
             return;
         }
         if self.rename.is_some() {
@@ -2060,6 +2152,12 @@ impl App {
     fn mouse(&mut self, state: ElementState, button: MouseButton) {
         let (x, y) = (self.cursor.x, self.cursor.y);
         let pressed = state == ElementState::Pressed;
+        if self.finder.is_some() {
+            if pressed && button == MouseButton::Left {
+                self.finder_click();
+            }
+            return;
+        }
         if pressed {
             self.commit_rename();
             // A click in another pane only moves the keyboard there.
@@ -2364,6 +2462,7 @@ impl App {
                 }
             }
             Some(Hit::NewSession) => self.new_session(),
+            Some(Hit::NewSessionMenu) => self.open_finder(true),
             Some(Hit::Project(i)) => {
                 let projects = self.projects();
                 let Some(project) = projects.get(i) else {
@@ -2565,15 +2664,16 @@ impl App {
     /// window and nothing was asked to run, plus one where Aeon was started
     /// from if none of them is there.
     fn start(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let run = self.run.take();
+        let launch = self.launch.take().unwrap_or_default();
         let (saved, active) = self.restore.take().unwrap_or_default();
-        if run.is_none() && self.primary && self.config.window.restore {
+        let plain = launch.run.is_none() && launch.program.is_none() && launch.cwd.is_none();
+        if plain && self.primary && self.config.window.restore {
             for group in &saved {
                 self.restore_group(group);
             }
         }
         if self.groups.is_empty() {
-            return self.open_session(None, run);
+            return self.open_with(launch.cwd, launch.run, launch.program);
         }
         let here = start_dir().filter(|dir| Some(dir) != self.home.as_ref());
         let found = here.as_ref().and_then(|dir| {
@@ -2622,7 +2722,7 @@ impl App {
         self.next_id += ids.len() as u64;
         for ((&id, cwd), size) in ids.iter().zip(&saved.panes).zip(sizes) {
             let cwd = cwd.is_dir().then(|| cwd.clone());
-            if let Err(e) = self.spawn_pane(id, cwd, None, size) {
+            if let Err(e) = self.spawn_pane(id, cwd, None, None, size) {
                 eprintln!("aeon: could not restore a session: {e}");
                 if !tree.remove(id) {
                     return;
@@ -2657,6 +2757,249 @@ impl App {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Opens the palette over the window: its sessions, the active project's
+    /// tasks, new sessions, apps, commands, math, and the web. `menu` opens
+    /// only the new-session profiles.
+    fn open_finder(&mut self, menu: bool) {
+        self.rename = None;
+        let projects = self.projects();
+        let sessions = chrome::display_order(&projects)
+            .into_iter()
+            .map(|g| Entry {
+                id: g,
+                title: self.group_title(g, &projects),
+                detail: projects
+                    .iter()
+                    .find(|p| p.sessions.contains(&g))
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default(),
+            })
+            .collect();
+        let tasks = self
+            .sessions
+            .get(self.active)
+            .map(|s| {
+                s.context
+                    .tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| Entry {
+                        id: i,
+                        title: t.name.clone(),
+                        detail: t.command.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A few hundred kilobytes at most, read once per open, as the
+        // launcher does.
+        let history = if menu {
+            Vec::new()
+        } else {
+            history::dir()
+                .map(|d| history::load(&d))
+                .unwrap_or_default()
+        };
+        let catalog = self.catalog.as_ref();
+        let sources = Sources {
+            history,
+            apps: catalog.map(|c| c.apps.clone()).unwrap_or_default(),
+            commands: catalog.map(|c| c.commands.clone()).unwrap_or_default(),
+            search_url: self.config.launcher.search_url.clone(),
+            sessions,
+            tasks,
+            profiles: catalog.map(|c| c.profiles.clone()).unwrap_or_default(),
+        };
+        self.finder = Some(if menu {
+            Launcher::menu(sources)
+        } else {
+            Launcher::open(sources)
+        });
+        self.finder_error = None;
+        if self
+            .catalog_requested
+            .is_none_or(|t| t.elapsed() >= CATALOG_MAX_AGE)
+        {
+            self.catalog_requested = Some(Instant::now());
+            let proxy = self.proxy.clone();
+            let _ = std::thread::Builder::new()
+                .name("catalog".into())
+                .spawn(move || {
+                    let _ = proxy.send_event(Event::Catalog(Catalog {
+                        apps: apps::load(),
+                        commands: apps::path_commands(),
+                        profiles: aeon_launcher::profiles::detect(),
+                    }));
+                });
+        }
+        self.request_redraw();
+    }
+
+    /// Where the palette sits: centred, near the top.
+    fn finder_rect(&self) -> Option<Rect> {
+        let finder = self.finder.as_ref()?;
+        let view = self.view.as_ref()?;
+        let size = view.window.inner_size();
+        let w = view
+            .ui
+            .px(FINDER_WIDTH)
+            .min(size.width.saturating_sub(view.ui.px(32.0)));
+        Some(Rect {
+            x: (size.width - w) / 2,
+            y: (size.height / 8).max(view.ui.px(56.0)),
+            w,
+            h: finder::height(&view.ui, finder.items().len()),
+        })
+    }
+
+    fn finder_key(&mut self, event: &KeyEvent) {
+        let ctrl = self.modifiers.control_key();
+        let alt = self.modifiers.alt_key();
+        let Some(launcher) = &mut self.finder else {
+            return;
+        };
+        match &event.logical_key {
+            Key::Named(NamedKey::Escape) => self.finder = None,
+            Key::Named(NamedKey::Enter) => {
+                if let Some(action) = launcher.choose(ctrl) {
+                    self.perform(action);
+                }
+                return;
+            }
+            Key::Named(NamedKey::ArrowDown) => launcher.select_next(),
+            Key::Named(NamedKey::ArrowUp) => launcher.select_previous(),
+            Key::Named(NamedKey::Tab) => launcher.complete(),
+            Key::Named(NamedKey::Backspace) if ctrl => launcher.delete_word(),
+            Key::Named(NamedKey::Backspace) => launcher.backspace(),
+            Key::Character(c) if ctrl && !alt && c.eq_ignore_ascii_case("v") => {
+                if let Some(text) = sys::get_clipboard() {
+                    launcher.insert(&text);
+                }
+            }
+            // AltGr reports Ctrl+Alt, so typed text is taken whatever the
+            // modifiers; control characters (Ctrl+letter) are dropped.
+            _ => match &event.text {
+                Some(text) if !text.chars().any(char::is_control) => launcher.insert(text),
+                _ => return,
+            },
+        }
+        self.finder_error = None;
+        self.request_redraw();
+    }
+
+    /// A click on a result chooses it; one outside the palette closes it.
+    fn finder_click(&mut self) {
+        let (Some(rect), Some(view)) = (self.finder_rect(), self.view.as_ref()) else {
+            return;
+        };
+        let (x, y) = (self.cursor.x, self.cursor.y);
+        let rows = self.finder.as_ref().map_or(0, |f| f.items().len());
+        if let Some(row) = finder::row_at(&view.ui, rect, rows, x, y) {
+            let ctrl = self.modifiers.control_key();
+            let action = self.finder.as_mut().and_then(|f| {
+                f.select(row);
+                f.choose(ctrl)
+            });
+            if let Some(action) = action {
+                self.perform(action);
+            }
+        } else if !rect.contains(x, y) {
+            self.finder = None;
+            self.request_redraw();
+        }
+    }
+
+    /// Carries out what the palette chose, then closes it; on failure it
+    /// stays open and says why.
+    fn perform(&mut self, action: Action) {
+        let cwd = self
+            .sessions
+            .get(self.active)
+            .and_then(|s| s.context.cwd.clone())
+            .or_else(start_dir)
+            .unwrap_or_else(|| PathBuf::from("C:\\"));
+        let result: Result<(), String> = match &action {
+            Action::Copy(text) => {
+                let owner = self.view.as_ref().map_or(0, |v| hwnd(&v.window));
+                if sys::set_clipboard(owner, text) {
+                    Ok(())
+                } else {
+                    Err("the clipboard is busy".into())
+                }
+            }
+            // In a window, Enter runs a command at the focused prompt.
+            Action::Run(command) => {
+                if let Some(session) = self.sessions.get_mut(self.active) {
+                    session.scroll = 0;
+                    session.selection = None;
+                    let mut bytes = command.clone().into_bytes();
+                    bytes.push(b'\r');
+                    let _ = session.input.write_all(&bytes);
+                }
+                Ok(())
+            }
+            Action::RunInTerminal(command) => self
+                .open_session(Some(cwd.clone()), Some(command.clone()))
+                .map_err(|e| e.to_string()),
+            Action::OpenApp(id) => apps::open(id).map_err(|e| e.to_string()),
+            Action::OpenUrl(url) => {
+                if sys::open_url(url) {
+                    Ok(())
+                } else {
+                    Err("no browser opened it".into())
+                }
+            }
+            Action::SetTheme(theme) => {
+                let light = match theme {
+                    aeon_launcher::Theme::Toggle => !sys::light_theme().unwrap_or(false),
+                    aeon_launcher::Theme::Dark => false,
+                    aeon_launcher::Theme::Light => true,
+                };
+                // The change broadcast waits on every window.
+                std::thread::spawn(move || sys::set_light_theme(light));
+                Ok(())
+            }
+            Action::GoToSession(g) => {
+                self.settings = None;
+                self.select(*g);
+                Ok(())
+            }
+            Action::RunTask(i) => {
+                self.run_task(*i);
+                Ok(())
+            }
+            Action::NewSession(profile) if profile.kind == Kind::Admin => {
+                crate::launcher::open_profile(profile, &cwd).map_err(|e| e.to_string())
+            }
+            Action::NewSession(profile) => self
+                .open_with(
+                    Some(cwd.clone()),
+                    None,
+                    Some(Program {
+                        program: profile.program.clone(),
+                        args: profile.args.clone(),
+                    }),
+                )
+                .map_err(|e| e.to_string()),
+        };
+        match result {
+            Ok(()) => {
+                match (&action, history::dir()) {
+                    (Action::RunInTerminal(command), Some(dir)) => {
+                        let _ = history::append(&dir, command);
+                    }
+                    (Action::OpenApp(id), Some(dir)) => {
+                        let _ = history::record_app(&dir, id);
+                    }
+                    _ => {}
+                }
+                self.finder = None;
+            }
+            Err(e) => self.finder_error = Some(format!("Could not start: {e}")),
+        }
+        self.request_redraw();
     }
 
     fn session_index(&self, id: SessionId) -> Option<usize> {
@@ -2766,6 +3109,17 @@ impl ApplicationHandler<Event> for App {
                 if let Some(index) = self.session_index(id) {
                     self.close_pane(index, event_loop);
                 }
+            }
+            Event::Catalog(mut catalog) => {
+                if let Some(dir) = history::dir() {
+                    apps::count_uses(&mut catalog.apps, &history::app_uses(&dir));
+                }
+                if let Some(finder) = &mut self.finder {
+                    finder.set_profiles(catalog.profiles.clone());
+                    finder.set_catalog(catalog.apps.clone(), catalog.commands.clone());
+                    self.request_redraw();
+                }
+                self.catalog = Some(catalog);
             }
         }
     }

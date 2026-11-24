@@ -1,4 +1,5 @@
-//! The quick launcher: a command box behind a global hotkey.
+//! The palette: one search box behind the global hotkey and, inside a
+//! terminal window, over its sessions too.
 //!
 //! [`Launcher`] is the box's state and is pure: typing, moving the selection,
 //! and choosing produce an [`Action`] that the caller carries out. Win32 lives
@@ -9,6 +10,7 @@ mod calc;
 pub mod history;
 mod hotkey;
 pub mod icons;
+pub mod profiles;
 #[cfg(windows)]
 pub mod sys;
 pub mod update;
@@ -22,14 +24,33 @@ use std::process::{Command, Stdio};
 pub use apps::App;
 pub use hotkey::Hotkey;
 pub use icons::{Icon, Icons};
+pub use profiles::Profile;
 
 /// How many results the box lists below the query.
 pub const MAX_ITEMS: usize = 8;
+/// How many profiles the new-session menu lists.
+const MAX_MENU: usize = 12;
+
+/// A session or task of the window the palette is over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// What the window knows it by.
+    pub id: usize,
+    pub title: String,
+    /// Shown beside the title, such as the session's project.
+    pub detail: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Item {
     /// The query is math; `result` is what Enter copies.
     Calc { result: String },
+    /// Go to a session of this window.
+    Session(Entry),
+    /// Run a task of the active session's project.
+    Task(Entry),
+    /// Open a new session with a shell, distro, host, or as administrator.
+    NewSession(Profile),
     /// One of Aeon's own commands, such as `theme`.
     Builtin(Builtin),
     /// An installed app whose name matches the query.
@@ -46,6 +67,8 @@ impl Item {
     pub fn text(&self) -> &str {
         match self {
             Item::Calc { result } => result,
+            Item::Session(entry) | Item::Task(entry) => &entry.title,
+            Item::NewSession(profile) => &profile.label,
             Item::Builtin(builtin) => builtin.label(),
             Item::App(app) => &app.name,
             Item::Run(command) | Item::History(command) => command,
@@ -162,6 +185,9 @@ pub enum Action {
     SetTheme(Theme),
     /// Open a web page in the default browser.
     OpenUrl(String),
+    GoToSession(usize),
+    RunTask(usize),
+    NewSession(Profile),
 }
 
 /// What the launcher searches.
@@ -175,6 +201,11 @@ pub struct Sources {
     pub commands: HashSet<String>,
     /// Search URL with `{query}` where the words go. Empty: no web search.
     pub search_url: String,
+    /// The window's sessions, in sidebar order. None in the global palette.
+    pub sessions: Vec<Entry>,
+    /// The active project's tasks.
+    pub tasks: Vec<Entry>,
+    pub profiles: Vec<Profile>,
 }
 
 #[derive(Debug, Default)]
@@ -183,6 +214,8 @@ pub struct Launcher {
     selected: usize,
     sources: Sources,
     items: Vec<Item>,
+    /// Only new-session profiles: the menu behind New session.
+    menu: bool,
 }
 
 impl Launcher {
@@ -194,6 +227,27 @@ impl Launcher {
         };
         launcher.refresh();
         launcher
+    }
+
+    /// The new-session menu: every profile, narrowed by typing.
+    pub fn menu(sources: Sources) -> Self {
+        let mut launcher = Self {
+            sources,
+            menu: true,
+            ..Self::default()
+        };
+        launcher.refresh();
+        launcher
+    }
+
+    pub fn is_menu(&self) -> bool {
+        self.menu
+    }
+
+    /// Profiles arrived from their background lookup.
+    pub fn set_profiles(&mut self, profiles: Vec<Profile>) {
+        self.sources.profiles = profiles;
+        self.refresh();
     }
 
     /// The app and command lists arrived while the box is open; keeps the query.
@@ -271,11 +325,25 @@ impl Launcher {
             Item::Search { query, .. } => {
                 Action::OpenUrl(search_url(&self.sources.search_url, query))
             }
+            Item::Session(entry) => Action::GoToSession(entry.id),
+            Item::Task(entry) => Action::RunTask(entry.id),
+            Item::NewSession(profile) => Action::NewSession(profile.clone()),
         })
     }
 
+    /// Selects row `index`, as a click does before choosing it.
+    pub fn select(&mut self, index: usize) {
+        if index < self.items.len() {
+            self.selected = index;
+        }
+    }
+
     fn refresh(&mut self) {
-        self.items = items(&self.query, &self.sources);
+        self.items = if self.menu {
+            profile_items(&self.query, &self.sources.profiles, MAX_MENU)
+        } else {
+            items(&self.query, &self.sources)
+        };
         self.selected = 0;
     }
 }
@@ -334,8 +402,39 @@ fn looks_like_command(query: &str, sources: &Sources) -> bool {
         })
 }
 
+/// Whether every word of `query` is in `text`, ignoring case.
+fn matches_words(query: &str, text: &str) -> bool {
+    let text = text.to_lowercase();
+    query
+        .split_whitespace()
+        .all(|word| text.contains(&word.to_lowercase()))
+}
+
+/// Profiles whose name or kind has every word of `query`, also reached by
+/// "new": "new wsl" lists the distros.
+fn profile_items(query: &str, profiles: &[Profile], max: usize) -> Vec<Item> {
+    profiles
+        .iter()
+        .filter(|p| matches_words(query, &format!("new session {} {}", p.label, p.kind.word())))
+        .take(max)
+        .cloned()
+        .map(Item::NewSession)
+        .collect()
+}
+
 fn items(query: &str, sources: &Sources) -> Vec<Item> {
     let query = query.trim();
+    // An empty box over a window lists its sessions, then recent commands.
+    if query.is_empty() {
+        return sources
+            .sessions
+            .iter()
+            .cloned()
+            .map(Item::Session)
+            .chain(sources.history.iter().cloned().map(Item::History))
+            .take(MAX_ITEMS)
+            .collect();
+    }
     // `?` forces a web search.
     if let Some(words) = query.strip_prefix('?') {
         let words = words.trim();
@@ -355,6 +454,17 @@ fn items(query: &str, sources: &Sources) -> Vec<Item> {
     let builtins = builtins(query);
     let is_builtin = !builtins.is_empty();
     items.extend(builtins.into_iter().map(Item::Builtin));
+    let entry = |e: &&Entry| matches_words(query, &format!("{} {}", e.title, e.detail));
+    items.extend(
+        sources
+            .sessions
+            .iter()
+            .filter(entry)
+            .cloned()
+            .map(Item::Session),
+    );
+    items.extend(sources.tasks.iter().filter(entry).cloned().map(Item::Task));
+    items.extend(profile_items(query, &sources.profiles, 3));
     let found_apps = apps::search(apps, query);
     let app_named_so = found_apps
         .iter()
@@ -748,6 +858,83 @@ mod tests {
             Some("from powershell")
         );
         let _ = std::fs::remove_file(&ps_out);
+    }
+
+    fn entry(id: usize, title: &str, detail: &str) -> Entry {
+        Entry {
+            id,
+            title: title.into(),
+            detail: detail.into(),
+        }
+    }
+
+    fn profile(label: &str, kind: profiles::Kind) -> Profile {
+        Profile {
+            label: label.into(),
+            kind,
+            program: "wsl.exe".into(),
+            args: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_empty_box_lists_sessions_then_history() {
+        let l = Launcher::open(Sources {
+            history: strings(&["git status"]),
+            sessions: vec![entry(0, "pwsh", "aeon"), entry(3, "npm run dev", "web")],
+            ..Sources::default()
+        });
+        assert_eq!(texts(&l), ["pwsh", "npm run dev", "git status"]);
+        assert_eq!(l.choose(false), Some(Action::GoToSession(0)));
+    }
+
+    #[test]
+    fn sessions_tasks_and_profiles_match_by_words() {
+        let sources = Sources {
+            sessions: vec![entry(2, "pwsh", "aeon"), entry(5, "pwsh", "web")],
+            tasks: vec![
+                entry(0, "dev", "npm run dev"),
+                entry(1, "test", "cargo test"),
+            ],
+            profiles: vec![
+                profile("Ubuntu", profiles::Kind::Wsl),
+                profile("build-box", profiles::Kind::Ssh),
+            ],
+            ..Sources::default()
+        };
+        let mut l = Launcher::open(sources.clone());
+        l.insert("web");
+        assert_eq!(l.items()[0], Item::Session(entry(5, "pwsh", "web")));
+        let mut l = Launcher::open(sources.clone());
+        l.insert("cargo");
+        assert_eq!(l.choose(false), Some(Action::RunTask(1)));
+        let mut l = Launcher::open(sources.clone());
+        l.insert("new wsl");
+        assert_eq!(texts(&l)[0], "Ubuntu");
+        assert!(matches!(l.choose(false), Some(Action::NewSession(p)) if p.label == "Ubuntu"));
+        let mut l = Launcher::open(sources);
+        l.insert("ssh");
+        assert_eq!(texts(&l)[0], "build-box");
+    }
+
+    #[test]
+    fn the_menu_lists_only_profiles() {
+        let mut l = Launcher::menu(Sources {
+            history: strings(&["ubuntu-thing"]),
+            profiles: vec![
+                profile("Ubuntu", profiles::Kind::Wsl),
+                profile("Debian", profiles::Kind::Wsl),
+                profile("Aeon", profiles::Kind::Admin),
+            ],
+            ..Sources::default()
+        });
+        assert!(l.is_menu());
+        assert_eq!(texts(&l), ["Ubuntu", "Debian", "Aeon"]);
+        l.insert("admin");
+        assert_eq!(texts(&l), ["Aeon"]);
+        l.backspace();
+        l.select(2);
+        assert_eq!(l.selected(), 0, "typing resets the selection");
     }
 
     #[test]

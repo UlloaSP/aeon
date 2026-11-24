@@ -888,6 +888,12 @@ fn rows(
                 key_row("Split down", "split_down", &keys.split_down),
                 key_row("Zoom the pane", "zoom_pane", &keys.zoom_pane),
                 key_row("Rename session", "rename_session", &keys.rename_session),
+                key_row("Palette", "palette", &keys.palette),
+                key_row(
+                    "New session with\u{2026}",
+                    "new_session_menu",
+                    &keys.new_session_menu,
+                ),
                 Row {
                     title: "Move between panes",
                     description: "Fixed: in a split session.".into(),
@@ -1053,6 +1059,8 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("split_down", k.split_down.clone()),
         ("zoom_pane", k.zoom_pane.clone()),
         ("rename_session", k.rename_session.clone()),
+        ("palette", k.palette.clone()),
+        ("new_session_menu", k.new_session_menu.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
     ]
 }
@@ -1395,11 +1403,11 @@ mod tests {
                     .is_some_and(|e| e.contains("close session"))
         );
         assert_eq!(
-            s.key(&Key::Character(SmolStr::new("N")), ctrl_shift, &config),
+            s.key(&Key::Character(SmolStr::new("Y")), ctrl_shift, &config),
             Outcome::Save(vec![change(
                 "keys",
                 "new_session",
-                Some(Value::Str("Ctrl+Shift+N".into()))
+                Some(Value::Str("Ctrl+Shift+Y".into()))
             )])
         );
         // The launcher's hotkey must be one Windows can register.
