@@ -874,6 +874,7 @@ fn rows(
                 key_row("Find", "find", &keys.find),
                 key_row("Copy", "copy", &keys.copy),
                 key_row("Paste", "paste", &keys.paste),
+                key_row("Project panel", "project_panel", &keys.project_panel),
                 Row {
                     title: "Go to a session",
                     description: "Fixed: by its number in the sidebar.".into(),
@@ -1029,6 +1030,7 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("find", k.find.clone()),
         ("copy", k.copy.clone()),
         ("paste", k.paste.clone()),
+        ("project_panel", k.project_panel.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
     ]
 }

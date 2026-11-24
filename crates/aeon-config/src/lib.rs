@@ -120,6 +120,7 @@ pub struct Keys {
     pub find: String,
     pub copy: String,
     pub paste: String,
+    pub project_panel: String,
 }
 
 impl Default for Keys {
@@ -134,6 +135,7 @@ impl Default for Keys {
             find: "Ctrl+Shift+F".to_owned(),
             copy: "Ctrl+Shift+C".to_owned(),
             paste: "Ctrl+Shift+V".to_owned(),
+            project_panel: "Ctrl+Shift+P".to_owned(),
         }
     }
 }

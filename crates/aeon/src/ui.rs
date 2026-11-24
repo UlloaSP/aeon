@@ -291,6 +291,10 @@ pub mod icon {
     pub const MUTED: char = '\u{E708}';
     pub const CHECK: char = '\u{E73E}';
     pub const CROSS: char = '\u{E711}';
+    pub const PIN: char = '\u{E718}';
+    pub const UNPIN: char = '\u{E77A}';
+    pub const PANEL: char = '\u{E8A0}';
+    pub const CODE: char = '\u{E943}';
     pub const SEARCH: char = '\u{E721}';
     pub const CHEVRON_LEFT: char = '\u{E76B}';
     pub const CHEVRON_RIGHT: char = '\u{E76C}';
