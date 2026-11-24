@@ -135,6 +135,8 @@ impl Rect {
 pub enum Hit {
     NewSession,
     Session(usize),
+    /// The bell on a session row: mutes or unmutes its notifications.
+    Mute(usize),
     Settings,
     Update,
 }
@@ -173,6 +175,8 @@ impl Pill {
 pub struct Sidebar {
     pub width: u32,
     rows: Vec<(Rect, Row)>,
+    /// Width of the mute button at the right end of a hovered session row.
+    mute: u32,
     footer_top: u32,
     settings: Rect,
     update: Option<Rect>,
@@ -230,6 +234,7 @@ impl Sidebar {
         Self {
             width,
             rows,
+            mute: ui.px(30.0),
             footer_top,
             settings: Rect {
                 x: inset,
@@ -251,8 +256,11 @@ impl Sidebar {
         self.rows
             .iter()
             .find(|(rect, _)| rect.contains(x, y))
-            .and_then(|(_, row)| match row {
+            .and_then(|(rect, row)| match row {
                 Row::NewSession => Some(Hit::NewSession),
+                Row::Session(i) if x >= f64::from(rect.x + rect.w - self.mute) => {
+                    Some(Hit::Mute(*i))
+                }
                 Row::Session(i) => Some(Hit::Session(*i)),
                 Row::Project(_) => None,
             })
@@ -271,14 +279,30 @@ fn pill_width(ui: &mut Ui, pill: &Pill) -> u32 {
 }
 
 /// One session as the sidebar shows it.
-pub struct SessionRow<'a> {
-    pub context: &'a Context,
+pub struct SessionRow {
     pub title: String,
+    pub state: RowState,
+    /// It finished, failed, or rang while you were elsewhere: drawn bold
+    /// until you look at it.
+    pub unseen: bool,
+    pub muted: bool,
+}
+
+/// What a session is doing, as its dot and the text at the row's end show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowState {
+    Idle,
+    Running,
+    Server(u16),
+    Progress(u8),
+    Failed(i32),
+    Done,
+    Bell,
 }
 
 pub struct SidebarState<'a> {
     pub projects: &'a [Project],
-    pub sessions: &'a [SessionRow<'a>],
+    pub sessions: &'a [SessionRow],
     pub active: usize,
     pub settings_open: bool,
     pub hover: Option<Hit>,
@@ -420,34 +444,60 @@ pub fn draw_sidebar(
                     ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, radius, pal.hover);
                 }
                 let slot = rect.x + ui.px(43.0);
-                let server = session.context.servers.first();
-                if server.is_some() {
-                    ui::dot(frame, slot, mid, ui.px(9.0), pal.cyan);
-                } else {
-                    let strength = if selected || hovered { 215 } else { 102 };
-                    ui.icon(
-                        frame,
-                        slot,
-                        mid,
-                        icon::TERMINAL,
-                        12.0,
-                        blend(pal.canvas, pal.fg, strength),
-                    );
+                let (dot, meta, meta_color) = match session.state {
+                    RowState::Idle => (None, String::new(), pal.label),
+                    RowState::Running => (Some(pal.blue), "running".to_owned(), pal.label),
+                    RowState::Server(port) => (Some(pal.cyan), format!(":{port}"), pal.cyan),
+                    RowState::Progress(p) => (Some(pal.blue), format!("{p}%"), pal.label),
+                    RowState::Failed(code) => (Some(pal.red), format!("exit {code}"), pal.red),
+                    RowState::Done => (Some(pal.green), "done".to_owned(), pal.green),
+                    RowState::Bell => (Some(pal.yellow), "bell".to_owned(), pal.yellow),
+                };
+                match dot {
+                    Some(color) => ui::dot(frame, slot, mid, ui.px(9.0), color),
+                    None => {
+                        let strength = if selected || hovered { 215 } else { 102 };
+                        ui.icon(
+                            frame,
+                            slot,
+                            mid,
+                            icon::TERMINAL,
+                            12.0,
+                            blend(pal.canvas, pal.fg, strength),
+                        );
+                    }
                 }
                 let right = rect.x + rect.w - ui.px(10.0);
-                let meta_x = match server {
-                    Some(server) => ui.text_right(
-                        frame,
-                        right,
-                        mid,
-                        &format!(":{}", server.port),
-                        small,
-                        pal.cyan,
-                    ),
-                    None => right,
+                let meta_x = if hovered {
+                    // The row's own action replaces its status while hovered.
+                    let on_bell = state.hover == Some(Hit::Mute(i));
+                    let glyph = if session.muted {
+                        icon::MUTED
+                    } else {
+                        icon::BELL
+                    };
+                    let color = if on_bell { pal.fg } else { pal.muted };
+                    let cx = right.saturating_sub(ui.px(6.0));
+                    ui.icon(frame, cx, mid, glyph, 12.0, color);
+                    cx.saturating_sub(ui.px(10.0))
+                } else {
+                    let mut end = right;
+                    if !meta.is_empty() {
+                        end = ui.text_right(frame, end, mid, &meta, small, meta_color);
+                    }
+                    if session.muted {
+                        let cx = end.saturating_sub(ui.px(10.0));
+                        ui.icon(frame, cx, mid, icon::MUTED, 10.0, pal.label);
+                        end = cx.saturating_sub(ui.px(8.0));
+                    }
+                    end
                 };
                 let x = rect.x + ui.px(60.0);
-                let font = if selected { strong } else { body };
+                let font = if selected || session.unseen {
+                    strong
+                } else {
+                    body
+                };
                 ui.text_mid(
                     frame,
                     x,
@@ -727,6 +777,199 @@ pub fn draw_find(
             caret,
             pal.accent,
         );
+    }
+}
+
+/// Where the terminal's cells are, for drawing over them.
+#[derive(Debug, Clone, Copy)]
+pub struct TermArea {
+    pub left: u32,
+    pub right: u32,
+    pub top: u32,
+    pub cell_height: u32,
+}
+
+/// How a command block ended, for the mark on its prompt row.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BlockStatus {
+    Running,
+    Passed(Option<std::time::Duration>),
+    Failed(i32, Option<std::time::Duration>),
+    /// The shell did not say how it ended (cmd).
+    Ended,
+}
+
+/// A command block's prompt row on screen.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockMark {
+    pub row: u32,
+    /// The line of its prompt, which identifies it.
+    pub prompt: u64,
+    pub status: BlockStatus,
+    pub hovered: bool,
+}
+
+/// What the buttons on a hovered block do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockAction {
+    CopyOutput,
+    Rerun,
+}
+
+/// `3.4 s`, `1m 05s`.
+pub fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1} s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+fn mark_label(status: BlockStatus) -> (String, Option<char>) {
+    match status {
+        BlockStatus::Running => ("running".to_owned(), None),
+        BlockStatus::Passed(d) => (
+            d.map(format_duration).unwrap_or_default(),
+            Some(icon::CHECK),
+        ),
+        BlockStatus::Failed(code, d) => (
+            match d {
+                Some(d) => format!("exit {code} \u{b7} {}", format_duration(d)),
+                None => format!("exit {code}"),
+            },
+            Some(icon::CROSS),
+        ),
+        BlockStatus::Ended => (String::new(), None),
+    }
+}
+
+/// The chip at the right end of a prompt row: its rectangle, or `None` when
+/// there is nothing to say.
+fn mark_chip(ui: &mut Ui, area: &TermArea, mark: &BlockMark) -> Option<Rect> {
+    let (label, glyph) = mark_label(mark.status);
+    if label.is_empty() && glyph.is_none() {
+        return None;
+    }
+    let small = ui.font(Face::Ui, 12.0, REGULAR);
+    let lead = match (mark.status, glyph) {
+        (BlockStatus::Running, _) => ui.px(14.0),
+        (_, Some(_)) => ui.px(16.0),
+        _ => 0,
+    };
+    let w = ui.measure(&label, small) + lead + ui.px(16.0);
+    let h = ui.px(20.0).min(area.cell_height.max(ui.px(16.0)));
+    let y = area.top + mark.row * area.cell_height + area.cell_height / 2 - h / 2;
+    Some(Rect {
+        x: area.right.saturating_sub(w),
+        y,
+        w,
+        h,
+    })
+}
+
+/// Where a block's buttons are: (Copy output, Rerun), when it can show them.
+fn mark_buttons(
+    ui: &mut Ui,
+    area: &TermArea,
+    mark: &BlockMark,
+) -> Option<[(Rect, BlockAction); 2]> {
+    if !mark.hovered || mark.status == BlockStatus::Running {
+        return None;
+    }
+    let small = ui.font(Face::Ui, 12.0, REGULAR);
+    let mut x = mark_chip(ui, area, mark).map_or(area.right, |c| c.x);
+    let h = ui.px(20.0).min(area.cell_height.max(ui.px(16.0)));
+    let y = area.top + mark.row * area.cell_height + area.cell_height / 2 - h / 2;
+    let mut rects = Vec::new();
+    for (text, action) in [
+        ("Rerun", BlockAction::Rerun),
+        ("Copy output", BlockAction::CopyOutput),
+    ] {
+        let w = ui.measure(text, small) + ui.px(16.0);
+        x = x.saturating_sub(w + ui.px(6.0));
+        rects.push((Rect { x, y, w, h }, action));
+    }
+    Some([rects[1], rects[0]])
+}
+
+/// The button of a hovered block under (`x`, `y`).
+pub fn block_action_at(
+    ui: &mut Ui,
+    area: &TermArea,
+    mark: &BlockMark,
+    x: f64,
+    y: f64,
+) -> Option<BlockAction> {
+    mark_buttons(ui, area, mark)?
+        .into_iter()
+        .find(|(r, _)| r.contains(x, y))
+        .map(|(_, a)| a)
+}
+
+/// A hairline above each command, and its result as a chip at the right end
+/// of its prompt row, drawn over any text that reaches that far.
+pub fn draw_blocks(
+    frame: &mut Frame<'_>,
+    ui: &mut Ui,
+    pal: &Palette,
+    area: &TermArea,
+    marks: &[BlockMark],
+) {
+    let small = ui.font(Face::Ui, 12.0, REGULAR);
+    let edge = blend(pal.canvas, pal.fg, 34);
+    for mark in marks {
+        let y = area.top + mark.row * area.cell_height;
+        if mark.row > 0 {
+            fill_rect(
+                frame,
+                area.left,
+                y,
+                area.right.saturating_sub(area.left),
+                1,
+                pal.border,
+            );
+        }
+        if let Some(chip) = mark_chip(ui, area, mark) {
+            ui::card(
+                frame,
+                chip.x,
+                chip.y,
+                chip.w,
+                chip.h,
+                chip.h / 2,
+                pal.raised,
+                edge,
+            );
+            let (label, glyph) = mark_label(mark.status);
+            let mid = chip.mid();
+            let mut x = chip.x + ui.px(8.0);
+            let failed = matches!(mark.status, BlockStatus::Failed(..));
+            match (mark.status, glyph) {
+                (BlockStatus::Running, _) => {
+                    ui::dot(frame, x + ui.px(3.0), mid, ui.px(6.0), pal.blue);
+                    x += ui.px(14.0);
+                }
+                (_, Some(glyph)) => {
+                    let color = if failed { pal.red } else { pal.green };
+                    ui.icon(frame, x + ui.px(5.0), mid, glyph, 9.0, color);
+                    x += ui.px(16.0);
+                }
+                _ => {}
+            }
+            let color = if failed { pal.red } else { pal.label };
+            ui.text_mid(frame, x, mid, &label, small, color, chip.w);
+        }
+        if let Some(buttons) = mark_buttons(ui, area, mark) {
+            for (r, action) in buttons {
+                ui::card(frame, r.x, r.y, r.w, r.h, r.h / 2, pal.raised, edge);
+                let text = match action {
+                    BlockAction::CopyOutput => "Copy output",
+                    BlockAction::Rerun => "Rerun",
+                };
+                ui.text_mid(frame, r.x + ui.px(8.0), r.mid(), text, small, pal.fg, r.w);
+            }
+        }
     }
 }
 

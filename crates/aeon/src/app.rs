@@ -11,7 +11,7 @@ use aeon_launcher::ResidentCommand;
 use aeon_launcher::update::Status;
 use aeon_launcher::{sys, updater};
 use aeon_pty::{Pty, PtySize};
-use aeon_term::{Match, MouseMode, Point, Terminal};
+use aeon_term::{Event as TermEvent, Match, MouseMode, Point, Terminal};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
 use winit::event::{
@@ -24,7 +24,10 @@ use winit::platform::windows::IconExtWindows;
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Icon, Window, WindowId};
 
-use crate::chrome::{self, Hit, Pill, Project, SessionRow, Sidebar, SidebarState};
+use crate::chrome::{
+    self, BlockAction, BlockMark, BlockStatus, Hit, Pill, Project, RowState, SessionRow, Sidebar,
+    SidebarState, TermArea,
+};
 use crate::font::{self, Atlas};
 use crate::input::{self, Button, MouseAction};
 use crate::keys::Combo;
@@ -89,7 +92,25 @@ pub struct App {
     zoom: f32,
     /// A link under the mouse while Ctrl is held: its line, columns, target.
     link: Option<(u64, usize, usize, Target)>,
+    /// Whether the window has keyboard focus: a session counts as seen only
+    /// while it does.
+    focused: bool,
+    /// The prompt line of the command block under the mouse.
+    hover_block: Option<u64>,
 }
+
+/// Something that happened in a session you were not looking at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attention {
+    Failed(i32),
+    Done,
+    Bell,
+}
+
+/// Commands shorter than this never notify: you were probably watching.
+const NOTIFY_AFTER: Duration = Duration::from_secs(10);
+/// Command timings kept per session, by prompt line.
+const TIMINGS_KEPT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Drag {
@@ -156,6 +177,15 @@ struct Session {
     /// Lines the view is scrolled up from the bottom.
     scroll: usize,
     selection: Option<Selection>,
+    /// When the running command started, and its block's prompt line.
+    running: Option<(Instant, u64)>,
+    /// How long each finished command took, by its block's prompt line.
+    timings: Vec<(u64, Duration)>,
+    /// OSC 9;4 progress the program reports.
+    progress: Option<u8>,
+    attention: Option<Attention>,
+    /// No notifications from this session.
+    muted: bool,
 }
 
 /// Where everything goes in a window of a given size.
@@ -209,6 +239,8 @@ impl App {
             find: None,
             zoom: 0.0,
             link: None,
+            focused: true,
+            hover_block: None,
         }
     }
 
@@ -312,6 +344,11 @@ impl App {
             watcher,
             scroll: 0,
             selection: None,
+            running: None,
+            timings: Vec::new(),
+            progress: None,
+            attention: None,
+            muted: false,
         });
         self.active = self.sessions.len() - 1;
         self.update_title();
@@ -367,6 +404,245 @@ impl App {
         if index < self.sessions.len() && index != self.active {
             self.active = index;
             self.update_title();
+            self.request_redraw();
+        }
+        self.mark_seen();
+    }
+
+    /// The active session has been looked at: its marks clear.
+    fn mark_seen(&mut self) {
+        if self.focused
+            && let Some(session) = self.sessions.get_mut(self.active)
+            && session.attention.take().is_some()
+        {
+            self.request_redraw();
+        }
+    }
+
+    /// Reacts to what happened in session `index`: timing, status, and a
+    /// notification when a long command ends out of sight.
+    fn shell_events(&mut self, index: usize) {
+        let visible = index == self.active && self.focused && self.settings.is_none();
+        let project = {
+            let projects = self.projects();
+            projects
+                .iter()
+                .find(|p| p.sessions.contains(&index))
+                .map(|p| p.name.clone())
+                .unwrap_or_default()
+        };
+        let Some(session) = self.sessions.get_mut(index) else {
+            return;
+        };
+        let mut notify = None;
+        for event in session.term.take_events() {
+            match event {
+                TermEvent::CommandStarted { command } if !command.is_empty() => {
+                    let prompt = session.term.blocks().last().map_or(0, |b| b.prompt);
+                    session.running = Some((Instant::now(), prompt));
+                    session.progress = None;
+                }
+                TermEvent::CommandStarted { .. } => {}
+                TermEvent::CommandFinished { command, exit } => {
+                    let Some((start, prompt)) = session.running.take() else {
+                        continue;
+                    };
+                    let took = start.elapsed();
+                    if session.timings.len() >= TIMINGS_KEPT {
+                        session.timings.remove(0);
+                    }
+                    session.timings.push((prompt, took));
+                    session.progress = None;
+                    let failed = exit.filter(|code| *code != 0);
+                    if !visible {
+                        if let Some(code) = failed {
+                            session.attention = Some(Attention::Failed(code));
+                        } else if took >= NOTIFY_AFTER {
+                            session.attention = Some(Attention::Done);
+                        }
+                    }
+                    if !visible && !session.muted && took >= NOTIFY_AFTER {
+                        let place = if project.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" in {project}")
+                        };
+                        let took = chrome::format_duration(took);
+                        notify = Some(match failed {
+                            Some(code) => (
+                                format!("{command} failed{place}"),
+                                format!("Exit {code} after {took}."),
+                            ),
+                            None => (
+                                format!("{command} finished{place}"),
+                                format!("Done in {took}."),
+                            ),
+                        });
+                    }
+                }
+                TermEvent::Bell if !visible && session.attention.is_none() => {
+                    session.attention = Some(Attention::Bell);
+                }
+                TermEvent::Bell => {}
+                TermEvent::Progress(p) => session.progress = p,
+            }
+        }
+        if let Some((title, body)) = notify {
+            sys::notify_through_resident(&title, &body);
+            if let Some(view) = &self.view {
+                view.window
+                    .request_user_attention(Some(winit::window::UserAttentionType::Informational));
+            }
+        }
+    }
+
+    /// What the sidebar shows for a session.
+    fn row_state(session: &Session) -> (RowState, bool) {
+        if let Some(attention) = session.attention {
+            let state = match attention {
+                Attention::Failed(code) => RowState::Failed(code),
+                Attention::Done => RowState::Done,
+                Attention::Bell => RowState::Bell,
+            };
+            return (state, true);
+        }
+        let state = if let Some(p) = session.progress {
+            RowState::Progress(p)
+        } else if let Some(server) = session.context.servers.first() {
+            RowState::Server(server.port)
+        } else if session.running.is_some() {
+            RowState::Running
+        } else {
+            RowState::Idle
+        };
+        (state, false)
+    }
+
+    /// Command blocks with their prompt on screen, for the active session.
+    fn visible_blocks(&self) -> (Vec<BlockMark>, Vec<(u64, u64)>) {
+        let Some(session) = self.sessions.get(self.active) else {
+            return (Vec::new(), Vec::new());
+        };
+        let term = &session.term;
+        if term.modes().alt_screen {
+            return (Vec::new(), Vec::new());
+        }
+        let first = term.screen_line().saturating_sub(session.scroll as u64);
+        let rows = term.grid().rows() as u64;
+        let mut marks = Vec::new();
+        let mut tints = Vec::new();
+        for block in term.blocks() {
+            if block.command.is_empty() || block.output.is_none() {
+                continue;
+            }
+            let took = session
+                .timings
+                .iter()
+                .rev()
+                .find(|(p, _)| *p == block.prompt)
+                .map(|(_, d)| *d);
+            let status = match (block.end, block.exit) {
+                (None, _) => BlockStatus::Running,
+                (Some(_), Some(0)) => BlockStatus::Passed(took),
+                (Some(end), Some(code)) => {
+                    tints.push((block.prompt, end));
+                    BlockStatus::Failed(code, took)
+                }
+                (Some(_), None) => BlockStatus::Ended,
+            };
+            if (first..first + rows).contains(&block.prompt) {
+                marks.push(BlockMark {
+                    row: (block.prompt - first) as u32,
+                    prompt: block.prompt,
+                    status,
+                    hovered: self.hover_block == Some(block.prompt),
+                });
+            }
+        }
+        (marks, tints)
+    }
+
+    fn term_area(&self) -> Option<TermArea> {
+        let view = self.view.as_ref()?;
+        let layout = self.layout(view);
+        // The chip covers the last columns exactly, so no glyph peeks out.
+        let cols = self
+            .sessions
+            .get(self.active)
+            .map_or(layout.cols, |s| s.term.grid().cols());
+        Some(TermArea {
+            left: layout.sidebar,
+            right: layout.origin.0 + cols as u32 * view.atlas.cell_width,
+            top: layout.origin.1,
+            cell_height: view.atlas.cell_height,
+        })
+    }
+
+    /// Runs a block button: copy what the command printed, or run it again.
+    fn block_action(&mut self, prompt: u64, action: BlockAction) {
+        let Some(session) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        let Some(block) = session.term.blocks().find(|b| b.prompt == prompt).cloned() else {
+            return;
+        };
+        match action {
+            BlockAction::CopyOutput => {
+                let (Some(output), Some(end)) = (block.output, block.end) else {
+                    return;
+                };
+                let text = if end > output {
+                    let cols = session.term.grid().cols();
+                    session.term.text(
+                        Point {
+                            line: output,
+                            col: 0,
+                        },
+                        Point {
+                            line: end - 1,
+                            col: cols.saturating_sub(1),
+                        },
+                    )
+                } else {
+                    String::new()
+                };
+                let owner = self.view.as_ref().map_or(0, |v| hwnd(&v.window));
+                sys::set_clipboard(owner, text.trim_end());
+            }
+            BlockAction::Rerun => {
+                session.scroll = 0;
+                session.selection = None;
+                let mut bytes = block.command.into_bytes();
+                bytes.push(b'\r');
+                let _ = session.input.write_all(&bytes);
+            }
+        }
+        self.request_redraw();
+    }
+
+    /// Scrolls so the previous (`-1`) or next (`1`) command's prompt is at
+    /// the top of the view.
+    fn jump_prompt(&mut self, step: i32) {
+        let Some(session) = self.sessions.get_mut(self.active) else {
+            return;
+        };
+        let screen = session.term.screen_line();
+        let top = screen.saturating_sub(session.scroll as u64);
+        let prompts: Vec<u64> = session.term.blocks().map(|b| b.prompt).collect();
+        let target = if step < 0 {
+            prompts.iter().rev().find(|&&p| p < top).copied()
+        } else {
+            prompts.iter().find(|&&p| p > top).copied()
+        };
+        let scroll = match target {
+            Some(line) => screen
+                .saturating_sub(line)
+                .min(session.term.scrollback_len() as u64) as usize,
+            None if step > 0 => 0,
+            None => return,
+        };
+        if scroll != session.scroll {
+            session.scroll = scroll;
             self.request_redraw();
         }
     }
@@ -489,6 +765,8 @@ impl App {
         let scale = view.window.scale_factor();
         let projects = self.projects();
         let pill = self.pill();
+        let (marks, tints) = self.visible_blocks();
+        let area = self.term_area();
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -531,6 +809,8 @@ impl App {
                 matches: self.find.as_ref().map_or(&[], |f| &f.matches[..]),
                 current: self.find.as_ref().and_then(|f| f.current),
                 link: self.link.as_ref().map(|(line, a, b, _)| (*line, *a, *b)),
+                tints: &tints,
+                tint: render::blend(self.theme.bg, self.theme.ansi[1], 22),
             };
             render::draw(
                 &mut frame,
@@ -554,6 +834,9 @@ impl App {
                     &session.context,
                 );
             }
+            if let Some(area) = &area {
+                chrome::draw_blocks(&mut frame, &mut view.ui, &self.palette, area, &marks);
+            }
             if let Some(find) = &self.find {
                 let count = match (find.current, find.matches.len()) {
                     (_, 0) if find.query.is_empty() => String::new(),
@@ -572,13 +855,18 @@ impl App {
             }
         }
         if layout.sidebar > 0 {
-            let rows: Vec<SessionRow<'_>> = self
+            let rows: Vec<SessionRow> = self
                 .sessions
                 .iter()
                 .enumerate()
-                .map(|(i, s)| SessionRow {
-                    context: &s.context,
-                    title: title(i, s),
+                .map(|(i, s)| {
+                    let (state, unseen) = Self::row_state(s);
+                    SessionRow {
+                        title: title(i, s),
+                        state,
+                        unseen,
+                        muted: s.muted,
+                    }
                 })
                 .collect();
             let sidebar = Sidebar::new(
@@ -736,6 +1024,14 @@ impl App {
             }
             Key::Character(c) if ctrl && c == "0" => {
                 self.set_zoom(0.0);
+                Some(true)
+            }
+            Key::Named(NamedKey::ArrowUp) if ctrl => {
+                self.jump_prompt(-1);
+                Some(true)
+            }
+            Key::Named(NamedKey::ArrowDown) if ctrl => {
+                self.jump_prompt(1);
                 Some(true)
             }
             Key::Named(NamedKey::PageUp) if mods == ModifiersState::SHIFT => {
@@ -1015,6 +1311,19 @@ impl App {
     }
 
     fn press_left(&mut self, cell: (usize, usize)) {
+        if let Some(prompt) = self.hover_block
+            && let Some(area) = self.term_area()
+        {
+            let (marks, _) = self.visible_blocks();
+            let (x, y) = (self.cursor.x, self.cursor.y);
+            if let Some(mark) = marks.iter().find(|m| m.prompt == prompt)
+                && let Some(view) = self.view.as_mut()
+                && let Some(action) = chrome::block_action_at(&mut view.ui, &area, mark, x, y)
+            {
+                self.block_action(prompt, action);
+                return;
+            }
+        }
         if self.modifiers.control_key()
             && let Some((_, _, _, target)) = self.link.clone()
         {
@@ -1258,6 +1567,12 @@ impl App {
                 }
             }
             Some(Hit::NewSession) => self.new_session(),
+            Some(Hit::Mute(i)) => {
+                if let Some(session) = self.sessions.get_mut(i) {
+                    session.muted = !session.muted;
+                }
+                self.request_redraw();
+            }
             Some(Hit::Session(i)) => {
                 self.settings = None;
                 self.select(i);
@@ -1290,6 +1605,20 @@ impl App {
                 }));
         let in_terminal = self.cell_at(x, y).is_some();
         self.hover_link();
+        let block = self
+            .cell_at(x, y)
+            .and_then(|cell| self.point(cell))
+            .and_then(|point| {
+                let (marks, _) = self.visible_blocks();
+                marks
+                    .iter()
+                    .find(|m| m.prompt == point.line)
+                    .map(|m| m.prompt)
+            });
+        if block != self.hover_block {
+            self.hover_block = block;
+            self.request_redraw();
+        }
         let icon = if clickable || self.link.is_some() {
             CursorIcon::Pointer
         } else if in_terminal && !self.reporting() {
@@ -1457,6 +1786,8 @@ impl ApplicationHandler<Event> for App {
                     // Stay on the same text while new lines arrive below.
                     session.scroll = (session.scroll + scrolled).min(session.term.scrollback_len());
                 }
+                self.shell_events(index);
+                let session = &mut self.sessions[index];
                 let mut redraw = session.term.take_dirty() && index == self.active;
                 // The first report usually repeats the starting directory,
                 // which the bar already shows in full.
@@ -1517,7 +1848,13 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
-            WindowEvent::Focused(true) => self.refresh_update(),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if focused {
+                    self.refresh_update();
+                    self.mark_seen();
+                }
+            }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
                 self.update_pointer();

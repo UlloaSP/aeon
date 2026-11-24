@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. Command blocks, project tasks, split panes, and one palette for everything are on the way.
+> Aeon is early. Project tasks, split panes, and one palette for everything are on the way.
 
 ## Install
 
@@ -81,6 +81,12 @@ These are the defaults; change any of them in **Settings > Keyboard**. They use 
 | Ctrl+=, Ctrl+-, Ctrl+0, Ctrl+wheel | Text size for this window |
 
 Programs that use the mouse, such as vim or htop, get it; hold Shift to select text instead. Typing returns to the bottom.
+
+### Commands and what they did
+
+In PowerShell, every command is a block: a line above it, and a chip at the end of its prompt line with how long it took and whether it passed (`3.4 s` with a check, or `exit 1` in red with the block tinted). Hover a finished command for **Copy output** and **Rerun**. **Ctrl+Up** and **Ctrl+Down** jump between commands. cmd marks its prompts but cannot say how a command ended.
+
+The sidebar shows what each session is doing: a blue dot while a command runs, its port while it serves one, the progress a program reports (`64%`), and, for a session you are not looking at, `exit 1` in red, `done` in green, or `bell`, in bold until you open it. When a command that ran for 10 seconds or more ends in a session you are not looking at, Windows shows a notification and the taskbar button flashes. The bell at the end of a session row (on hover) mutes its notifications.
 
 ### The launcher
 

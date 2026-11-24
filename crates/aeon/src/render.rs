@@ -100,6 +100,9 @@ pub struct Overlay<'a> {
     pub current: Option<usize>,
     /// A link under the mouse with Ctrl held: line and columns.
     pub link: Option<(u64, usize, usize)>,
+    /// Line ranges drawn on a tinted background: commands that failed.
+    pub tints: &'a [(u64, u64)],
+    pub tint: u32,
 }
 
 pub fn draw(
@@ -128,6 +131,20 @@ pub fn draw(
         let y = top + row as u32 * ch;
         let number = first + row as u64;
         let cells = term.line(number).unwrap_or_default();
+        if overlay
+            .tints
+            .iter()
+            .any(|(a, b)| (*a..*b).contains(&number))
+        {
+            fill_rect(
+                frame,
+                left,
+                y,
+                frame.width.saturating_sub(left),
+                ch,
+                overlay.tint,
+            );
+        }
         // Find results on this line; `matches` is ordered by line.
         let from = overlay.matches.partition_point(|m| m.start.line < number);
         let to = overlay.matches.partition_point(|m| m.start.line <= number);

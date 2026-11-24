@@ -315,6 +315,56 @@ mod tests {
     }
 
     #[test]
+    fn integrated_powershell_marks_commands_and_their_exit() {
+        use std::io::Write;
+        let Some(program) = ["pwsh.exe", "powershell.exe"]
+            .into_iter()
+            .find_map(crate::find_in_path)
+        else {
+            return;
+        };
+        let appdata = std::env::temp_dir().join(format!("aeon-test-marks-{}", std::process::id()));
+        let command = crate::integrate(Command::new(program), None)
+            .cwd(env!("CARGO_MANIFEST_DIR"))
+            .env("APPDATA", &appdata);
+        let mut pty = ConPty::spawn(
+            &command,
+            PtySize {
+                rows: 24,
+                cols: 120,
+            },
+        )
+        .unwrap();
+        let mut reader = pty.reader.take().unwrap();
+        let mut writer = pty.writer.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while let Ok(n @ 1..) = reader.read(&mut buf) {
+                if tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut out = String::new();
+        let wait_for = |marker: &str, out: &mut String| {
+            while !out.contains(marker) {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                match rx.recv_timeout(left) {
+                    Ok(chunk) => out.push_str(&String::from_utf8_lossy(&chunk)),
+                    Err(_) => panic!("no {marker:?} in output: {out:?}"),
+                }
+            }
+        };
+        wait_for("\x1b]133;B", &mut out);
+        writer.write_all(b"cmd /c exit 3\r").unwrap();
+        wait_for("\x1b]133;D;3", &mut out);
+        assert!(out.contains("\x1b]133;C"), "{out:?}");
+        let _ = std::fs::remove_dir_all(&appdata);
+    }
+
+    #[test]
     fn integrated_powershell_reports_its_directory() {
         let Some(program) = ["pwsh.exe", "powershell.exe"]
             .into_iter()

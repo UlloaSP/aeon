@@ -335,6 +335,44 @@ pub fn notify_settings_changed() {
     send_to_resident(crate::ResidentCommand::SettingsChanged);
 }
 
+/// Marks the `WM_COPYDATA` a terminal sends the resident to show a
+/// notification, so no other copied data is mistaken for one.
+const NOTIFY_DATA: usize = 0xAE01;
+
+/// Shows a Windows notification from the resident's icon: the terminal has
+/// no icon of its own. `false` when no resident runs.
+pub fn notify_through_resident(title: &str, text: &str) -> bool {
+    let class = wide(TRAY_CLASS);
+    let payload: Vec<u16> = title
+        .encode_utf16()
+        .chain(Some(0))
+        .chain(text.encode_utf16())
+        .collect();
+    let data = windows_sys::Win32::System::DataExchange::COPYDATASTRUCT {
+        dwData: NOTIFY_DATA,
+        cbData: (payload.len() * 2) as u32,
+        lpData: payload.as_ptr() as *mut c_void,
+    };
+    // SAFETY: `data` and `payload` outlive the synchronous send; a hung
+    // resident makes the call return at once instead of blocking.
+    unsafe {
+        let window = FindWindowW(class.as_ptr(), null());
+        if window.is_null() {
+            return false;
+        }
+        let mut result = 0;
+        SendMessageTimeoutW(
+            window,
+            windows_sys::Win32::UI::WindowsAndMessaging::WM_COPYDATA,
+            0,
+            &data as *const _ as isize,
+            SMTO_ABORTIFHUNG,
+            500,
+            &mut result,
+        ) != 0
+    }
+}
+
 /// GETs an https `url`, following redirects, through the system proxy, and
 /// returns the HTTP status. Only a 200's body is read: `on_chunk` receives
 /// it piece by piece and `on_progress(done, total)` reports bytes, `total`
@@ -627,7 +665,13 @@ mod tray {
     impl Tray {
         /// Shows a notification from the icon, such as "Update ready".
         pub fn notify(&self, title: &str, text: &str) {
-            let mut data = notify_data(self.hwnd as HWND, null_mut(), "");
+            balloon(self.hwnd as HWND, title, text);
+        }
+    }
+
+    fn balloon(hwnd: HWND, title: &str, text: &str) {
+        {
+            let mut data = notify_data(hwnd, null_mut(), "");
             data.uFlags = NIF_INFO;
             data.dwInfoFlags = NIIF_INFO;
             for (slot, unit) in data
@@ -853,6 +897,25 @@ mod tray {
                     (state.on_command)(command.tray_command());
                 }
                 return Some(0);
+            }
+            if msg == windows_sys::Win32::UI::WindowsAndMessaging::WM_COPYDATA {
+                // SAFETY: for WM_COPYDATA, lParam points at a COPYDATASTRUCT
+                // whose data stays valid for the duration of this call.
+                let text = unsafe {
+                    let data = &*(lparam
+                        as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
+                    if data.dwData != super::NOTIFY_DATA || data.lpData.is_null() {
+                        return None;
+                    }
+                    let units = std::slice::from_raw_parts(
+                        data.lpData as *const u16,
+                        data.cbData as usize / 2,
+                    );
+                    String::from_utf16_lossy(units)
+                };
+                let (title, body) = text.split_once('\0').unwrap_or((&text, ""));
+                balloon(hwnd, title, body);
+                return Some(1);
             }
             None
         });

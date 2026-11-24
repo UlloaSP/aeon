@@ -76,6 +76,39 @@ pub struct Match {
     pub len: usize,
 }
 
+/// One command, from its prompt to where it finished, as the shell marked
+/// it with OSC 133 (`A` prompt, `B` input, `C` output, `D;exit` done).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Block {
+    /// The line the prompt started on.
+    pub prompt: u64,
+    /// Where typing started, after the prompt.
+    pub input: Option<Point>,
+    /// The line output started on, once the command ran.
+    pub output: Option<u64>,
+    /// The line the shell was on when the command finished.
+    pub end: Option<u64>,
+    /// The exit status, when the shell reported one.
+    pub exit: Option<i32>,
+    /// What was typed, read off the screen when it ran.
+    pub command: String,
+}
+
+/// Things that happened in the shell, for the window to react to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    CommandStarted {
+        command: String,
+    },
+    CommandFinished {
+        command: String,
+        exit: Option<i32>,
+    },
+    Bell,
+    /// OSC 9;4 progress: a percentage, or `None` when it ended.
+    Progress(Option<u8>),
+}
+
 /// Lines kept above the screen when nothing else is configured.
 pub const DEFAULT_SCROLLBACK: usize = 5000;
 
@@ -171,7 +204,12 @@ struct State {
     /// Working directory the shell last reported through OSC 7 or OSC 9;9.
     cwd: Option<String>,
     cwd_changed: bool,
+    blocks: VecDeque<Block>,
+    events: Vec<Event>,
 }
+
+/// Blocks kept, oldest dropped first; far more than a screen of history.
+const BLOCK_LIMIT: usize = 2000;
 
 impl Terminal {
     pub fn new(rows: usize, cols: usize) -> Self {
@@ -199,6 +237,8 @@ impl Terminal {
                 dirty: true,
                 cwd: None,
                 cwd_changed: false,
+                blocks: VecDeque::new(),
+                events: Vec::new(),
             },
         }
     }
@@ -261,6 +301,18 @@ impl Terminal {
     /// Returns whether the reported working directory changed, and clears the flag.
     pub fn take_cwd_changed(&mut self) -> bool {
         std::mem::take(&mut self.state.cwd_changed)
+    }
+
+    /// Commands the shell marked, oldest first, while their prompt is still
+    /// in the history.
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        let first = self.state.dropped;
+        self.state.blocks.iter().filter(move |b| b.prompt >= first)
+    }
+
+    /// What happened since the last call.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.state.events)
     }
 
     /// How many lines went into the scrollback since the last call, so a
@@ -414,6 +466,98 @@ impl Terminal {
 }
 
 impl State {
+    /// The history line the cursor is on.
+    fn cursor_line(&self) -> u64 {
+        self.dropped + self.scrollback.len() as u64 + self.cursor.row as u64
+    }
+
+    /// OSC 133 marks from the shell's prompt, which delimit commands.
+    fn mark(&mut self, kind: &[u8], rest: &[&[u8]]) {
+        if self.modes.alt_screen {
+            return;
+        }
+        let here = Point {
+            line: self.cursor_line(),
+            col: self.cursor.col,
+        };
+        match kind {
+            b"A" => {
+                if self.blocks.len() >= BLOCK_LIMIT {
+                    self.blocks.pop_front();
+                }
+                self.blocks.push_back(Block {
+                    prompt: here.line,
+                    input: None,
+                    output: None,
+                    end: None,
+                    exit: None,
+                    command: String::new(),
+                });
+            }
+            b"B" => {
+                if let Some(block) = self.blocks.back_mut() {
+                    block.input = Some(here);
+                }
+            }
+            b"C" => {
+                let command = self
+                    .blocks
+                    .back()
+                    .and_then(|b| b.input)
+                    .map(|start| self.typed_since(start))
+                    .unwrap_or_default();
+                if let Some(block) = self.blocks.back_mut() {
+                    block.output = Some(here.line);
+                    block.command = command.clone();
+                }
+                self.events.push(Event::CommandStarted { command });
+            }
+            b"D" => {
+                let exit = rest
+                    .first()
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|v| v.trim().parse().ok());
+                if let Some(block) = self.blocks.back_mut()
+                    && block.end.is_none()
+                    && block.output.is_some()
+                {
+                    block.end = Some(here.line);
+                    block.exit = exit;
+                    self.events.push(Event::CommandFinished {
+                        command: block.command.clone(),
+                        exit,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The text typed after the prompt, up to the cursor.
+    fn typed_since(&self, start: Point) -> String {
+        let screen = self.dropped + self.scrollback.len() as u64;
+        let mut text = String::new();
+        for line in start.line..=self.cursor_line() {
+            let Some(row) = line.checked_sub(screen).map(|r| r as usize) else {
+                continue;
+            };
+            if row >= self.grid.rows() {
+                break;
+            }
+            let from = if line == start.line { start.col } else { 0 };
+            let cells = self.grid.row(row);
+            let piece: String = cells[from.min(cells.len())..]
+                .iter()
+                .map(|c| c.ch)
+                .collect();
+            text.push_str(piece.trim_end());
+            if !self.grid.wrapped(row) && line != self.cursor_line() {
+                text.push(' ');
+            }
+        }
+        text.trim().to_owned()
+    }
+
     fn screen(&self) -> &Grid {
         if self.modes.alt_screen {
             &self.alt
@@ -713,6 +857,10 @@ impl vte::Perform for State {
                 let next = (self.cursor.col / 8 + 1) * 8;
                 self.cursor.col = next.min(self.cols() - 1);
             }
+            0x07 => {
+                self.events.push(Event::Bell);
+                return;
+            }
             _ => return,
         }
         self.pending_wrap = false;
@@ -720,6 +868,26 @@ impl vte::Perform for State {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        match params {
+            [b"133", kind, rest @ ..] => {
+                self.mark(kind, rest);
+                return;
+            }
+            [b"9", b"4", state, rest @ ..] => {
+                let value = rest
+                    .first()
+                    .and_then(|v| std::str::from_utf8(v).ok())
+                    .and_then(|v| v.parse::<u8>().ok())
+                    .map(|v| v.min(100));
+                let progress = match *state {
+                    b"0" => None,
+                    _ => Some(value.unwrap_or(0)),
+                };
+                self.events.push(Event::Progress(progress));
+                return;
+            }
+            _ => {}
+        }
         if let Some(path) = reported_path(params)
             && self.cwd.as_deref() != Some(path.as_str())
         {
@@ -1163,6 +1331,58 @@ mod tests {
         assert_eq!(line[2].ch, 'd');
         assert_eq!(line[4].fg, Color::Default);
         assert_eq!(line_text(&t, t.first_line()), "red plain");
+    }
+
+    #[test]
+    fn prompt_marks_make_blocks_and_events() {
+        let mut t = term(5, 20, "\x1b]133;A\x1b\\> \x1b]133;B\x1b\\npm test");
+        t.advance(
+            b"\r\n\x1b]133;C\x1b\\failed\r\n\x1b]133;D;1\x1b\\\x1b]133;A\x1b\\> \x1b]133;B\x1b\\",
+        );
+        let blocks: Vec<&Block> = t.blocks().collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].command, "npm test");
+        assert_eq!(blocks[0].prompt, 0);
+        assert_eq!(blocks[0].output, Some(1));
+        assert_eq!(blocks[0].end, Some(2));
+        assert_eq!(blocks[0].exit, Some(1));
+        assert_eq!(blocks[1].prompt, 2);
+        assert_eq!(
+            t.take_events(),
+            [
+                Event::CommandStarted {
+                    command: "npm test".into()
+                },
+                Event::CommandFinished {
+                    command: "npm test".into(),
+                    exit: Some(1)
+                },
+            ]
+        );
+        assert!(t.take_events().is_empty());
+    }
+
+    #[test]
+    fn done_without_a_run_command_is_not_a_finish() {
+        let mut t = term(
+            3,
+            10,
+            "\x1b]133;A\x1b\\> \x1b]133;B\x1b\\\x1b]133;D;0\x1b\\",
+        );
+        assert!(t.take_events().is_empty());
+    }
+
+    #[test]
+    fn bell_and_progress_are_reported() {
+        let mut t = term(1, 10, "\x07\x1b]9;4;1;64\x07\x1b]9;4;0;0\x07");
+        assert_eq!(
+            t.take_events(),
+            [
+                Event::Bell,
+                Event::Progress(Some(64)),
+                Event::Progress(None)
+            ]
+        );
     }
 
     #[test]
