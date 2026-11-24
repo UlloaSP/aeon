@@ -170,6 +170,39 @@ jobs:
           MAKE_LATEST: ${{ needs.preflight.outputs.make_latest }}
         run: gh release edit "$RELEASE_TAG" --draft=false --latest="$MAKE_LATEST"
 
+      # The feed installed Aeons check for updates (crates/aeon-launcher/src/
+      # update.rs): one file per channel on the fixed `update-feed` release.
+      # Written last, so it only ever points at a published release. Stable
+      # prereleases (rc builds) are not offered to anyone.
+      - name: Update the update feed
+        if: needs.preflight.outputs.channel == 'nightly' || needs.preflight.outputs.is_prerelease == 'false'
+        working-directory: release-assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.tag }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+          CHANNEL: ${{ needs.preflight.outputs.channel }}
+        run: |
+          base="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG"
+          {
+            echo "version $VERSION"
+            echo "notes https://github.com/$GH_REPO/releases/tag/$RELEASE_TAG"
+            for arch in x64 arm64; do
+              file="aeon-$VERSION-windows-$arch.msi"
+              sha="$(awk -v f="$file" '$2 == f { print $1 }' SHA256SUMS)"
+              if [[ -z "$sha" ]]; then
+                echo "No checksum for $file." >&2
+                exit 1
+              fi
+              echo "$arch $base/$file $sha"
+            done
+          } > "$CHANNEL.txt"
+          cat "$CHANNEL.txt"
+          # Stable and nightly runs can both get here first; either may create it.
+          gh release view update-feed > /dev/null 2>&1             || gh release create update-feed --title "Update feed" --prerelease --latest=false               --notes "What installed copies of Aeon read to find updates. Not a release; nothing to download here."             || gh release view update-feed > /dev/null
+          gh release upload update-feed "$CHANNEL.txt" --clobber
+
   # Nightlies pile up fast. Keep the newest few; stable releases are never touched.
   prune_nightlies:
     name: Prune old nightlies

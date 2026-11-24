@@ -37,7 +37,7 @@ After a stable release, nightlies automatically move to the next patch version (
 1. **Preflight** resolves the channel, version, tag, previous tag, and commit ([resolve-release.sh](../.github/scripts/resolve-release.sh)).
 2. **Quality** runs clippy and the full test suite on that commit ([rust-checks.yml](../.github/workflows/rust-checks.yml)), the same workflow CI uses.
 3. **Windows x64 / arm64** build the release binary, package the MSI and portable zip, and on x64 install the MSI, launch Aeon, record its startup memory in the job summary, and uninstall ([release-windows.yml](../.github/workflows/release-windows.yml)). CI runs this same workflow on packaging changes, so the release path is exercised before release day.
-4. **Publish** writes `SHA256SUMS`, creates a draft release with generated notes, uploads every asset, and only then publishes it. A nightly's tag is created at this point.
+4. **Publish** writes `SHA256SUMS`, creates a draft release with generated notes, uploads every asset, and only then publishes it. A nightly's tag is created at this point. Then it points the update feed at the new release: `stable.txt` or `nightly.txt` on the `update-feed` release, which installed Aeons read to find updates. That release is not a version; never delete it, and never edit its files by hand.
 5. **Prune** deletes all but the newest 10 nightlies (releases and tags). Stable releases are never touched.
 
 ## MSI details

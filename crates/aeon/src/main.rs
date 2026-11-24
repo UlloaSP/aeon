@@ -21,10 +21,16 @@ pub const VERSION: &str = match option_env!("AEON_VERSION") {
 /// `aeon` opens a terminal. `aeon --command <cmd>` opens one that runs `cmd`
 /// first. `aeon --background` is the resident launcher; the installer's
 /// startup entry adds `--at-sign-in`, so the resident can honor the
-/// "Start with Windows" setting.
+/// "Start with Windows" setting, and a terminal that asks for an update check
+/// while no resident runs starts one with `--check-updates`.
 enum Mode {
-    Terminal { run: Option<String> },
-    Resident { at_sign_in: bool },
+    Terminal {
+        run: Option<String>,
+    },
+    Resident {
+        at_sign_in: bool,
+        check_updates: bool,
+    },
 }
 
 fn mode() -> Mode {
@@ -32,6 +38,7 @@ fn mode() -> Mode {
     if args.iter().any(|a| a == "--background") {
         return Mode::Resident {
             at_sign_in: args.iter().any(|a| a == "--at-sign-in"),
+            check_updates: args.iter().any(|a| a == "--check-updates"),
         };
     }
     let run = args
@@ -43,7 +50,10 @@ fn mode() -> Mode {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match mode() {
-        Mode::Resident { at_sign_in } => launcher::run(at_sign_in),
+        Mode::Resident {
+            at_sign_in,
+            check_updates,
+        } => launcher::run(at_sign_in, check_updates),
         Mode::Terminal { run } => {
             let event_loop = EventLoop::<app::Event>::with_user_event().build()?;
             let mut app = app::App::new(event_loop.create_proxy(), run);

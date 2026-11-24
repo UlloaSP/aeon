@@ -3,15 +3,19 @@ use std::io::{Read, Write};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use aeon_config::Config;
 use aeon_context::{Context, Watcher};
+use aeon_launcher::ResidentCommand;
+use aeon_launcher::update::Status;
+use aeon_launcher::{sys, updater};
 use aeon_pty::{Pty, PtySize};
 use aeon_term::Terminal;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event::{ElementState, KeyEvent, MouseButton, StartCause, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 use winit::platform::windows::IconExtWindows;
@@ -19,7 +23,7 @@ use winit::window::{CursorIcon, Icon, Window, WindowId};
 
 use crate::font::{self, Atlas};
 use crate::keys::Combo;
-use crate::render::{self, Frame, Sidebar, SidebarEntry, Theme};
+use crate::render::{self, Frame, Sidebar, SidebarContent, SidebarEntry, Theme, UpdateRow};
 use crate::settings::{self, Outcome, Settings};
 
 /// Identifies a session across threads; never reused within a process.
@@ -54,7 +58,16 @@ pub struct App {
     pointer: bool,
     modifiers: ModifiersState,
     cursor: PhysicalPosition<f64>,
+    /// What the resident last wrote about updates. Read at start, on focus,
+    /// and while something is under way: no timer runs while idle.
+    update: Status,
+    /// Keep reading the status until then, so the answer to a request
+    /// arrives even before the resident starts on it.
+    update_watch_until: Option<Instant>,
 }
+
+/// How often the update status is read while a check or download runs.
+const UPDATE_POLL: Duration = Duration::from_millis(400);
 
 /// The window and what draws into it; shared by every session.
 struct View {
@@ -107,6 +120,8 @@ impl App {
             cursor: PhysicalPosition::new(-1.0, -1.0),
             settings: None,
             pointer: false,
+            update: updater::read_status(),
+            update_watch_until: None,
         }
     }
 
@@ -336,6 +351,7 @@ impl App {
         let layout = self.layout(view);
         let scale = view.window.scale_factor();
         let padding = (f64::from(self.config.window.padding) * scale).round() as u32;
+        let update_row = self.update_row();
         let Some(view) = self.view.as_mut() else {
             return;
         };
@@ -395,9 +411,12 @@ impl App {
                 &mut view.atlas,
                 &self.theme,
                 &sidebar,
-                &entries,
-                self.active,
-                self.settings.is_some(),
+                &SidebarContent {
+                    entries: &entries,
+                    active: self.active,
+                    settings_open: self.settings.is_some(),
+                    update: update_row,
+                },
             );
         }
         let _ = buffer.present();
@@ -510,6 +529,16 @@ impl App {
         let sidebar = Sidebar::new(&view.atlas, scale);
         if sidebar.is_settings_button(x, y, size.height) {
             self.toggle_settings();
+        } else if self.update_row().is_some() && sidebar.is_update_button(x, y, size.height) {
+            let command = match self.update {
+                Status::Available(_) => Some(ResidentCommand::DownloadUpdate),
+                Status::Ready { .. } => Some(ResidentCommand::InstallUpdate),
+                Status::Error(_) => Some(ResidentCommand::CheckUpdates),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.update_command(command);
+            }
         } else if sidebar.is_new_button(x, y, &view.atlas) {
             self.new_session();
         } else if let Some(i) = sidebar.row_at(x, y, self.sessions.len()) {
@@ -531,6 +560,7 @@ impl App {
         let clickable = if x < f64::from(layout.sidebar) {
             let sidebar = Sidebar::new(&view.atlas, scale);
             sidebar.is_settings_button(x, y, size.height)
+                || (self.update_row().is_some() && sidebar.is_update_button(x, y, size.height))
                 || sidebar.is_new_button(x, y, &view.atlas)
                 || sidebar.row_at(x, y, self.sessions.len()).is_some()
         } else {
@@ -552,7 +582,7 @@ impl App {
     fn toggle_settings(&mut self) {
         self.settings = match self.settings {
             Some(_) => None,
-            None => Some(Settings::new(&self.config)),
+            None => Some(Settings::new(&self.config, self.update.clone())),
         };
         self.request_redraw();
     }
@@ -566,6 +596,7 @@ impl App {
                 self.request_redraw();
             }
             Outcome::OpenConfigFile => crate::launcher::open_settings(),
+            Outcome::Update(command) => self.update_command(command),
             Outcome::Save(changes) => {
                 let result = self.save_settings(&changes);
                 if let Some(panel) = &mut self.settings {
@@ -597,6 +628,59 @@ impl App {
         Ok(())
     }
 
+    /// The sidebar's update row, when there is something to show.
+    fn update_row(&self) -> Option<UpdateRow> {
+        let [_, red, green, ..] = self.theme.ansi;
+        let muted = self.theme.ansi[8];
+        let (icon, label, color, percent) = match &self.update {
+            Status::Available(_) => ('\u{2193}', "Update available".to_owned(), green, None),
+            Status::Downloading { percent, .. } => (
+                '\u{2193}',
+                format!("Downloading {percent}%"),
+                self.theme.fg,
+                Some(*percent),
+            ),
+            Status::Ready { .. } => ('\u{25cf}', "Restart to update".to_owned(), green, None),
+            Status::Error(_) => ('!', "Update failed. Retry".to_owned(), red, None),
+            Status::Checking => ('\u{2022}', "Checking for updates".to_owned(), muted, None),
+            Status::Idle | Status::UpToDate => return None,
+        };
+        Some(UpdateRow {
+            icon,
+            label,
+            color,
+            percent,
+        })
+    }
+
+    /// Asks the resident to act on updates, starting one when none runs:
+    /// it checks as soon as it is up.
+    fn update_command(&mut self, command: ResidentCommand) {
+        if !sys::send_to_resident(command) {
+            let _ = std::env::current_exe().and_then(|exe| {
+                std::process::Command::new(exe)
+                    .args(["--background", "--check-updates"])
+                    .spawn()
+                    .map(drop)
+            });
+        }
+        self.update_watch_until = Some(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// Re-reads the update status, redrawing only when it changed.
+    fn refresh_update(&mut self) {
+        let status = updater::read_status();
+        if status == self.update {
+            return;
+        }
+        self.update = status;
+        if let Some(panel) = &mut self.settings {
+            panel.update = self.update.clone();
+            panel.rebuild(&self.config);
+        }
+        self.request_redraw();
+    }
+
     fn session_index(&self, id: SessionId) -> Option<usize> {
         self.sessions.iter().position(|s| s.id == id)
     }
@@ -615,6 +699,31 @@ impl ApplicationHandler<Event> for App {
         if let Err(e) = started {
             eprintln!("aeon: failed to start: {e}");
             event_loop.exit();
+        }
+    }
+
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
+            // about_to_wait schedules the next read, if one is still needed.
+            event_loop.set_control_flow(ControlFlow::Wait);
+            self.refresh_update();
+        }
+    }
+
+    /// Polls the update status only while a check or download is under way.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let watching = self.update_watch_until.is_some_and(|t| now < t);
+        let busy = matches!(self.update, Status::Checking | Status::Downloading { .. });
+        if !watching {
+            self.update_watch_until = None;
+        }
+        match event_loop.control_flow() {
+            ControlFlow::WaitUntil(_) if watching || busy => {}
+            _ if watching || busy => {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(now + UPDATE_POLL))
+            }
+            _ => event_loop.set_control_flow(ControlFlow::Wait),
         }
     }
 
@@ -685,6 +794,7 @@ impl ApplicationHandler<Event> for App {
                 }
             }
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::Focused(true) => self.refresh_update(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(&event, event_loop),
             WindowEvent::CursorMoved { position, .. } => {
