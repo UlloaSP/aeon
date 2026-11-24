@@ -3,27 +3,29 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use aeon_config::Config;
+use aeon_launcher::profiles::{self, Kind};
 use aeon_launcher::{
-    Action, App, Hotkey, Icon, Icons, Item, Launcher, Sources, Theme as WindowsTheme, TrayCommand,
-    apps, history, sys, update, updater,
+    Action, App, Hotkey, Icon, Icons, Item, Launcher, Profile, Sources, Theme as WindowsTheme,
+    TrayCommand, apps, history, sys, update, updater,
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::windows::{CornerPreference, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::app::points_to_px;
-use crate::font::{self, Atlas};
-use crate::render::{self, Frame, Theme};
+use crate::chrome::Rect;
+use crate::palette::{self, Content};
+use crate::render::{Frame, Theme};
+use crate::ui::{Palette, Ui};
 
 /// One resident per sign-in session; a second `--background` just exits.
 /// Development builds take their own lock, so they run beside an installed
@@ -38,14 +40,7 @@ const INSTANCE_LOCK: &str = if cfg!(debug_assertions) {
 /// the last load is older than this.
 const APPS_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
-const WIDTH: f64 = 680.0;
-const INPUT_HEIGHT: f64 = 52.0;
-const ROW_HEIGHT: f64 = 38.0;
-const PAD: f64 = 8.0;
-const INPUT_POINTS: f32 = 14.0;
-const LIST_POINTS: f32 = 11.0;
-/// App icons in the list, in logical pixels.
-const ICON_SIZE: f64 = 24.0;
+const WIDTH: f64 = 640.0;
 
 pub enum Event {
     Hotkey,
@@ -54,6 +49,7 @@ pub enum Event {
         apps: Vec<App>,
         /// Programs on PATH, which tell commands from web searches.
         commands: HashSet<String>,
+        profiles: Vec<Profile>,
     },
     /// An app's icon, or `None` when the shell has none, from the icon thread.
     Icon(String, Option<Icon>),
@@ -92,12 +88,15 @@ struct Resident {
     /// Holds the global hotkey; replaced when settings change it.
     hotkey_listener: Option<sys::HotkeyListener>,
     config: Config,
-    theme: Theme,
+    colors: Palette,
     hotkey: Result<Hotkey, String>,
     view: Option<View>,
     launcher: Launcher,
     apps: Vec<App>,
     commands: HashSet<String>,
+    profiles: Vec<Profile>,
+    /// The mouse, for clicking a result.
+    cursor: PhysicalPosition<f64>,
     /// When the app list was last requested; `None` before the first load.
     apps_requested: Option<Instant>,
     icons: Icons,
@@ -116,8 +115,7 @@ struct Resident {
 struct View {
     window: Rc<Window>,
     surface: softbuffer::Surface<Rc<Window>, Rc<Window>>,
-    input: Atlas,
-    list: Atlas,
+    ui: Ui,
 }
 
 impl Resident {
@@ -153,13 +151,15 @@ impl Resident {
             proxy,
             tray: None,
             hotkey_listener: None,
-            theme: Theme::new(&config.colors),
+            colors: Palette::new(&Theme::new(&config.colors)),
             config,
             hotkey,
             view: None,
             launcher: Launcher::default(),
             apps: Vec::new(),
             commands: HashSet::new(),
+            profiles: Vec::new(),
+            cursor: PhysicalPosition::new(-1.0, -1.0),
             apps_requested: None,
             icons,
             icon_cache: HashMap::new(),
@@ -173,7 +173,6 @@ impl Resident {
         &self,
         event_loop: &ActiveEventLoop,
     ) -> Result<View, Box<dyn std::error::Error>> {
-        let font = Rc::new(font::load(self.config.font.path.as_deref())?);
         let window = Rc::new(
             event_loop.create_window(
                 Window::default_attributes()
@@ -185,15 +184,13 @@ impl Resident {
                     .with_skip_taskbar(true)
                     .with_undecorated_shadow(true)
                     .with_corner_preference(CornerPreference::Round)
-                    .with_inner_size(LogicalSize::new(WIDTH, INPUT_HEIGHT)),
+                    .with_inner_size(LogicalSize::new(WIDTH, 52.0)),
             )?,
         );
-        let scale = window.scale_factor();
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
         Ok(View {
-            input: Atlas::new(font.clone(), points_to_px(INPUT_POINTS, scale)),
-            list: Atlas::new(font, points_to_px(LIST_POINTS, scale)),
+            ui: Ui::new(window.scale_factor()),
             window,
             surface,
         })
@@ -218,6 +215,8 @@ impl Resident {
             apps: self.apps.clone(),
             commands: self.commands.clone(),
             search_url: self.config.launcher.search_url.clone(),
+            profiles: self.profiles.clone(),
+            ..Sources::default()
         });
         self.load_apps_if_stale();
         if self.hotkey.is_ok() {
@@ -260,7 +259,7 @@ impl Resident {
             .hotkey
             .parse::<Hotkey>()
             .map_err(|e| format!("Invalid [launcher] hotkey: {e}"));
-        self.theme = Theme::new(&config.colors);
+        self.colors = Palette::new(&Theme::new(&config.colors));
         self.updater.request(updater::Request::Configure {
             channel: channel(&config),
             automatic: config.updates.check,
@@ -292,6 +291,7 @@ impl Resident {
                 let _ = proxy.send_event(Event::Catalog {
                     apps: apps::load(),
                     commands: apps::path_commands(),
+                    profiles: profiles::detect(),
                 });
             });
     }
@@ -333,7 +333,7 @@ impl Resident {
     /// Asks for the icons of listed apps that have none yet.
     fn request_icons(&mut self) {
         let Some(view) = &self.view else { return };
-        let size = (ICON_SIZE * view.window.scale_factor()).round() as u32;
+        let size = view.ui.px(palette::ICON);
         for item in self.launcher.items() {
             if let Item::App(app) = item
                 && !self.icon_cache.contains_key(&app.id)
@@ -348,15 +348,10 @@ impl Resident {
     fn resize(&mut self) {
         self.request_icons();
         let Some(view) = &self.view else { return };
-        let rows = self.launcher.items().len() as f64;
-        let list = if rows > 0.0 {
-            PAD + rows * ROW_HEIGHT + PAD
-        } else {
-            0.0
-        };
+        let height = palette::height(&view.ui, self.launcher.items().len());
         let _ = view
             .window
-            .request_inner_size(LogicalSize::new(WIDTH, INPUT_HEIGHT + list));
+            .request_inner_size(PhysicalSize::new(view.ui.px(WIDTH), height));
         view.window.request_redraw();
     }
 
@@ -421,6 +416,9 @@ impl Resident {
                     Err(std::io::Error::other("no browser opened the search"))
                 }
             }
+            Action::NewSession(profile) => open_profile(profile, &home),
+            // The global palette lists no sessions or tasks.
+            Action::GoToSession(_) | Action::RunTask(_) => Ok(()),
             Action::SetTheme(theme) => {
                 let light = match theme {
                     WindowsTheme::Toggle => !sys::light_theme().unwrap_or(false),
@@ -472,180 +470,43 @@ impl Resident {
             width: w.get(),
             height: h.get(),
         };
-        draw(
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: frame.width,
+            h: frame.height,
+        };
+        palette::draw(
             &mut frame,
-            &mut view.input,
-            &mut view.list,
+            &mut view.ui,
+            &self.colors,
+            rect,
             &Content {
-                theme: &self.theme,
                 launcher: &self.launcher,
-                icons: &self.icon_cache,
                 error: self.error.as_deref(),
-                scale: view.window.scale_factor(),
+                icons: Some(&self.icon_cache),
+                in_window: false,
             },
         );
         let _ = buffer.present();
     }
-}
 
-/// What one frame of the launcher shows.
-struct Content<'a> {
-    theme: &'a Theme,
-    launcher: &'a Launcher,
-    icons: &'a HashMap<String, Option<Icon>>,
-    error: Option<&'a str>,
-    scale: f64,
-}
-
-fn draw(frame: &mut Frame<'_>, input: &mut Atlas, list: &mut Atlas, content: &Content<'_>) {
-    let Content {
-        theme,
-        launcher,
-        icons,
-        error,
-        scale,
-    } = *content;
-    let px = |logical: f64| (logical * scale).round() as u32;
-    let [_, red, green, yellow, blue, magenta, cyan, ..] = theme.ansi;
-    let muted = theme.ansi[8];
-    frame.pixels.fill(theme.bar_bg);
-
-    // Query row: accent chevron, text or placeholder, caret.
-    let left = px(18.0);
-    let text_y = (px(INPUT_HEIGHT).saturating_sub(input.cell_height) / 2) as i32;
-    render::draw_glyph(frame, input, '\u{276F}', left as i32, text_y, theme.cursor);
-    let text_x = left + input.cell_width * 2;
-    let max_cols = (frame.width.saturating_sub(text_x + px(18.0)) / input.cell_width) as usize;
-    let query = launcher.query();
-    if let Some(error) = error {
-        draw_text(frame, input, text_x, text_y, error, red, max_cols);
-    } else if query.is_empty() {
-        draw_text(
-            frame,
-            input,
-            text_x,
-            text_y,
-            "Run a command, or do math",
-            muted,
-            max_cols,
-        );
-    } else {
-        draw_text(frame, input, text_x, text_y, query, theme.fg, max_cols);
-    }
-    let caret_x = text_x + query.chars().count().min(max_cols) as u32 * input.cell_width;
-    if error.is_none() {
-        render::fill_rect(
-            frame,
-            caret_x,
-            text_y as u32,
-            px(2.0),
-            input.cell_height,
-            theme.cursor,
-        );
-    }
-
-    let items = launcher.items();
-    if items.is_empty() {
-        return;
-    }
-    let divider = render::blend(theme.bar_bg, theme.fg, 24);
-    render::fill_rect(
-        frame,
-        0,
-        px(INPUT_HEIGHT),
-        frame.width,
-        px(1.0).max(1),
-        divider,
-    );
-
-    let row_h = px(ROW_HEIGHT);
-    let list_cols = (frame.width.saturating_sub(px(18.0) * 2) / list.cell_width) as usize;
-    // Every row has an icon column as wide as an app icon, then the text, so
-    // glyph markers and real icons line up.
-    let icon_box = px(ICON_SIZE);
-    let text_x = left + icon_box + px(12.0);
-    let icon_cols = (text_x - left).div_ceil(list.cell_width) as usize;
-    for (i, item) in items.iter().enumerate() {
-        let top = px(INPUT_HEIGHT + PAD) + i as u32 * row_h;
-        let selected = i == launcher.selected();
-        if selected {
-            let highlight = render::blend(theme.bar_bg, theme.fg, 22);
-            render::fill_rect(
-                frame,
-                px(PAD),
-                top,
-                frame.width - 2 * px(PAD),
-                row_h,
-                highlight,
-            );
-        }
-        let y = (top + row_h.saturating_sub(list.cell_height) / 2) as i32;
-        let (icon, color) = match item {
-            Item::Calc { .. } => ('=', yellow),
-            Item::Run(_) => ('\u{276F}', green),
-            Item::History(_) => ('\u{25F7}', muted),
-            Item::App(_) => ('\u{25C6}', blue),
-            Item::Builtin(_) => ('\u{25D0}', magenta),
-            Item::Search { .. } => ('\u{25CE}', cyan),
+    /// A click on a result chooses it.
+    fn click(&mut self) {
+        let Some(view) = &self.view else { return };
+        let size = view.window.inner_size();
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            w: size.width,
+            h: size.height,
         };
-        match item {
-            Item::App(app) if let Some(Some(image)) = icons.get(&app.id) => {
-                let y = (top + row_h.saturating_sub(icon_box) / 2) as i32;
-                draw_icon(frame, image, left as i32, y, icon_box);
+        let rows = self.launcher.items().len();
+        if let Some(row) = palette::row_at(&view.ui, rect, rows, self.cursor.x, self.cursor.y) {
+            self.launcher.select(row);
+            if let Some(action) = self.launcher.choose(self.modifiers.control_key()) {
+                self.perform(action);
             }
-            _ => {
-                let x = left + icon_box.saturating_sub(list.cell_width) / 2;
-                render::draw_glyph(frame, list, icon, x as i32, y, color);
-            }
-        }
-
-        let hint = match (item, selected) {
-            (_, false) => "",
-            (Item::Calc { .. }, true) => "Enter copies",
-            (Item::App(_), true) => "Enter opens",
-            (Item::Builtin(_), true) => "Enter applies",
-            (Item::Search { .. }, true) => "Enter searches",
-            (_, true) => "Enter runs \u{b7} Ctrl+Enter in a terminal",
-        };
-        let hint_cols = hint.chars().count();
-        let text_cols =
-            list_cols.saturating_sub(icon_cols + if hint_cols > 0 { hint_cols + 2 } else { 0 });
-        draw_text(frame, list, text_x, y, item.text(), theme.fg, text_cols);
-        if hint_cols > 0 {
-            let hint_x = frame.width - px(18.0) - hint_cols as u32 * list.cell_width;
-            draw_text(frame, list, hint_x, y, hint, muted, hint_cols);
-        }
-    }
-}
-
-/// Draws a premultiplied icon into a `size` square, scaling it by nearest
-/// pixel when the shell returned another size.
-fn draw_icon(frame: &mut Frame<'_>, icon: &Icon, x: i32, y: i32, size: u32) {
-    for dy in 0..size {
-        let py = y + dy as i32;
-        if py < 0 || py >= frame.height as i32 {
-            continue;
-        }
-        let sy = (dy * icon.height / size) as usize;
-        for dx in 0..size {
-            let px = x + dx as i32;
-            if px < 0 || px >= frame.width as i32 {
-                continue;
-            }
-            let sx = (dx * icon.width / size) as usize;
-            let src = icon.pixels[sy * icon.width as usize + sx];
-            let alpha = src >> 24;
-            if alpha == 0 {
-                continue;
-            }
-            let i = (py as u32 * frame.width + px as u32) as usize;
-            let dst = frame.pixels[i];
-            let channel = |shift: u32| {
-                let s = (src >> shift) & 0xff;
-                let d = (dst >> shift) & 0xff;
-                (s + d * (255 - alpha) / 255).min(255) << shift
-            };
-            frame.pixels[i] = channel(16) | channel(8) | channel(0);
         }
     }
 }
@@ -655,6 +516,32 @@ fn channel(config: &Config) -> update::Channel {
         aeon_config::Channel::Stable => update::Channel::Stable,
         aeon_config::Channel::Nightly => update::Channel::Nightly,
     }
+}
+
+/// Opens a terminal window for `profile` in `dir`; as administrator, through
+/// the UAC prompt.
+pub(crate) fn open_profile(profile: &Profile, dir: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    if profile.kind == Kind::Admin {
+        // A trailing backslash would escape the closing quote.
+        let mut dir_arg = dir.display().to_string();
+        if dir_arg.ends_with('\\') {
+            dir_arg.push('\\');
+        }
+        return if sys::run_as_admin(&exe, &format!("--cwd \"{dir_arg}\""), dir) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(
+                "Windows did not start it as administrator",
+            ))
+        };
+    }
+    let mut command = std::process::Command::new(exe);
+    command.arg("--shell").arg(&profile.program);
+    for arg in &profile.args {
+        command.arg("--arg").arg(arg);
+    }
+    command.current_dir(dir).spawn().map(drop)
 }
 
 fn home_dir() -> PathBuf {
@@ -687,30 +574,6 @@ fn hwnd(window: &Window) -> Option<isize> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
         _ => None,
-    }
-}
-
-/// Monospace text from `x`, cut with an ellipsis past `max_cols`.
-fn draw_text(
-    frame: &mut Frame<'_>,
-    atlas: &mut Atlas,
-    x: u32,
-    y: i32,
-    text: &str,
-    color: u32,
-    max_cols: usize,
-) {
-    let count = text.chars().count();
-    let shown: Box<dyn Iterator<Item = char>> = if count > max_cols && max_cols > 0 {
-        Box::new(text.chars().take(max_cols - 1).chain(Some('\u{2026}')))
-    } else {
-        Box::new(text.chars().take(max_cols))
-    };
-    for (i, ch) in shown.enumerate() {
-        if ch != ' ' {
-            let cx = x + i as u32 * atlas.cell_width;
-            render::draw_glyph(frame, atlas, ch, cx as i32, y, color);
-        }
     }
 }
 
@@ -786,13 +649,16 @@ impl ApplicationHandler<Event> for Resident {
             Event::Catalog {
                 apps: mut list,
                 commands,
+                profiles,
             } => {
                 self.commands = commands;
+                self.profiles = profiles;
                 if let Some(dir) = history::dir() {
                     apps::count_uses(&mut list, &history::app_uses(&dir));
                 }
                 self.apps = list;
                 if self.view.as_ref().and_then(|v| v.window.is_visible()) == Some(true) {
+                    self.launcher.set_profiles(self.profiles.clone());
                     self.launcher
                         .set_catalog(self.apps.clone(), self.commands.clone());
                     self.resize();
@@ -809,17 +675,19 @@ impl ApplicationHandler<Event> for Resident {
             WindowEvent::Focused(false) => self.hide(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::KeyboardInput { event, .. } => self.key(&event),
+            WindowEvent::CursorMoved { position, .. } => self.cursor = position,
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => self.click(),
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 // Icons were drawn for the old scale.
                 self.icon_cache.clear();
                 self.icons_pending.clear();
-                if let Some(view) = self.view.take() {
-                    self.view = Some(View {
-                        input: view.input.with_px(points_to_px(INPUT_POINTS, scale_factor)),
-                        list: view.list.with_px(points_to_px(LIST_POINTS, scale_factor)),
-                        ..view
-                    });
+                if let Some(view) = &mut self.view {
+                    view.ui.set_scale(scale_factor);
                     self.resize();
                 }
             }

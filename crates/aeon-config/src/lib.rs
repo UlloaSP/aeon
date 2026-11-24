@@ -125,6 +125,8 @@ pub struct Keys {
     pub split_down: String,
     pub zoom_pane: String,
     pub rename_session: String,
+    pub palette: String,
+    pub new_session_menu: String,
 }
 
 impl Default for Keys {
@@ -144,6 +146,8 @@ impl Default for Keys {
             split_down: "Ctrl+Shift+E".to_owned(),
             zoom_pane: "Ctrl+Shift+Z".to_owned(),
             rename_session: "F2".to_owned(),
+            palette: "Ctrl+Shift+K".to_owned(),
+            new_session_menu: "Ctrl+Shift+N".to_owned(),
         }
     }
 }

@@ -298,6 +298,15 @@ pub mod icon {
     pub const SEARCH: char = '\u{E721}';
     pub const CHEVRON_LEFT: char = '\u{E76B}';
     pub const CHEVRON_RIGHT: char = '\u{E76C}';
+    pub const CHEVRON_DOWN: char = '\u{E70D}';
+    pub const CALCULATOR: char = '\u{E8EF}';
+    pub const PLAY: char = '\u{E768}';
+    pub const REMOTE: char = '\u{E8AF}';
+    pub const ADMIN: char = '\u{E7EF}';
+    pub const APPS: char = '\u{E71D}';
+    pub const COLOR: char = '\u{E790}';
+    pub const HISTORY: char = '\u{E81C}';
+    pub const GLOBE: char = '\u{E774}';
 }
 
 /// Blends a run's ClearType coverage into the frame, channel by channel.

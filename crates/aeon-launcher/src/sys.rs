@@ -26,7 +26,8 @@ use windows_sys::Win32::System::DataExchange::{
 };
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, REG_DWORD, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegCloseKey,
+    RegEnumKeyExW, RegGetValueW, RegOpenKeyExW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -78,6 +79,90 @@ pub fn open_url(url: &str) -> bool {
         )
     };
     result as isize > 32
+}
+
+/// Starts `exe` elevated, with `params` as its command line, through the
+/// UAC prompt. False when it did not start, including when the user said no.
+pub fn run_as_admin(exe: &std::path::Path, params: &str, dir: &std::path::Path) -> bool {
+    let verb = wide("runas");
+    let exe = wide(&exe.to_string_lossy());
+    let params = wide(params);
+    let dir = wide(&dir.to_string_lossy());
+    // SAFETY: NUL-terminated strings; ShellExecuteW returns a value above 32
+    // on success.
+    let result = unsafe {
+        ShellExecuteW(
+            null_mut(),
+            verb.as_ptr(),
+            exe.as_ptr(),
+            params.as_ptr(),
+            dir.as_ptr(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result as isize > 32
+}
+
+/// The installed WSL distributions, by name, as `wsl -l` lists them.
+pub fn wsl_distros() -> Vec<String> {
+    const LXSS: &str = r"Software\Microsoft\Windows\CurrentVersion\Lxss";
+    let path = wide(LXSS);
+    let mut key: HKEY = null_mut();
+    // SAFETY: `path` is NUL-terminated and `key` receives an open handle,
+    // closed below.
+    if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut key) }
+        != ERROR_SUCCESS
+    {
+        return Vec::new();
+    }
+    let value = wide("DistributionName");
+    let mut names = Vec::new();
+    for index in 0.. {
+        let mut sub = [0u16; 256];
+        let mut len = sub.len() as u32;
+        // SAFETY: `sub` holds `len` characters; the other outputs are unused.
+        let status = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                sub.as_mut_ptr(),
+                &mut len,
+                null(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+            )
+        };
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        let mut data = [0u16; 256];
+        let mut size = (data.len() * 2) as u32;
+        // SAFETY: `sub` was NUL-terminated by RegEnumKeyExW; `data` holds
+        // `size` bytes and RRF_RT_REG_SZ NUL-terminates what it writes.
+        let status = unsafe {
+            RegGetValueW(
+                key,
+                sub.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                null_mut(),
+                data.as_mut_ptr().cast::<c_void>(),
+                &mut size,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            let end = data.iter().position(|&c| c == 0).unwrap_or(data.len());
+            let name = String::from_utf16_lossy(&data[..end]);
+            // Docker Desktop's distros are its own machinery, not shells.
+            if !name.is_empty() && !name.starts_with("docker-desktop") {
+                names.push(name);
+            }
+        }
+    }
+    // SAFETY: `key` was opened above and is closed once.
+    unsafe { RegCloseKey(key) };
+    names
 }
 
 /// Prepares the calling thread for [`app_icon`]. Call once per thread.
