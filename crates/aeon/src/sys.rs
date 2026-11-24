@@ -251,3 +251,22 @@ impl Drop for TextRenderer {
         }
     }
 }
+
+/// Asks OK or Cancel in a standard warning dialog owned by `owner`. Returns
+/// whether the user chose OK.
+pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDOK, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW,
+    };
+    let (title, text) = (wide(title), wide(text));
+    // SAFETY: both strings are NUL-terminated and outlive the call; `owner`
+    // is this process's window or 0.
+    unsafe {
+        MessageBoxW(
+            owner as _,
+            text.as_ptr(),
+            title.as_ptr(),
+            MB_OKCANCEL | MB_ICONWARNING,
+        ) == IDOK
+    }
+}

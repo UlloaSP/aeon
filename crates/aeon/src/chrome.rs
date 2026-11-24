@@ -309,6 +309,10 @@ pub struct SessionRow {
     /// until you look at it.
     pub unseen: bool,
     pub muted: bool,
+    /// How many panes the session is split into.
+    pub panes: usize,
+    /// The title is being renamed: drawn as a field with a caret.
+    pub editing: bool,
 }
 
 /// What a session is doing, as its dot and the text at the row's end show.
@@ -474,8 +478,12 @@ pub fn draw_sidebar(
                     continue;
                 };
                 let selected = i == state.active && !state.settings_open;
-                let hovered = state.hover == Some(Hit::Session(i));
-                if selected {
+                let hovered = state.hover == Some(Hit::Session(i)) && !session.editing;
+                if session.editing {
+                    ui::card(
+                        frame, rect.x, rect.y, rect.w, rect.h, radius, pal.raised, pal.accent,
+                    );
+                } else if selected {
                     ui::card(
                         frame,
                         rect.x,
@@ -491,6 +499,9 @@ pub fn draw_sidebar(
                 }
                 let slot = rect.x + ui.px(43.0);
                 let (dot, meta, meta_color) = match session.state {
+                    RowState::Idle if session.panes > 1 => {
+                        (None, format!("{} panes", session.panes), pal.label)
+                    }
                     RowState::Idle => (None, String::new(), pal.label),
                     RowState::Running => (Some(pal.blue), "running".to_owned(), pal.label),
                     RowState::Server(port) => (Some(pal.cyan), format!(":{port}"), pal.cyan),
@@ -544,15 +555,19 @@ pub fn draw_sidebar(
                 } else {
                     body
                 };
-                ui.text_mid(
-                    frame,
-                    x,
-                    mid,
-                    &session.title,
-                    font,
-                    pal.fg,
-                    meta_x.saturating_sub(x + ui.px(8.0)),
-                );
+                let room = meta_x.saturating_sub(x + ui.px(8.0));
+                let width = ui.text_mid(frame, x, mid, &session.title, font, pal.fg, room);
+                if session.editing {
+                    let caret = ui.px(16.0);
+                    fill_rect(
+                        frame,
+                        x + width.min(room) + 1,
+                        mid.saturating_sub(caret / 2),
+                        ui.px(1.0).max(1),
+                        caret,
+                        pal.accent,
+                    );
+                }
             }
         }
     }

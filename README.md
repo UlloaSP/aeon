@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. Split panes, restoring sessions, and one palette for everything are on the way.
+> Aeon is early. One palette for everything, a drop-down terminal, and a new-session menu are on the way.
 
 ## Install
 
@@ -60,12 +60,20 @@ One window holds as many shells as you want. The sidebar groups them by project:
 | Keys | Action |
 | --- | --- |
 | Ctrl+Shift+T | New session (or click **New session**) |
-| Ctrl+Shift+W | Close the session |
+| Ctrl+Shift+W | Close the pane, or the session when it has one |
 | Ctrl+Tab, Ctrl+Shift+Tab | Next, previous session |
 | Ctrl+1 to Ctrl+9 | Go to a session (or click it) |
+| Ctrl+Shift+D, Ctrl+Shift+E | Split the pane to the right, or down |
+| Alt+Arrows | Move to the pane in that direction (or click it) |
+| Ctrl+Shift+Z | Show only this pane, or all of them again |
+| F2 | Rename the session; Enter keeps the name, Escape drops it, and an empty name goes back to the automatic one |
 | Ctrl+Shift+B | Show or hide the sidebar |
 
-These are the defaults; change any of them in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%\aeon\state`, apart from your `config.toml`.
+These are the defaults; change any of them except Alt+Arrows in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B.
+
+A split starts its shell in the folder of the pane you split. Typing `exit` closes the pane. Closing a pane, a session, or the window while a command is still running asks first; that needs shell integration, which is what reports commands.
+
+When Aeon starts with no other window open, it reopens the sessions the last window had: their names, splits, and folders, each with a fresh shell. Started from a shell in a folder none of them is in, it adds a session there. Turn this off with `restore = false` under `[window]`. Sessions started with a command (the launcher's Ctrl+Enter) start fresh. What to reopen, and whether the sidebar is shown, is kept in `%APPDATA%\aeon\state`, apart from your `config.toml`.
 
 ### In the terminal
 
@@ -137,6 +145,7 @@ size = 11.0                   # points
 columns = 120
 rows = 32
 padding = 8
+restore = true                # reopen the last window's sessions
 
 [launcher]
 hotkey = "Ctrl+Alt+Space"     # Ctrl, Alt, Shift, Win + a letter, digit, F1-F24, Space, or `
@@ -154,6 +163,10 @@ find = "Ctrl+Shift+F"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
 project_panel = "Ctrl+Shift+P"
+split_right = "Ctrl+Shift+D"
+split_down = "Ctrl+Shift+E"
+zoom_pane = "Ctrl+Shift+Z"
+rename_session = "F2"
 
 [terminal]
 scrollback = 5000             # lines kept for scrolling back; 0 keeps none

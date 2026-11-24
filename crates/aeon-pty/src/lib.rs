@@ -66,6 +66,22 @@ pub struct Pty {
     inner: conpty::ConPty,
 }
 
+/// Waits for a shell to exit, from any thread.
+pub struct ExitWaiter {
+    #[cfg(windows)]
+    inner: conpty::Waiter,
+}
+
+impl ExitWaiter {
+    /// Blocks until the shell exits and returns its exit code.
+    pub fn wait(self) -> io::Result<u32> {
+        #[cfg(windows)]
+        return self.inner.wait();
+        #[cfg(not(windows))]
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 impl Pty {
     #[cfg(windows)]
     pub fn spawn(command: &Command, size: PtySize) -> io::Result<Self> {
@@ -112,6 +128,16 @@ impl Pty {
         return self.inner.pid();
         #[cfg(not(windows))]
         0
+    }
+
+    /// Something another thread can block on until the shell exits. Reading
+    /// output never ends on its own: ConPTY keeps the pipe open until the
+    /// pseudo console closes.
+    pub fn exit_waiter(&self) -> io::Result<ExitWaiter> {
+        #[cfg(windows)]
+        return self.inner.waiter().map(|inner| ExitWaiter { inner });
+        #[cfg(not(windows))]
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// Blocks until the shell exits and returns its exit code.

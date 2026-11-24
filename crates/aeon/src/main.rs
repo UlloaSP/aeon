@@ -9,6 +9,7 @@ mod input;
 mod keys;
 mod launcher;
 mod links;
+mod panes;
 mod render;
 mod settings;
 mod sys;
