@@ -3,7 +3,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aeon_context::Context;
+use aeon_context::{Context, Git, Task};
 
 use crate::render::{Frame, blend, fill_rect};
 use crate::sys::Face;
@@ -17,10 +17,13 @@ pub struct Project {
     pub path: Option<PathBuf>,
     /// Indexes into the session list, in session order.
     pub sessions: Vec<usize>,
+    /// Kept in the sidebar with no sessions open.
+    pub pinned: bool,
 }
 
-/// Groups sessions into projects, ordered by each project's first session.
-pub fn projects(contexts: &[&Context], home: Option<&Path>) -> Vec<Project> {
+/// Groups sessions into projects, ordered by each project's first session,
+/// then the pinned projects that have none.
+pub fn projects(contexts: &[&Context], home: Option<&Path>, pinned: &[PathBuf]) -> Vec<Project> {
     let mut projects: Vec<Project> = Vec::new();
     for (index, context) in contexts.iter().enumerate() {
         let path = context
@@ -36,9 +39,23 @@ pub fn projects(contexts: &[&Context], home: Option<&Path>) -> Vec<Project> {
                     .as_deref()
                     .and_then(Path::file_name)
                     .map_or_else(|| "Home".to_owned(), |n| n.to_string_lossy().into_owned()),
+                pinned: path.as_ref().is_some_and(|p| pinned.contains(p)),
                 path,
                 sessions: vec![index],
             }),
+        }
+    }
+    for path in pinned {
+        if !projects.iter().any(|p| p.path.as_ref() == Some(path)) {
+            projects.push(Project {
+                name: path.file_name().map_or_else(
+                    || path.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                ),
+                path: Some(path.clone()),
+                sessions: Vec::new(),
+                pinned: true,
+            });
         }
     }
     projects
@@ -110,15 +127,15 @@ pub fn session_title(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rect {
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 impl Rect {
-    fn contains(&self, x: f64, y: f64) -> bool {
+    pub fn contains(&self, x: f64, y: f64) -> bool {
         x >= f64::from(self.x)
             && x < f64::from(self.x + self.w)
             && y >= f64::from(self.y)
@@ -137,6 +154,10 @@ pub enum Hit {
     Session(usize),
     /// The bell on a session row: mutes or unmutes its notifications.
     Mute(usize),
+    /// A project row: its first session, or a new one there.
+    Project(usize),
+    /// The pin on a project row.
+    Pin(usize),
     Settings,
     Update,
 }
@@ -256,13 +277,15 @@ impl Sidebar {
         self.rows
             .iter()
             .find(|(rect, _)| rect.contains(x, y))
-            .and_then(|(rect, row)| match row {
-                Row::NewSession => Some(Hit::NewSession),
-                Row::Session(i) if x >= f64::from(rect.x + rect.w - self.mute) => {
-                    Some(Hit::Mute(*i))
+            .map(|(rect, row)| {
+                let end = x >= f64::from(rect.x + rect.w - self.mute);
+                match row {
+                    Row::NewSession => Hit::NewSession,
+                    Row::Session(i) if end => Hit::Mute(*i),
+                    Row::Session(i) => Hit::Session(*i),
+                    Row::Project(i) if end => Hit::Pin(*i),
+                    Row::Project(i) => Hit::Project(*i),
                 }
-                Row::Session(i) => Some(Hit::Session(*i)),
-                Row::Project(_) => None,
             })
     }
 }
@@ -403,15 +426,38 @@ pub fn draw_sidebar(
                     color,
                 );
                 let name_color = blend(pal.canvas, pal.fg, 230);
-                let count = project.sessions.len().to_string();
-                let count_x = ui.text_right(
-                    frame,
-                    rect.x + rect.w - ui.px(10.0),
-                    mid,
-                    &count,
-                    small,
-                    pal.label,
-                );
+                let hovered = matches!(state.hover, Some(Hit::Project(h) | Hit::Pin(h)) if h == i);
+                if hovered {
+                    ui::round_rect(frame, rect.x, rect.y, rect.w, rect.h, ui.px(8.0), pal.hover);
+                }
+                let right = rect.x + rect.w - ui.px(10.0);
+                let count_x = if hovered {
+                    let on_pin = state.hover == Some(Hit::Pin(i));
+                    let glyph = if project.pinned {
+                        icon::UNPIN
+                    } else {
+                        icon::PIN
+                    };
+                    let cx = right.saturating_sub(ui.px(6.0));
+                    ui.icon(
+                        frame,
+                        cx,
+                        mid,
+                        glyph,
+                        12.0,
+                        if on_pin { pal.fg } else { pal.muted },
+                    );
+                    cx.saturating_sub(ui.px(10.0))
+                } else {
+                    let count = project.sessions.len().to_string();
+                    let mut end = ui.text_right(frame, right, mid, &count, small, pal.label);
+                    if project.pinned {
+                        let cx = end.saturating_sub(ui.px(10.0));
+                        ui.icon(frame, cx, mid, icon::PIN, 10.0, pal.label);
+                        end = cx.saturating_sub(ui.px(8.0));
+                    }
+                    end
+                };
                 let x = rect.x + ui.px(36.0);
                 ui.text_mid(
                     frame,
@@ -644,6 +690,36 @@ pub fn header_height(ui: &Ui) -> u32 {
 /// The session's breadcrumb across the top of the terminal: project, session,
 /// branch and changes, and the servers it started.
 #[allow(clippy::too_many_arguments)]
+/// What a button in the session header does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderHit {
+    OpenEditor,
+    TogglePanel,
+}
+
+/// The header's buttons, from the right: the project panel toggle, then
+/// "Open in VS Code" when VS Code is installed.
+pub fn header_buttons(ui: &mut Ui, frame_width: u32, editor: bool) -> Vec<(Rect, HeaderHit)> {
+    let height = header_height(ui);
+    let h = ui.px(28.0);
+    let y = (height - h) / 2;
+    let mut x = frame_width.saturating_sub(ui.px(12.0));
+    let mut out = Vec::new();
+    let w = ui.px(32.0);
+    x = x.saturating_sub(w);
+    out.push((Rect { x, y, w, h }, HeaderHit::TogglePanel));
+    if editor {
+        let font = ui.font(Face::Ui, 13.0, REGULAR);
+        let w = ui.measure("Open in VS Code", font) + ui.px(36.0);
+        x = x.saturating_sub(w + ui.px(4.0));
+        out.push((Rect { x, y, w, h }, HeaderHit::OpenEditor));
+    }
+    out
+}
+
+/// The session's breadcrumb across the top of the terminal: project, session,
+/// branch and changes, and the servers it started; its buttons at the right.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_header(
     frame: &mut Frame<'_>,
     ui: &mut Ui,
@@ -652,6 +728,9 @@ pub fn draw_header(
     project: &Project,
     title: &str,
     context: &Context,
+    buttons: &[(Rect, HeaderHit)],
+    hover: Option<HeaderHit>,
+    panel_open: bool,
 ) {
     let height = header_height(ui);
     let width = frame.width.saturating_sub(left);
@@ -662,8 +741,42 @@ pub fn draw_header(
     let strong = ui.font(Face::Ui, 14.0, SEMIBOLD);
     let small = ui.font(Face::Ui, 12.0, REGULAR);
     let gap = ui.px(8.0);
-    let end = frame.width.saturating_sub(ui.px(16.0));
+    let end = buttons
+        .iter()
+        .map(|(r, _)| r.x)
+        .min()
+        .unwrap_or(frame.width)
+        .saturating_sub(ui.px(16.0));
     let room = |x: u32| end.saturating_sub(x);
+
+    for (r, hit) in buttons {
+        let hovered = hover == Some(*hit);
+        let on = *hit == HeaderHit::TogglePanel && panel_open;
+        if on {
+            ui::round_rect(frame, r.x, r.y, r.w, r.h, ui.px(6.0), pal.highlight);
+        } else if hovered {
+            ui::round_rect(frame, r.x, r.y, r.w, r.h, ui.px(6.0), pal.hover);
+        }
+        let color = if hovered || on { pal.fg } else { pal.muted };
+        match hit {
+            HeaderHit::TogglePanel => {
+                ui.icon(frame, r.x + r.w / 2, r.mid(), icon::PANEL, 14.0, color)
+            }
+            HeaderHit::OpenEditor => {
+                ui.icon(frame, r.x + ui.px(14.0), r.mid(), icon::CODE, 13.0, color);
+                let font = ui.font(Face::Ui, 13.0, REGULAR);
+                ui.text_mid(
+                    frame,
+                    r.x + ui.px(28.0),
+                    r.mid(),
+                    "Open in VS Code",
+                    font,
+                    color,
+                    r.w,
+                );
+            }
+        }
+    }
 
     let mut x = left + ui.px(16.0);
     monogram_tile(
@@ -704,7 +817,7 @@ pub fn draw_header(
             (git.ahead, "\u{2191}", pal.green),
             (git.behind, "\u{2193}", pal.red),
         ] {
-            if n > 0 {
+            if n > 0 && room(x) > ui.px(24.0) {
                 x += ui.px(6.0);
                 x += ui.text_mid(
                     frame,
@@ -719,6 +832,9 @@ pub fn draw_header(
         }
     }
     for server in &context.servers {
+        if room(x) < ui.px(60.0) {
+            break;
+        }
         x += ui.px(16.0);
         ui::dot(frame, x + ui.px(3.0), mid, ui.px(6.0), pal.cyan);
         x += ui.px(12.0);
@@ -973,6 +1089,386 @@ pub fn draw_blocks(
     }
 }
 
+/// A server in the project panel: which session started it.
+pub struct PanelServer {
+    pub name: String,
+    pub port: u16,
+    pub session: String,
+}
+
+/// What the project panel shows.
+pub struct PanelData<'a> {
+    pub tasks: &'a [Task],
+    /// For each task, whether a session is running it.
+    pub running: &'a [bool],
+    pub servers: &'a [PanelServer],
+    pub git: Option<&'a Git>,
+}
+
+/// Something in the project panel a click acts on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelHit {
+    Run(usize),
+    Stop(usize),
+    OpenServer(usize),
+    StopServer(usize),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PanelItem {
+    Section(&'static str, String),
+    Empty(&'static str),
+    Task(usize),
+    Server(usize),
+    File(usize),
+}
+
+/// The project panel at the right of the terminal: tasks, servers, git.
+/// Its layout is shared by drawing and hit-testing.
+pub struct Panel {
+    pub x: u32,
+    pub width: u32,
+    top: u32,
+    items: Vec<(Rect, PanelItem)>,
+    buttons: Vec<(Rect, PanelHit)>,
+}
+
+pub const PANEL_WIDTH: f64 = 320.0;
+
+impl Panel {
+    pub fn new(
+        ui: &mut Ui,
+        x: u32,
+        width: u32,
+        top: u32,
+        height: u32,
+        data: &PanelData<'_>,
+    ) -> Self {
+        let inset = ui.px(8.0);
+        let w = width.saturating_sub(2 * inset);
+        let left = x + inset;
+        let mut items = Vec::new();
+        let mut buttons = Vec::new();
+        let mut y = top + ui.px(4.0);
+        let small = ui.font(Face::Ui, 12.0, REGULAR);
+        let mut push = |y: &mut u32, h: u32, item: PanelItem| {
+            if *y + h <= height {
+                items.push((
+                    Rect {
+                        x: left,
+                        y: *y,
+                        w,
+                        h,
+                    },
+                    item,
+                ));
+            }
+            *y += h;
+        };
+        let source = data
+            .tasks
+            .first()
+            .map_or(String::new(), |t| t.source.to_owned());
+        push(&mut y, ui.px(32.0), PanelItem::Section("Tasks", source));
+        if data.tasks.is_empty() {
+            push(
+                &mut y,
+                ui.px(32.0),
+                PanelItem::Empty("No package.json, justfile, Makefile, or Cargo.toml here."),
+            );
+        }
+        for i in 0..data.tasks.len() {
+            push(&mut y, ui.px(32.0), PanelItem::Task(i));
+        }
+        y += ui.px(8.0);
+        push(
+            &mut y,
+            ui.px(32.0),
+            PanelItem::Section("Servers", String::new()),
+        );
+        if data.servers.is_empty() {
+            push(
+                &mut y,
+                ui.px(32.0),
+                PanelItem::Empty("None. Ports this project's sessions open show up here."),
+            );
+        }
+        for i in 0..data.servers.len() {
+            push(&mut y, ui.px(40.0), PanelItem::Server(i));
+        }
+        if let Some(git) = data.git {
+            y += ui.px(8.0);
+            let mut aside = git.head.clone();
+            if git.ahead > 0 {
+                aside.push_str(&format!(" \u{2191}{}", git.ahead));
+            }
+            if git.behind > 0 {
+                aside.push_str(&format!(" \u{2193}{}", git.behind));
+            }
+            push(&mut y, ui.px(32.0), PanelItem::Section("Git", aside));
+            if git.files.is_empty() {
+                push(&mut y, ui.px(28.0), PanelItem::Empty("No changes."));
+            }
+            for i in 0..git.files.len() {
+                push(&mut y, ui.px(26.0), PanelItem::File(i));
+            }
+        }
+        for (rect, item) in &items {
+            let mut right = rect.x + rect.w - ui.px(8.0);
+            let mut button = |label: &str, hit: PanelHit, right: &mut u32| {
+                let bw = ui.measure(label, small) + ui.px(16.0);
+                let bh = ui.px(24.0);
+                *right = right.saturating_sub(bw);
+                buttons.push((
+                    Rect {
+                        x: *right,
+                        y: rect.mid() - bh / 2,
+                        w: bw,
+                        h: bh,
+                    },
+                    hit,
+                ));
+                *right = right.saturating_sub(ui.px(6.0));
+            };
+            match item {
+                PanelItem::Task(i) => {
+                    if data.running.get(*i).copied().unwrap_or(false) {
+                        button("Stop", PanelHit::Stop(*i), &mut right);
+                    } else {
+                        button("Run", PanelHit::Run(*i), &mut right);
+                    }
+                }
+                PanelItem::Server(i) => {
+                    button("Stop", PanelHit::StopServer(*i), &mut right);
+                    button("Open", PanelHit::OpenServer(*i), &mut right);
+                }
+                _ => {}
+            }
+        }
+        Self {
+            x,
+            width,
+            top,
+            items,
+            buttons,
+        }
+    }
+
+    pub fn hit(&self, x: f64, y: f64) -> Option<PanelHit> {
+        self.buttons
+            .iter()
+            .find(|(r, _)| r.contains(x, y))
+            .map(|(_, h)| *h)
+    }
+}
+
+pub fn draw_panel(
+    frame: &mut Frame<'_>,
+    ui: &mut Ui,
+    pal: &Palette,
+    panel: &Panel,
+    data: &PanelData<'_>,
+    hover: Option<PanelHit>,
+) {
+    fill_rect(
+        frame,
+        panel.x,
+        panel.top,
+        panel.width,
+        frame.height.saturating_sub(panel.top),
+        pal.canvas,
+    );
+    fill_rect(
+        frame,
+        panel.x,
+        panel.top,
+        1,
+        frame.height.saturating_sub(panel.top),
+        pal.border,
+    );
+    let label = ui.font(Face::Ui, 12.0, SEMIBOLD);
+    let small = ui.font(Face::Ui, 12.0, REGULAR);
+    let code = ui.font(Face::Code, 12.0, REGULAR);
+    let code_strong = ui.font(Face::Code, 12.0, SEMIBOLD);
+    for (rect, item) in &panel.items {
+        let mid = rect.mid();
+        let x = rect.x + ui.px(8.0);
+        let right = panel
+            .buttons
+            .iter()
+            .filter(|(r, _)| r.y + r.h > rect.y && r.y < rect.y + rect.h)
+            .map(|(r, _)| r.x)
+            .min()
+            .unwrap_or(rect.x + rect.w)
+            .saturating_sub(ui.px(8.0));
+        match item {
+            PanelItem::Section(title, aside) => {
+                let tw = ui.text_mid(frame, x, mid, title, label, pal.label, rect.w);
+                let ax = if aside.is_empty() {
+                    rect.x + rect.w
+                } else {
+                    ui.text_right(
+                        frame,
+                        rect.x + rect.w - ui.px(8.0),
+                        mid,
+                        aside,
+                        small,
+                        pal.label,
+                    )
+                };
+                let line_x = x + tw + ui.px(8.0);
+                if ax > line_x + ui.px(16.0) {
+                    fill_rect(frame, line_x, mid, ax - line_x - ui.px(8.0), 1, pal.border);
+                }
+            }
+            PanelItem::Empty(text) => {
+                ui.text_mid(
+                    frame,
+                    x,
+                    mid,
+                    text,
+                    small,
+                    pal.label,
+                    rect.w.saturating_sub(ui.px(16.0)),
+                );
+            }
+            PanelItem::Task(i) => {
+                let task = &data.tasks[*i];
+                let running = data.running.get(*i).copied().unwrap_or(false);
+                if running {
+                    ui::dot(frame, x + ui.px(3.0), mid, ui.px(6.0), pal.blue);
+                }
+                let nx = x + ui.px(14.0);
+                let nw = ui.text_mid(
+                    frame,
+                    nx,
+                    mid,
+                    &task.name,
+                    code_strong,
+                    pal.fg,
+                    ui.px(110.0),
+                );
+                let dx = nx + nw.max(ui.px(48.0)) + ui.px(10.0);
+                let detail = if task.detail.is_empty() {
+                    &task.command
+                } else {
+                    &task.detail
+                };
+                ui.text_mid(
+                    frame,
+                    dx,
+                    mid,
+                    detail,
+                    code,
+                    pal.label,
+                    right.saturating_sub(dx),
+                );
+            }
+            PanelItem::Server(i) => {
+                let server = &data.servers[*i];
+                ui::dot(
+                    frame,
+                    x + ui.px(3.0),
+                    mid - ui.px(7.0),
+                    ui.px(6.0),
+                    pal.cyan,
+                );
+                let nx = x + ui.px(14.0);
+                let nw = ui.text_mid(
+                    frame,
+                    nx,
+                    mid - ui.px(7.0),
+                    &server.name,
+                    code_strong,
+                    pal.fg,
+                    ui.px(100.0),
+                );
+                ui.text_mid(
+                    frame,
+                    nx + nw + ui.px(6.0),
+                    mid - ui.px(7.0),
+                    &format!(":{}", server.port),
+                    code,
+                    pal.cyan,
+                    ui.px(60.0),
+                );
+                ui.text_mid(
+                    frame,
+                    nx,
+                    mid + ui.px(9.0),
+                    &format!("from {}", server.session),
+                    small,
+                    pal.label,
+                    right.saturating_sub(nx),
+                );
+            }
+            PanelItem::File(i) => {
+                let Some(file) = data.git.and_then(|g| g.files.get(*i)) else {
+                    continue;
+                };
+                let color = match file.status {
+                    'A' | '?' => pal.green,
+                    'D' => pal.red,
+                    'U' => pal.magenta,
+                    _ => pal.yellow,
+                };
+                let status = if file.status == '?' { 'U' } else { file.status };
+                ui.text_mid(
+                    frame,
+                    x,
+                    mid,
+                    &status.to_string(),
+                    code_strong,
+                    color,
+                    ui.px(16.0),
+                );
+                ui.text_mid(
+                    frame,
+                    x + ui.px(18.0),
+                    mid,
+                    &file.path,
+                    code,
+                    pal.fg,
+                    rect.w.saturating_sub(ui.px(34.0)),
+                );
+            }
+        }
+    }
+    let edge = blend(pal.canvas, pal.fg, 34);
+    for (r, hit) in &panel.buttons {
+        let hovered = hover == Some(*hit);
+        let (text, danger) = match hit {
+            PanelHit::Run(_) => ("Run", false),
+            PanelHit::Stop(_) | PanelHit::StopServer(_) => ("Stop", true),
+            PanelHit::OpenServer(_) => ("Open", false),
+        };
+        let fill = if hovered { pal.highlight } else { pal.raised };
+        ui::card(
+            frame,
+            r.x,
+            r.y,
+            r.w,
+            r.h,
+            ui.px(6.0),
+            fill,
+            if danger {
+                blend(pal.canvas, pal.red, 90)
+            } else {
+                edge
+            },
+        );
+        ui.text_mid(
+            frame,
+            r.x + ui.px(8.0),
+            r.mid(),
+            text,
+            small,
+            if danger { pal.red } else { pal.fg },
+            r.w,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -993,7 +1489,11 @@ mod tests {
         let c = ctx(r"C:\code\aeon\crates\aeon", Some(r"C:\code\aeon"));
         let d = ctx(r"C:\tmp", None);
         let e = Context::default();
-        let projects = projects(&[&a, &b, &c, &d, &e], Some(home));
+        let projects = projects(
+            &[&a, &b, &c, &d, &e],
+            Some(home),
+            &[PathBuf::from(r"C:\code\api")],
+        );
         let summary: Vec<(&str, &[usize])> = projects
             .iter()
             .map(|p| (p.name.as_str(), p.sessions.as_slice()))
@@ -1003,9 +1503,11 @@ mod tests {
             [
                 ("aeon", &[0, 2][..]),
                 ("Home", &[1, 4][..]),
-                ("tmp", &[3][..])
+                ("tmp", &[3][..]),
+                ("api", &[][..])
             ]
         );
+        assert!(projects[3].pinned && !projects[0].pinned);
         assert_eq!(display_order(&projects), [0, 2, 1, 4, 3]);
     }
 
@@ -1025,6 +1527,7 @@ mod tests {
             name: "aeon".into(),
             path: Some(PathBuf::from(r"C:\code\aeon")),
             sessions: vec![0],
+            pinned: false,
         };
         let top = ctx(r"C:\code\aeon", Some(r"C:\code\aeon"));
         let deep = ctx(r"C:\code\aeon\crates\aeon", Some(r"C:\code\aeon"));
@@ -1037,6 +1540,7 @@ mod tests {
             name: "Home".into(),
             path: None,
             sessions: vec![0],
+            pinned: false,
         };
         assert_eq!(
             session_title(&ctx(r"C:\Users\me", None), "cmd", &homeless, Some(home)),
@@ -1051,11 +1555,13 @@ mod tests {
             name: "aeon".into(),
             path: Some(PathBuf::from(r"C:\code\aeon")),
             sessions: vec![0, 1],
+            pinned: false,
         }];
         let sb = Sidebar::new(&mut ui, 256, 800, &projects, Some(&Pill::Available));
         assert_eq!(sb.hit(100.0, 50.0), Some(Hit::NewSession));
         // New session 40..72, gap to 78, project 78..110, sessions 110..146..182.
-        assert_eq!(sb.hit(100.0, 90.0), None);
+        assert_eq!(sb.hit(100.0, 90.0), Some(Hit::Project(0)));
+        assert_eq!(sb.hit(240.0, 90.0), Some(Hit::Pin(0)));
         assert_eq!(sb.hit(100.0, 120.0), Some(Hit::Session(0)));
         assert_eq!(sb.hit(100.0, 160.0), Some(Hit::Session(1)));
         assert_eq!(sb.hit(20.0, 770.0), Some(Hit::Settings));

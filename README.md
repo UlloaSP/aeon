@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. Project tasks, split panes, and one palette for everything are on the way.
+> Aeon is early. Split panes, restoring sessions, and one palette for everything are on the way.
 
 ## Install
 
@@ -81,6 +81,18 @@ These are the defaults; change any of them in **Settings > Keyboard**. They use 
 | Ctrl+=, Ctrl+-, Ctrl+0, Ctrl+wheel | Text size for this window |
 
 Programs that use the mouse, such as vim or htop, get it; hold Shift to select text instead. Typing returns to the bottom.
+
+### Projects
+
+Click a project in the sidebar to go to its first session. Hover it and click the pin to keep it in the sidebar even with no sessions open; clicking a pinned project with none opens one there.
+
+The project panel (**Ctrl+Shift+P**, or the button at the right of the header) shows what the active session's project can run and what it is running:
+
+- **Tasks** found in `package.json` (run with pnpm, yarn, bun, or npm, whichever the project uses), a `justfile`, a `Makefile`, or `Cargo.toml`. **Run** opens a session named after the task at the project's top; **Stop** sends it Ctrl+C, and the session keeps its output.
+- **Servers** the project's sessions started, with **Open** (in the browser) and **Stop**.
+- **Git**: the branch, how far ahead or behind it is, and the changed files.
+
+**Open in VS Code** in the header opens the project's folder when VS Code is installed. Which panels are open and the pinned projects are remembered in `%APPDATA%\aeon\state`.
 
 ### Commands and what they did
 
@@ -141,6 +153,7 @@ settings = "Ctrl+,"
 find = "Ctrl+Shift+F"
 copy = "Ctrl+Shift+C"
 paste = "Ctrl+Shift+V"
+project_panel = "Ctrl+Shift+P"
 
 [terminal]
 scrollback = 5000             # lines kept for scrolling back; 0 keeps none

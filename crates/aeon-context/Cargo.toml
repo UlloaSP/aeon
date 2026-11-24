@@ -1,6 +1,6 @@
 [package]
 name = "aeon-context"
-description = "What the context bar shows: working directory, git state, and servers the shell started."
+description = "What the sidebar and project panel show: project root, git state, tasks, and servers the shell started."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

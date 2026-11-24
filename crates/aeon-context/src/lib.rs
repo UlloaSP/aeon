@@ -7,12 +7,14 @@
 mod git;
 #[cfg(windows)]
 mod sys;
+pub mod tasks;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-pub use git::Git;
+pub use git::{FileChange, Git};
+pub use tasks::Task;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Context {
@@ -21,6 +23,8 @@ pub struct Context {
     pub root: Option<PathBuf>,
     pub git: Option<Git>,
     pub servers: Vec<Server>,
+    /// What the project at `root` can run.
+    pub tasks: Vec<Task>,
 }
 
 /// A process under the shell that listens on a TCP port.
@@ -66,6 +70,8 @@ impl Watcher {
                     if git_due {
                         context.git = context.cwd.as_deref().and_then(git::status);
                         context.root = context.cwd.as_deref().and_then(git::root);
+                        let project = context.root.as_deref().or(context.cwd.as_deref());
+                        context.tasks = project.map(tasks::detect).unwrap_or_default();
                         last_git = Some(Instant::now());
                     }
                     context.servers = servers(shell_pid);
