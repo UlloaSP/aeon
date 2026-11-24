@@ -9,7 +9,9 @@ use crate::Command;
 const POWERSHELL_INIT: &str = include_str!("aeon.ps1");
 
 /// cmd's own prompt (`C:\path>`) plus an OSC 9;9 working-directory report.
-const CMD_PROMPT: &str = r"$e]9;9;$P$e\$P$G";
+/// cmd marks prompts for command blocks (OSC 133 A and B) and reports its
+/// directory (OSC 9;9). It cannot mark when a command runs or how it ended.
+const CMD_PROMPT: &str = r"$e]133;A$e\$e]9;9;$P$e\$P$G$e]133;B$e\";
 
 /// Sets up PowerShell and cmd for Aeon. PowerShell starts without the user's
 /// profile, with Aeon's history file and prompt. Both report their working
@@ -28,8 +30,12 @@ pub fn integrate(command: Command, run: Option<&str>) -> Command {
         "pwsh" | "powershell" => {
             let mut script = POWERSHELL_INIT.to_owned();
             if let Some(run) = run {
-                script.push('\n');
-                script.push_str(run);
+                // Shown and marked as if typed at a prompt, so it becomes a
+                // command block with its time and result like any other.
+                let shown = run.replace('\'', "''");
+                script.push_str(&format!(
+                    "\n$e = [char]27; [Console]::Write(\"$e]133;A$e\\$e[1;32m$([char]0x276F)$e[0m $e]133;B$e\\\" + '{shown}' + \"`r`n$e]133;C$e\\\"); $global:AeonRan = $true\n{run}"
+                ));
             }
             command
                 .args(["-NoLogo", "-NoProfile", "-NoExit", "-EncodedCommand"])
