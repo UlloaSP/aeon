@@ -945,6 +945,16 @@ fn rows(
                     },
                 },
                 Row {
+                    title: "Drop-down terminal",
+                    description: "Shows a terminal across the top of the screen from anywhere."
+                        .into(),
+                    control: Control::Hotkey {
+                        value: config.launcher.dropdown.clone(),
+                        table: "launcher",
+                        key: "dropdown",
+                    },
+                },
+                Row {
                     title: "Web search",
                     description: "Where queries that are not a command or app go.".into(),
                     control: Control::Choice { options, index },
@@ -1062,6 +1072,7 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("palette", k.palette.clone()),
         ("new_session_menu", k.new_session_menu.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
+        ("dropdown", config.launcher.dropdown.clone()),
     ]
 }
 
@@ -1432,7 +1443,8 @@ mod tests {
         let mut config = Config::default();
         config.launcher.search_url = "https://kagi.com/search?q={query}".into();
         let rows = rows(Section::Launcher, &config, &[], &[], &Status::Idle);
-        let Control::Choice { options, index } = &rows[1].control else {
+        let row = rows.iter().find(|r| r.title == "Web search");
+        let Some(Control::Choice { options, index }) = row.map(|r| &r.control) else {
             panic!("web search is a choice");
         };
         assert_eq!(options[*index].label, "Custom");

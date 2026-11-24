@@ -26,6 +26,14 @@ pub use hotkey::Hotkey;
 pub use icons::{Icon, Icons};
 pub use profiles::Profile;
 
+/// The drop-down terminal's window class, which the resident finds it by.
+/// Development builds use their own, as with the other locks.
+pub const DROPDOWN_CLASS: &str = if cfg!(debug_assertions) {
+    "AeonDropdownDev"
+} else {
+    "AeonDropdown"
+};
+
 /// How many results the box lists below the query.
 pub const MAX_ITEMS: usize = 8;
 /// How many profiles the new-session menu lists.

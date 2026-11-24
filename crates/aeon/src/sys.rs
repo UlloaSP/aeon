@@ -270,3 +270,31 @@ pub fn confirm(owner: isize, title: &str, text: &str) -> bool {
         ) == IDOK
     }
 }
+
+/// Paints the Windows title bar in the theme's colours, so it reads as part
+/// of Aeon while keeping Snap layouts and the native buttons. Windows 10
+/// ignores it.
+pub fn tint_caption(hwnd: isize, pal: &crate::ui::Palette) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR, DwmSetWindowAttribute,
+    };
+    // COLORREF is 0x00BBGGRR.
+    let colorref = |rgb: u32| ((rgb & 0xff) << 16) | (rgb & 0xff00) | ((rgb >> 16) & 0xff);
+    for (attribute, color) in [
+        (DWMWA_CAPTION_COLOR, pal.canvas),
+        (DWMWA_TEXT_COLOR, pal.muted),
+        (DWMWA_BORDER_COLOR, pal.border),
+    ] {
+        let value = colorref(color);
+        // SAFETY: `value` is a COLORREF that outlives the call, and its size
+        // is what each of these attributes takes.
+        unsafe {
+            DwmSetWindowAttribute(
+                hwnd as _,
+                attribute as u32,
+                (&value as *const u32).cast(),
+                size_of::<u32>() as u32,
+            );
+        }
+    }
+}

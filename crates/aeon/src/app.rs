@@ -23,7 +23,7 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-use winit::platform::windows::IconExtWindows;
+use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{CursorIcon, Icon, Window, WindowId};
 
@@ -76,6 +76,8 @@ pub struct Launch {
     pub program: Option<Program>,
     /// `--cwd`: where the first session starts.
     pub cwd: Option<PathBuf>,
+    /// `--dropdown`: the drop-down terminal the resident shows and hides.
+    pub dropdown: bool,
 }
 
 /// A shell other than the configured one, chosen from a profile.
@@ -102,6 +104,8 @@ pub struct App {
     hover: Option<Hit>,
     /// How the window was started, until its first session opens.
     launch: Option<Launch>,
+    /// The drop-down terminal: no frame, and hidden when it loses focus.
+    dropdown: bool,
     /// The palette over the window, while open.
     finder: Option<Launcher>,
     /// Why the palette's last choice failed.
@@ -302,11 +306,14 @@ impl App {
         };
         let theme = Theme::new(&config.colors);
         let saved = state::load();
-        let primary = aeon_launcher::sys::single_instance(if cfg!(debug_assertions) {
-            "Local\\AeonWindowsDev"
-        } else {
-            "Local\\AeonWindows"
-        });
+        // The drop-down terminal neither restores nor saves sessions.
+        let primary = !launch.dropdown
+            && aeon_launcher::sys::single_instance(if cfg!(debug_assertions) {
+                "Local\\AeonWindowsDev"
+            } else {
+                "Local\\AeonWindows"
+            });
+        let dropdown = launch.dropdown;
         // Finding VS Code means walking PATH; keep that off the UI thread.
         let editor_proxy = proxy.clone();
         let _ = std::thread::Builder::new()
@@ -323,6 +330,7 @@ impl App {
             config,
             config_error,
             launch: Some(launch),
+            dropdown,
             finder: None,
             finder_error: None,
             catalog: None,
@@ -387,15 +395,36 @@ impl App {
         if let Some(error) = &self.config_error {
             title.push_str(&format!(" (config ignored: {error})"));
         }
-        let window = Rc::new(
-            event_loop.create_window(
-                Window::default_attributes()
-                    .with_title(title)
-                    .with_window_icon(Icon::from_resource(1, None).ok())
-                    .with_theme(Some(window_theme(&self.theme)))
-                    .with_inner_size(inner),
-            )?,
-        );
+        let mut attributes = Window::default_attributes()
+            .with_title(title)
+            .with_window_icon(Icon::from_resource(1, None).ok())
+            .with_theme(Some(window_theme(&self.theme)))
+            .with_inner_size(inner);
+        if self.dropdown {
+            // Across the top of the monitor under the mouse; the resident
+            // moves it there again each time it shows it.
+            let monitor = aeon_launcher::sys::cursor_position().and_then(|(x, y)| {
+                event_loop.available_monitors().find(|m| {
+                    let (p, s) = (m.position(), m.size());
+                    x >= p.x && y >= p.y && x < p.x + s.width as i32 && y < p.y + s.height as i32
+                })
+            });
+            if let Some(monitor) = monitor.or_else(|| event_loop.primary_monitor()) {
+                let (p, s) = (monitor.position(), monitor.size());
+                let height = (f64::from(s.height) * crate::launcher::DROPDOWN_HEIGHT) as u32;
+                attributes = attributes
+                    .with_position(p)
+                    .with_inner_size(winit::dpi::PhysicalSize::new(s.width, height));
+            }
+            attributes = attributes
+                .with_decorations(false)
+                .with_undecorated_shadow(true)
+                .with_skip_taskbar(true)
+                .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+                .with_class_name(aeon_launcher::DROPDOWN_CLASS);
+        }
+        let window = Rc::new(event_loop.create_window(attributes)?);
+        crate::sys::tint_caption(hwnd(&window), &self.palette);
         let atlas = atlas.with_px(self.font_px(window.scale_factor()));
         let context = softbuffer::Context::new(window.clone())?;
         let surface = softbuffer::Surface::new(&context, window.clone())?;
@@ -2613,6 +2642,7 @@ impl App {
         self.palette = Palette::new(&self.theme);
         if let Some(view) = &self.view {
             view.window.set_theme(Some(window_theme(&self.theme)));
+            crate::sys::tint_caption(hwnd(&view.window), &self.palette);
         }
         self.config = config;
         self.resize();
@@ -3147,6 +3177,14 @@ impl ApplicationHandler<Event> for App {
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Focused(focused) => {
                 self.focused = focused;
+                // The drop-down terminal gets out of the way, as its hotkey
+                // would put it away.
+                if self.dropdown
+                    && !focused
+                    && let Some(view) = &self.view
+                {
+                    view.window.set_visible(false);
+                }
                 // The cursor turns hollow while the window is in the background.
                 self.request_redraw();
                 if focused {

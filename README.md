@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. A drop-down terminal and its own title bar are on the way.
+> Aeon is early. Expect rough edges, and tell us about them.
 
 ## Install
 
@@ -133,6 +133,10 @@ While it runs, Aeon has an icon in the notification area (under the taskbar's hi
 
 To stop it from starting with Windows, turn off **Start with Windows** in Settings > General.
 
+### The drop-down terminal
+
+Press **Ctrl+Alt+`** anywhere and a terminal drops down across the top of the screen you are on. Press it again, or click elsewhere, and it gets out of the way with its sessions still running; it comes back as you left it. The background launcher handles this key, so it needs **Start with Windows** (or an Aeon running in the background). Change the key in Settings > Launcher, or set `dropdown = ""` to turn it off.
+
 ### Your shell inside Aeon
 
 Aeon starts PowerShell **without your profile**, with its own prompt and its own command history in `%APPDATA%\aeon\history`, separate from other terminals. Prompt themes like Oh My Posh are not needed: the session header shows the same information, for every shell. cmd keeps its usual prompt and reports its directory to Aeon.
@@ -158,6 +162,7 @@ restore = true                # reopen the last window's sessions
 
 [launcher]
 hotkey = "Ctrl+Alt+Space"     # Ctrl, Alt, Shift, Win + a letter, digit, F1-F24, Space, or `
+dropdown = "Ctrl+Alt+`"       # the drop-down terminal; empty turns it off
 search_url = "https://www.google.com/search?q={query}"   # empty turns web search off
 start_with_windows = true
 
