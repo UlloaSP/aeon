@@ -14,6 +14,7 @@ dependencies = [
  "embed-resource",
  "fontdue",
  "softbuffer",
+ "windows-sys 0.61.2",
  "winit",
 ]
 

@@ -17,6 +17,8 @@ pub use git::Git;
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Context {
     pub cwd: Option<PathBuf>,
+    /// The repository `cwd` is in: the project the sidebar groups it under.
+    pub root: Option<PathBuf>,
     pub git: Option<Git>,
     pub servers: Vec<Server>,
 }
@@ -63,6 +65,7 @@ impl Watcher {
                     let git_due = last_git.is_none_or(|t| t.elapsed() >= GIT_POLL);
                     if git_due {
                         context.git = context.cwd.as_deref().and_then(git::status);
+                        context.root = context.cwd.as_deref().and_then(git::root);
                         last_git = Some(Instant::now());
                     }
                     context.servers = servers(shell_pid);
