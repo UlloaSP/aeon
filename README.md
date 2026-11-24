@@ -28,7 +28,7 @@ It works with PowerShell 7, Windows PowerShell, cmd, WSL, Git Bash, and anything
 - **No account, no telemetry.** It is a terminal.
 - **Open.** MIT licensed. If you don't like something, fork it.
 
-> Aeon is early. It hosts a shell in full color and handles the keys you need to use it. Scrollback, selection, mouse, and tabs are next.
+> Aeon is early. Command blocks, project tasks, split panes, and one palette for everything are on the way.
 
 ## Install
 
@@ -66,6 +66,21 @@ One window holds as many shells as you want. The sidebar groups them by project:
 | Ctrl+Shift+B | Show or hide the sidebar |
 
 These are the defaults; change any of them in **Settings > Keyboard**. They use Ctrl+Shift because shells already use Ctrl+T, Ctrl+W, and Ctrl+B. Whether the sidebar is shown is remembered in `%APPDATA%\aeon\state`, apart from your `config.toml`.
+
+### In the terminal
+
+| Keys | Action |
+| --- | --- |
+| Mouse wheel, Shift+PageUp, Shift+PageDown | Scroll back through the last 5000 lines |
+| Drag, double-click, triple-click | Select text, a word, or a line |
+| Ctrl+C | Copy the selection (without one, it goes to the shell as usual) |
+| Ctrl+V, Ctrl+Shift+V, right-click | Paste (right-click copies instead when text is selected) |
+| Ctrl+Shift+C | Copy |
+| Ctrl+Shift+F | Find in the output: Enter goes to the previous match, Shift+Enter to the next, Esc closes |
+| Ctrl+click | Open a link: URLs in the browser, `file.rs:42:7` in VS Code at that line |
+| Ctrl+=, Ctrl+-, Ctrl+0, Ctrl+wheel | Text size for this window |
+
+Programs that use the mouse, such as vim or htop, get it; hold Shift to select text instead. Typing returns to the bottom.
 
 ### The launcher
 
@@ -117,6 +132,12 @@ next_session = "Ctrl+Tab"
 previous_session = "Ctrl+Shift+Tab"
 toggle_sidebar = "Ctrl+Shift+B"
 settings = "Ctrl+,"
+find = "Ctrl+Shift+F"
+copy = "Ctrl+Shift+C"
+paste = "Ctrl+Shift+V"
+
+[terminal]
+scrollback = 5000             # lines kept for scrolling back; 0 keeps none
 
 [bar]
 enabled = true                # the session header: project, git, and servers above the terminal

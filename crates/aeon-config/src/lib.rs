@@ -25,6 +25,21 @@ pub struct Config {
     pub keys: Keys,
     pub cursor: Cursor,
     pub updates: Updates,
+    pub terminal: TerminalSettings,
+}
+
+/// How the terminal itself behaves.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TerminalSettings {
+    /// Lines kept above the screen for scrolling back. 0 keeps none.
+    pub scrollback: usize,
+}
+
+impl Default for TerminalSettings {
+    fn default() -> Self {
+        Self { scrollback: 5000 }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -102,6 +117,9 @@ pub struct Keys {
     pub previous_session: String,
     pub toggle_sidebar: String,
     pub settings: String,
+    pub find: String,
+    pub copy: String,
+    pub paste: String,
 }
 
 impl Default for Keys {
@@ -113,6 +131,9 @@ impl Default for Keys {
             previous_session: "Ctrl+Shift+Tab".to_owned(),
             toggle_sidebar: "Ctrl+Shift+B".to_owned(),
             settings: "Ctrl+,".to_owned(),
+            find: "Ctrl+Shift+F".to_owned(),
+            copy: "Ctrl+Shift+C".to_owned(),
+            paste: "Ctrl+Shift+V".to_owned(),
         }
     }
 }
@@ -512,6 +533,15 @@ program = \"cmd.exe\"",
             Config::parse("[keys]\nnew_session = \"Ctrl+N\"\n[cursor]\nstyle = \"bar\"").unwrap();
         assert_eq!(config.keys.new_session, "Ctrl+N");
         assert_eq!(config.keys.settings, "Ctrl+,");
+        assert_eq!(config.keys.find, "Ctrl+Shift+F");
+        assert_eq!(Config::default().terminal.scrollback, 5000);
+        assert_eq!(
+            Config::parse("[terminal]\nscrollback = 0")
+                .unwrap()
+                .terminal
+                .scrollback,
+            0
+        );
         assert_eq!(config.cursor.style, CursorStyle::Bar);
         assert!(Config::parse("[cursor]\nstyle = \"beam\"").is_err());
     }

@@ -287,6 +287,7 @@ pub mod icon {
     pub const TERMINAL: char = '\u{E756}';
     pub const DOWNLOAD: char = '\u{E896}';
     pub const REFRESH: char = '\u{E72C}';
+    pub const SEARCH: char = '\u{E721}';
     pub const CHEVRON_LEFT: char = '\u{E76B}';
     pub const CHEVRON_RIGHT: char = '\u{E76C}';
 }

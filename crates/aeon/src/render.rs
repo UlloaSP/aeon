@@ -2,7 +2,7 @@
 //! tens of megabytes of resident memory before the first frame.
 
 use aeon_config::{Colors, CursorStyle};
-use aeon_term::{Cell, Color, Flags, Terminal};
+use aeon_term::{Cell, Color, Flags, Match, Point, Terminal};
 
 use crate::font::Atlas;
 
@@ -88,6 +88,20 @@ const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
+/// What is drawn over the terminal's own cells.
+#[derive(Default)]
+pub struct Overlay<'a> {
+    /// Lines the view is scrolled up from the bottom.
+    pub scroll: usize,
+    /// Selected cells, both ends included, in order.
+    pub selection: Option<(Point, Point)>,
+    /// Find results, oldest first, and which one is current.
+    pub matches: &'a [Match],
+    pub current: Option<usize>,
+    /// A link under the mouse with Ctrl held: line and columns.
+    pub link: Option<(u64, usize, usize)>,
+}
+
 pub fn draw(
     frame: &mut Frame<'_>,
     term: &Terminal,
@@ -95,27 +109,63 @@ pub fn draw(
     theme: &Theme,
     origin: (u32, u32),
     cursor_style: CursorStyle,
+    overlay: &Overlay<'_>,
 ) {
     frame.pixels.fill(theme.bg);
     let (left, top) = origin;
 
     let grid = term.grid();
     let cursor = term.cursor();
+    let show_cursor = overlay.scroll == 0 && term.modes().cursor_visible;
     let (cw, ch) = (atlas.cell_width, atlas.cell_height);
     let line = (ch / 16).max(1);
+    let first = term.screen_line().saturating_sub(overlay.scroll as u64);
+    let selected_bg = blend(theme.bg, theme.ansi[4], 105);
+    let match_bg = blend(theme.bg, theme.ansi[3], 95);
+    let blank = Cell::default();
 
     for row in 0..grid.rows() {
         let y = top + row as u32 * ch;
-        for (col, cell) in grid.row(row).iter().enumerate() {
+        let number = first + row as u64;
+        let cells = term.line(number).unwrap_or_default();
+        // Find results on this line; `matches` is ordered by line.
+        let from = overlay.matches.partition_point(|m| m.start.line < number);
+        let to = overlay.matches.partition_point(|m| m.start.line <= number);
+        for col in 0..grid.cols() {
+            let cell = cells.get(col).unwrap_or(&blank);
             let x = left + col as u32 * cw;
-            let at_cursor = cursor.row == row && cursor.col == col;
+            let at_cursor =
+                show_cursor && overlay.scroll == 0 && cursor.row == row && cursor.col == col;
             // A block cursor inverts its cell; bar and underline are drawn on top.
             let block = at_cursor && cursor_style == CursorStyle::Block;
-            let (fg, bg) = theme.cell_colors(cell, block);
+            let (mut fg, mut bg) = theme.cell_colors(cell, block);
+            let here = Point { line: number, col };
+            if let Some(i) = (from..to).find(|&i| {
+                let m = overlay.matches[i];
+                (m.start.col..m.start.col + m.len).contains(&col)
+            }) {
+                if overlay.current == Some(i) {
+                    (fg, bg) = (theme.bg, theme.cursor);
+                } else {
+                    bg = match_bg;
+                }
+            } else if overlay
+                .selection
+                .is_some_and(|(a, b)| a <= here && here <= b)
+            {
+                bg = selected_bg;
+            }
             if bg != theme.bg {
                 fill_rect(frame, x, y, cw, ch, bg);
             }
-            if cell.ch != ' ' {
+            let linked = overlay
+                .link
+                .is_some_and(|(l, a, b)| l == number && (a..=b).contains(&col));
+            if linked {
+                let underline = (y + atlas.baseline as u32 + line).min(y + ch - line);
+                fill_rect(frame, x, underline, cw, line, theme.ansi[12]);
+            }
+            if cell.ch != ' ' && !cell.flags.contains(Flags::HIDDEN) {
                 draw_glyph(frame, atlas, cell.ch, x as i32, y as i32, fg);
                 // No bold font is loaded: bold is the same glyph drawn again
                 // one stroke to the right.
