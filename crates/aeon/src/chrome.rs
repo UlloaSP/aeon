@@ -684,6 +684,52 @@ pub fn draw_header(
     }
 }
 
+/// The find bar, floating at the top right of the terminal.
+pub fn draw_find(
+    frame: &mut Frame<'_>,
+    ui: &mut Ui,
+    pal: &Palette,
+    top: u32,
+    query: &str,
+    count: &str,
+) {
+    let (w, h) = (ui.px(380.0), ui.px(36.0));
+    let x = frame.width.saturating_sub(w + ui.px(16.0));
+    let y = top + ui.px(8.0);
+    ui::card(
+        frame,
+        x,
+        y,
+        w,
+        h,
+        ui.px(8.0),
+        pal.raised,
+        blend(pal.canvas, pal.fg, 40),
+    );
+    let mid = y + h / 2;
+    ui.icon(frame, x + ui.px(16.0), mid, icon::SEARCH, 12.0, pal.label);
+    let body = ui.font(Face::Ui, 14.0, REGULAR);
+    let small = ui.font(Face::Ui, 12.0, REGULAR);
+    let count_x = ui.text_right(frame, x + w - ui.px(12.0), mid, count, small, pal.label);
+    let tx = x + ui.px(32.0);
+    let room = count_x.saturating_sub(tx + ui.px(8.0));
+    if query.is_empty() {
+        let hint = "Find \u{b7} Enter previous, Shift+Enter next";
+        ui.text_mid(frame, tx, mid, hint, body, pal.label, room);
+    } else {
+        let drawn = ui.text_mid(frame, tx, mid, query, body, pal.fg, room);
+        let caret = ui.px(16.0);
+        fill_rect(
+            frame,
+            tx + drawn + 1,
+            mid - caret / 2,
+            ui.px(1.0).max(1),
+            caret,
+            pal.accent,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

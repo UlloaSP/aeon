@@ -5,8 +5,10 @@
 mod app;
 mod chrome;
 mod font;
+mod input;
 mod keys;
 mod launcher;
+mod links;
 mod render;
 mod settings;
 mod sys;

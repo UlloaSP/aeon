@@ -871,6 +871,9 @@ fn rows(
                     &keys.toggle_sidebar,
                 ),
                 key_row("Settings", "settings", &keys.settings),
+                key_row("Find", "find", &keys.find),
+                key_row("Copy", "copy", &keys.copy),
+                key_row("Paste", "paste", &keys.paste),
                 Row {
                     title: "Go to a session",
                     description: "Fixed: by its number in the sidebar.".into(),
@@ -1023,6 +1026,9 @@ fn shortcut_names(config: &Config) -> Vec<(&'static str, String)> {
         ("previous_session", k.previous_session.clone()),
         ("toggle_sidebar", k.toggle_sidebar.clone()),
         ("settings", k.settings.clone()),
+        ("find", k.find.clone()),
+        ("copy", k.copy.clone()),
+        ("paste", k.paste.clone()),
         ("hotkey", config.launcher.hotkey.clone()),
     ]
 }
